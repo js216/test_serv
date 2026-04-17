@@ -16,6 +16,16 @@ OUTPUTS = os.path.join(STATE_DIR, "outputs")
 DONE = os.path.join(STATE_DIR, "done")
 
 
+def read_meta(path):
+    meta = {}
+    with open(path) as f:
+        for line in f:
+            k, _, v = line.strip().partition("=")
+            if k:
+                meta[k] = v
+    return meta
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         ext = self.path.strip("/")
@@ -31,12 +41,18 @@ class Handler(BaseHTTPRequestHandler):
             return
         name = random.choice(names)
         src = os.path.join(INPUTS, name)
+        meta_src = os.path.join(INPUTS, f"{name}.meta")
         with open(src, "rb") as f:
             data = f.read()
+        meta = read_meta(meta_src) if os.path.exists(meta_src) else {}
         self.send_response(200)
+        for k, v in meta.items():
+            self.send_header(f"X-Test-{k.capitalize()}", v)
         self.end_headers()
         self.wfile.write(data)
         os.rename(src, os.path.join(DONE, name))
+        if os.path.exists(meta_src):
+            os.rename(meta_src, os.path.join(DONE, f"{name}.meta"))
 
     def do_POST(self):
         tail = self.path.rsplit("/", 1)[-1]

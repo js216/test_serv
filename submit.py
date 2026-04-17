@@ -22,7 +22,7 @@ INPUTS = os.path.join(STATE_DIR, "inputs")
 OUTPUTS = os.path.join(STATE_DIR, "outputs")
 
 
-def submit(src_path):
+def submit(src_path, meta):
     with open(src_path, "rb") as f:
         data = f.read()
     digest = hashlib.sha256(data).hexdigest()
@@ -32,7 +32,15 @@ def submit(src_path):
     dst = os.path.join(INPUTS, f"{digest}.{ext}")
     if os.path.exists(dst):
         raise FileExistsError(digest)
-    shutil.copyfile(src_path, dst)
+    meta_path = f"{dst}.meta"
+    if meta:
+        with open(meta_path, "w") as f:
+            f.write("".join(f"{k}={v}\n" for k, v in meta.items()))
+            f.flush()
+            os.fsync(f.fileno())
+    tmp = f"{dst}.inprogress"
+    shutil.copyfile(src_path, tmp)
+    os.rename(tmp, dst)
     return digest
 
 
@@ -61,15 +69,33 @@ def compare(result, expected_path):
     return 1
 
 
+def parse_meta_kv(pairs):
+    meta = {}
+    for p in pairs or []:
+        k, _, v = p.partition("=")
+        if not k or not v:
+            raise ValueError(f"--meta expects key=value, got: {p}")
+        meta[k] = v
+    return meta
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("job", help="file to submit (extension is the job kind)")
     ap.add_argument("--wait", type=float)
     ap.add_argument("--expected")
+    ap.add_argument("--runtime", type=float,
+                    help="capture duration in seconds (sent as X-Test-Runtime)")
+    ap.add_argument("--meta", action="append", metavar="KEY=VAL",
+                    help="extra sidecar key=value (repeatable)")
     args = ap.parse_args()
 
+    meta = parse_meta_kv(args.meta)
+    if args.runtime is not None:
+        meta["runtime"] = str(args.runtime)
+
     try:
-        digest = submit(args.job)
+        digest = submit(args.job, meta)
     except FileExistsError as e:
         print(f"duplicate job: {e}", file=sys.stderr)
         return 2
