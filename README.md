@@ -54,7 +54,7 @@ derived from the submitter's `--runtime` and `--meta KEY=VAL` flags
 artefact back:
 
     POST /<digest>.csv    # scope trace (any non-.txt artefact, any count)
-    POST /<digest>.txt    # UART text log — MUST be last, it is the sentinel
+    POST /<digest>.txt    # UART text log -- MUST be last, it is the sentinel
 
 The `.txt` is the completion marker; by convention the harness posts all
 other artefacts first so that by the time the submitter sees the
@@ -83,7 +83,7 @@ removed from `outputs/` after dumping.
 `--runtime SEC` is shorthand for `--meta runtime=SEC`; both write a
 `{digest}.{ext}.meta` sidecar with `key=value` lines.  The server
 emits each key as an `X-Test-<Key>` response header.  Adding new keys
-is zero-code on the server side — the harness just reads whatever
+is zero-code on the server side -- the harness just reads whatever
 `X-Test-*` headers it cares about.
 
 ### Ordering guarantee
@@ -96,4 +96,4 @@ writes the `.meta` first (fsynced), copies the payload to a
 
 ### Author
 
-Jakob Kastelic
+Jakob Kastelic (Stanford Research Systems)
