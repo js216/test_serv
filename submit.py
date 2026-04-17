@@ -46,6 +46,12 @@ def submit(src_path, meta):
     if os.path.exists(dst):
         raise FileExistsError(digest)
     meta_path = f"{dst}.meta"
+    # Drop any stale .meta left by a previously-interrupted submit so it
+    # can't be paired with the fresh binary landing below.
+    try:
+        os.remove(meta_path)
+    except FileNotFoundError:
+        pass
     if meta:
         with open(meta_path, "w") as f:
             f.write("".join(f"{k}={v}\n" for k, v in meta.items()))

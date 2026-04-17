@@ -299,6 +299,7 @@ class DspHandler(JobHandler):
             self.qspi.accept_ldr(payload)
 
             duration = float(headers.get("X-Test-Runtime", self.rx_duration_s))
+            print(datetime.now(), f"runtime={duration}s")
             uart_msg = self._read_serial_for(ser, duration)
         finally:
             ser.close()
