@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
-# submit.py --- Submit a job and wait for its test result
+# submit.py --- Submit a job and wait for its result artefacts
 # Copyright (c) 2026 Jakob Kastelic
 
 import argparse
+import glob
 import hashlib
 import os
 import shutil
@@ -45,26 +46,41 @@ def submit(src_path, meta):
 
 
 def wait_for_result(digest, timeout):
-    out = os.path.join(OUTPUTS, f"{digest}.txt")
+    sentinel = os.path.join(OUTPUTS, f"{digest}.txt")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(out):
-            with open(out, "rb") as f:
-                result = f.read()
-            os.remove(out)
-            return result
+        if os.path.exists(sentinel):
+            paths = sorted(glob.glob(os.path.join(OUTPUTS, f"{digest}.*")))
+            paths.sort(key=lambda p: p.endswith(".txt"))
+            return paths
         time.sleep(0.05)
     return None
 
 
-def compare(result, expected_path):
+def dump_and_cleanup(paths):
+    txt_bytes = None
+    for p in paths:
+        with open(p, "rb") as f:
+            data = f.read()
+        name = os.path.basename(p)
+        sys.stdout.buffer.write(f"=== {name} ===\n".encode())
+        sys.stdout.buffer.write(data)
+        if not data.endswith(b"\n"):
+            sys.stdout.buffer.write(b"\n")
+        if p.endswith(".txt"):
+            txt_bytes = data
+    sys.stdout.buffer.flush()
+    for p in paths:
+        os.remove(p)
+    return txt_bytes
+
+
+def compare(txt_bytes, expected_path):
     with open(expected_path, "rb") as f:
         expected = f.read()
-    if result == expected:
+    if txt_bytes == expected:
         print(f"{GREEN}SUCCESS{RESET}")
         return 0
-    if result is not None:
-        sys.stdout.buffer.write(result)
     print(f"{RED}FAIL{RESET}")
     return 1
 
@@ -104,14 +120,14 @@ def main():
         print(digest)
         return 0
 
-    result = wait_for_result(digest, args.wait)
+    paths = wait_for_result(digest, args.wait)
+    if paths is None:
+        return 1
+
+    txt_bytes = dump_and_cleanup(paths)
 
     if args.expected is not None:
-        return compare(result, args.expected)
-
-    if result is None:
-        return 1
-    sys.stdout.buffer.write(result)
+        return compare(txt_bytes, args.expected)
     return 0
 
 
