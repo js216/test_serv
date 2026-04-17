@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: MIT
-# server.py --- Generic test-job dispatcher (multi-kind, routed by extension)
+# server.py --- Generic hardware-test dispatcher (multi-kind, routed by extension)
 # Copyright (c) 2026 Jakob Kastelic
 
+import argparse
 import os
 import random
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -65,6 +66,10 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
-for d in (INPUTS, OUTPUTS, DONE):
-    os.makedirs(d, mode=0o700, exist_ok=True)
-HTTPServer(("127.0.0.1", 8080), Handler).serve_forever()
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--port", type=int, default=8080)
+    args = ap.parse_args()
+    for d in (INPUTS, OUTPUTS, DONE):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+    HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
