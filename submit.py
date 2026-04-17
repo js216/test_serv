@@ -146,7 +146,7 @@ def main():
     try:
         digest = submit(args.job, meta)
     except StaleOutputsError as e:
-        print(f"stale outputs for {e}; run submit.py --fetch {e} first",
+        print(f"output stale; run:\n    python3 submit.py --fetch {e}",
               file=sys.stderr)
         return 2
     except FileExistsError as e:
