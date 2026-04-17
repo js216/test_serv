@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# submit.py --- Submit an .ldr file and wait for its test result
+# submit.py --- Submit a job and wait for its test result
 # Copyright (c) 2026 Jakob Kastelic
 
 import argparse
@@ -14,19 +14,25 @@ GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-INPUTS = os.path.join(HERE, "inputs")
-OUTPUTS = os.path.join(HERE, "outputs")
+STATE_DIR = os.environ.get(
+    "TEST_SERV_DIR",
+    f"/tmp/test_serv-{os.getenv('USER', 'anon')}",
+)
+INPUTS = os.path.join(STATE_DIR, "inputs")
+OUTPUTS = os.path.join(STATE_DIR, "outputs")
 
 
-def submit(ldr_path):
-    with open(ldr_path, "rb") as f:
+def submit(src_path):
+    with open(src_path, "rb") as f:
         data = f.read()
     digest = hashlib.sha256(data).hexdigest()
-    dst = os.path.join(INPUTS, f"{digest}.ldr")
+    ext = os.path.splitext(src_path)[1].lstrip(".")
+    if not ext:
+        raise ValueError(f"{src_path}: cannot infer extension (kind)")
+    dst = os.path.join(INPUTS, f"{digest}.{ext}")
     if os.path.exists(dst):
         raise FileExistsError(digest)
-    shutil.copyfile(ldr_path, dst)
+    shutil.copyfile(src_path, dst)
     return digest
 
 
@@ -57,13 +63,13 @@ def compare(result, expected_path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("ldr")
+    ap.add_argument("job", help="file to submit (extension is the job kind)")
     ap.add_argument("--wait", type=float)
     ap.add_argument("--expected")
     args = ap.parse_args()
 
     try:
-        digest = submit(args.ldr)
+        digest = submit(args.job)
     except FileExistsError as e:
         print(f"duplicate job: {e}", file=sys.stderr)
         return 2
