@@ -23,6 +23,16 @@ INPUTS = os.path.join(STATE_DIR, "inputs")
 OUTPUTS = os.path.join(STATE_DIR, "outputs")
 
 
+class StaleOutputsError(Exception):
+    pass
+
+
+def output_paths(digest):
+    paths = sorted(glob.glob(os.path.join(OUTPUTS, f"{digest}.*")))
+    paths.sort(key=lambda p: p.endswith(".txt"))
+    return paths
+
+
 def submit(src_path, meta):
     with open(src_path, "rb") as f:
         data = f.read()
@@ -30,6 +40,8 @@ def submit(src_path, meta):
     ext = os.path.splitext(src_path)[1].lstrip(".")
     if not ext:
         raise ValueError(f"{src_path}: cannot infer extension (kind)")
+    if output_paths(digest):
+        raise StaleOutputsError(digest)
     dst = os.path.join(INPUTS, f"{digest}.{ext}")
     if os.path.exists(dst):
         raise FileExistsError(digest)
@@ -50,9 +62,7 @@ def wait_for_result(digest, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if os.path.exists(sentinel):
-            paths = sorted(glob.glob(os.path.join(OUTPUTS, f"{digest}.*")))
-            paths.sort(key=lambda p: p.endswith(".txt"))
-            return paths
+            return output_paths(digest)
         time.sleep(0.05)
     return None
 
@@ -95,9 +105,24 @@ def parse_meta_kv(pairs):
     return meta
 
 
+def fetch(digest, expected_path):
+    paths = output_paths(digest)
+    if not paths:
+        print(f"no outputs for digest {digest}", file=sys.stderr)
+        return 1
+    txt_bytes = dump_and_cleanup(paths)
+    if expected_path is not None:
+        return compare(txt_bytes, expected_path)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("job", help="file to submit (extension is the job kind)")
+    ap.add_argument("job", nargs="?",
+                    help="file to submit (extension is the job kind)")
+    ap.add_argument("--fetch", metavar="DIGEST",
+                    help="dump and clean up outputs for a previously-submitted "
+                         "digest; use this after a fire-and-forget submit")
     ap.add_argument("--wait", type=float)
     ap.add_argument("--expected")
     ap.add_argument("--runtime", type=float,
@@ -106,12 +131,24 @@ def main():
                     help="extra sidecar key=value (repeatable)")
     args = ap.parse_args()
 
+    if args.fetch and args.job:
+        ap.error("--fetch is mutually exclusive with a job file")
+    if not args.fetch and not args.job:
+        ap.error("either a job file or --fetch DIGEST is required")
+
+    if args.fetch:
+        return fetch(args.fetch, args.expected)
+
     meta = parse_meta_kv(args.meta)
     if args.runtime is not None:
         meta["runtime"] = str(args.runtime)
 
     try:
         digest = submit(args.job, meta)
+    except StaleOutputsError as e:
+        print(f"stale outputs for {e}; run submit.py --fetch {e} first",
+              file=sys.stderr)
+        return 2
     except FileExistsError as e:
         print(f"duplicate job: {e}", file=sys.stderr)
         return 2

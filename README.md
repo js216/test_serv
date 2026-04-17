@@ -40,6 +40,14 @@ additionally blocks up to N seconds, then streams the returned
 artefacts to stdout (see *Output stream* below) and clears them from
 `outputs/`.
 
+Results from a fire-and-forget submit must be collected before the same
+job can be resubmitted.  If `outputs/{digest}.*` is non-empty at submit
+time, submit.py refuses with exit code 2 and a pointer to `--fetch`:
+
+    submit.py --fetch DIGEST           # dump pending outputs, clean up
+    submit.py --fetch DIGEST --expected ref.txt   # byte-exact check on the
+                                                  # fetched .txt
+
 Common invocations:
 
     submit.py main.ldr                         # submit, print digest, exit
@@ -69,21 +77,24 @@ other artefacts first so that by the time the submitter sees the
 
 ### Output stream
 
-With `--wait`, submit.py streams every `outputs/{digest}.*` to stdout,
-framed by header lines and with the `.txt` last:
+With `--wait` (or `--fetch`), submit.py streams every `outputs/{digest}.*`
+to stdout, framed by header lines and with the `.txt` last:
 
     === abc123.csv ===
     timestamp,ch1,ch2
     0.000,0.12,-0.05
     ...
     === abc123.txt ===
-    OK test_if
-    OK test_while
-    0x55 pass 0x2 fail
+    <whatever the job wrote to UART, verbatim>
 
-Redirect to a file for a complete run record; leave it on a tty and the
-coloured pass/fail summary lands at the cursor.  All matching files are
-removed from `outputs/` after dumping.
+The set of returned artefacts depends entirely on what the harness
+POSTs for that kind.  A UART-only job like `examples/uart_test.ldr`
+returns only `.txt`; a test that triggers the scope also returns
+`.csv`; a silent job like `examples/blink.ldr` returns an empty `.txt`
+(the `.txt` is the completion sentinel and is always posted, even
+when there was nothing to capture).  Redirect stdout to a file for a
+complete run record.  All matching files are removed from `outputs/`
+after dumping.
 
 ### Per-run parameters
 
