@@ -33,6 +33,13 @@ instance alongside the primary one.
 The job's kind is its file extension: `submit.py foo.ldr` drops a
 `.ldr` job, `submit.py bar.bit` a `.bit` job.
 
+Without `--wait`, submit.py returns as soon as the job is queued and
+prints the job's SHA-256 digest to stdout -- fire-and-forget mode, for
+pipelines that harvest results later by digest.  With `--wait N`, it
+additionally blocks up to N seconds, then streams the returned
+artefacts to stdout (see *Output stream* below) and clears them from
+`outputs/`.
+
 Common invocations:
 
     submit.py main.ldr                         # submit, print digest, exit
