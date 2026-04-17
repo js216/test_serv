@@ -271,34 +271,37 @@ class DspHandler(JobHandler):
         else:
             self.scope = None
 
-    def _read_serial_for(self, duration_s):
+    def _read_serial_for(self, ser, duration_s):
+        start = time.time()
+        buf = []
+
+        while time.time() - start < duration_s:
+            data = ser.read(1024)
+            if data:
+                buf.append(data)
+
+        return b"".join(buf).decode(errors="replace")
+
+    def run(self, payload, headers):
+        # Open the UART before loading so the first byte of the new
+        # firmware's output is captured. Reset halts the old firmware;
+        # drain clears any bytes it emitted before reset took effect.
         ser = serial.Serial(
             self.serial_port,
             baudrate=self.baudrate,
             timeout=0.1
         )
-
-        start = time.time()
-        buf = []
-
         try:
-            while time.time() - start < duration_s:
-                data = ser.read(1024)
-                if data:
-                    buf.append(data)
+            self.expander.reset()
+            self.expander.exp_init()
+            ser.reset_input_buffer()
+
+            self.qspi.accept_ldr(payload)
+
+            duration = float(headers.get("X-Test-Runtime", self.rx_duration_s))
+            uart_msg = self._read_serial_for(ser, duration)
         finally:
             ser.close()
-
-        return b"".join(buf).decode(errors="replace")
-
-    def run(self, payload, headers):
-        self.expander.reset()
-        self.expander.exp_init()
-
-        self.qspi.accept_ldr(payload)
-
-        duration = float(headers.get("X-Test-Runtime", self.rx_duration_s))
-        uart_msg = self._read_serial_for(duration)
 
         artefacts = {}
         if self.scope is not None:
