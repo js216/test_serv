@@ -4,8 +4,8 @@ A minimal hardware-test dispatcher: a submitter drops a job file into a
 shared directory, the hardware-side harness polls for jobs matching its
 kind, runs them, and posts the result artefacts back.  Jobs are routed
 by file extension, so a single server handles any mix of hardware kinds
-(`.ldr` for DSP firmware, `.hex` for microcontrollers, etc.) with no
-code changes.
+(`.ldr` for DSP firmware, `.bin` for iCE40 FPGA bitstreams, etc.) with
+no code changes.
 
 ### Running the server
 
@@ -36,7 +36,7 @@ Flags:
 Without `--wait`, submit.py returns as soon as the job is queued and
 prints the SHA-256 digest to stdout (fire-and-forget).  The job's kind
 is its file extension: `submit.py foo.ldr` drops a `.ldr` job,
-`submit.py bar.hex` a `.hex` job.
+`submit.py bar.bin` a `.bin` job.
 
 Results from a fire-and-forget submit must be collected before the same
 job can be resubmitted.  If `outputs/{digest}.*` is non-empty at submit
@@ -47,7 +47,7 @@ time, submit.py refuses with exit code 2 and a pointer to `--fetch`.
 Each harness polls its own extension:
 
     GET /ldr    # returns a random *.ldr payload, 204 if none
-    GET /hex    # ditto for *.hex
+    GET /bin    # ditto for *.bin
     GET /<ext>  # ditto for any extension
 
 The response carries per-job parameters as `X-Test-<Key>` headers
