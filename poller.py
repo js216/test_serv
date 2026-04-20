@@ -338,12 +338,15 @@ class Poller:
     def run(self):
         try:
             while not self._stop:
+                dispatched = False
                 for kind in self.handlers:
                     payload, headers = self.remote.get_job(kind)
                     if payload:
                         self._dispatch(kind, payload, headers)
+                        dispatched = True
 
-                time.sleep(self.poll_interval_s)
+                if not dispatched:
+                    time.sleep(self.poll_interval_s)
 
         except KeyboardInterrupt:
             self._stop = True

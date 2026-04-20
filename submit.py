@@ -3,8 +3,10 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import argparse
+import csv
 import glob
 import hashlib
+import io
 import os
 import shutil
 import sys
@@ -14,6 +16,16 @@ import time
 GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
+
+# Scope CSV column -> (signal name, "active" predicate on the column
+# value as it appears in the CSV). Edit this table to change thresholds
+# or rename signals.
+SCOPE_SIGNALS = {
+    "C1": ("DSP_LED",   lambda v: v < 68),
+    "C2": ("DSP_FAULT", lambda v: v < 150),
+    "C3": ("DSP_SIG_1", lambda v: v < 150),
+    "C4": ("DSP_SIG_2", lambda v: v < 150),
+}
 
 STATE_DIR = os.environ.get(
     "TEST_SERV_DIR",
@@ -73,16 +85,61 @@ def wait_for_result(digest, timeout):
     return None
 
 
-def dump_and_cleanup(paths):
+def summarize_scope_csv(data):
+    """Reduce a scope CSV to one line per known channel listing how many
+    times the signal crossed into its active state and back out."""
+    r = csv.reader(io.StringIO(data.decode(errors="replace")))
+    try:
+        header = next(r)
+    except StopIteration:
+        return "(empty csv)\n"
+
+    cols = [(i, h) for i, h in enumerate(header) if h in SCOPE_SIGNALS]
+    prev = {i: None for i, _ in cols}
+    enter = {i: 0 for i, _ in cols}
+    leave = {i: 0 for i, _ in cols}
+    n_active = {i: 0 for i, _ in cols}
+    n_total = {i: 0 for i, _ in cols}
+
+    for row in r:
+        for i, _ in cols:
+            try:
+                active = SCOPE_SIGNALS[header[i]][1](float(row[i]))
+            except (ValueError, IndexError):
+                continue
+            if prev[i] is not None and active != prev[i]:
+                (enter if active else leave)[i] += 1
+            prev[i] = active
+            n_total[i] += 1
+            if active:
+                n_active[i] += 1
+
+    name_w = max(len(n) for n, _ in SCOPE_SIGNALS.values())
+    lines = []
+    for i, ch in cols:
+        name = SCOPE_SIGNALS[ch][0]
+        pct = (100.0 * n_active[i] / n_total[i]) if n_total[i] else 0.0
+        lines.append(
+            f"{ch} {name:<{name_w}}  "
+            f"went_active={enter[i]} went_inactive={leave[i]}"
+            f"  duty={pct:5.1f}%"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def dump_and_cleanup(paths, raw_scope=False):
     txt_bytes = None
     for p in paths:
         with open(p, "rb") as f:
             data = f.read()
         name = os.path.basename(p)
         sys.stdout.buffer.write(f"=== {name} ===\n".encode())
-        sys.stdout.buffer.write(data)
-        if not data.endswith(b"\n"):
-            sys.stdout.buffer.write(b"\n")
+        if p.endswith(".csv") and not raw_scope:
+            sys.stdout.buffer.write(summarize_scope_csv(data).encode())
+        else:
+            sys.stdout.buffer.write(data)
+            if not data.endswith(b"\n"):
+                sys.stdout.buffer.write(b"\n")
         if p.endswith(".txt"):
             txt_bytes = data
     sys.stdout.buffer.flush()
@@ -111,12 +168,12 @@ def parse_meta_kv(pairs):
     return meta
 
 
-def fetch(digest, expected_path):
+def fetch(digest, expected_path, raw_scope=False):
     paths = output_paths(digest)
     if not paths:
         print(f"no outputs for digest {digest}", file=sys.stderr)
         return 1
-    txt_bytes = dump_and_cleanup(paths)
+    txt_bytes = dump_and_cleanup(paths, raw_scope=raw_scope)
     if expected_path is not None:
         return compare(txt_bytes, expected_path)
     return 0
@@ -135,6 +192,8 @@ def main():
                     help="capture duration in seconds (sent as X-Test-Runtime)")
     ap.add_argument("--meta", action="append", metavar="KEY=VAL",
                     help="extra sidecar key=value (repeatable)")
+    ap.add_argument("--raw-scope", action="store_true",
+                    help="dump the full scope CSV instead of the summary")
     args = ap.parse_args()
 
     if args.fetch and args.job:
@@ -143,7 +202,7 @@ def main():
         ap.error("either a job file or --fetch DIGEST is required")
 
     if args.fetch:
-        return fetch(args.fetch, args.expected)
+        return fetch(args.fetch, args.expected, raw_scope=args.raw_scope)
 
     meta = parse_meta_kv(args.meta)
     if args.runtime is not None:
@@ -167,7 +226,7 @@ def main():
     if paths is None:
         return 1
 
-    txt_bytes = dump_and_cleanup(paths)
+    txt_bytes = dump_and_cleanup(paths, raw_scope=args.raw_scope)
 
     if args.expected is not None:
         return compare(txt_bytes, args.expected)
