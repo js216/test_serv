@@ -20,12 +20,28 @@ CLK_DIV_32, CLK_DIV_64, CLK_DIV_128, CLK_DIV_256, CLK_DIV_512 = 4, 5, 6, 7, 8
 
 MODE_SINGLE, MODE_DUAL, MODE_QUAD = 1, 2, 4
 
+ROLE_MASTER, ROLE_SLAVE = 0, 1
+
+SYS_CLK_24, SYS_CLK_48, SYS_CLK_60, SYS_CLK_80 = 0, 1, 2, 3
+
 # flags bits: bit0 CPOL idle-high, bit1 CPHA clock-leading.
 # Boot-path defaults = CPOL idle-low, CPHA clock-trailing -> flags = 0.
 
 
 def header(clk_div=CLK_DIV_8, mode=MODE_SINGLE, flags=0):
+    """v1 header: master-only, no sys_clk control."""
     return b"QSPI" + struct.pack("<BBBB", 1, clk_div, mode, flags)
+
+
+def header_v2(role=ROLE_MASTER, sys_clk=SYS_CLK_80,
+              clk_div=CLK_DIV_8, mode=MODE_SINGLE, flags=0):
+    """v2 header: carries role + FT4222 system clock selector.
+
+    Default sys_clk=SYS_CLK_80 is required to hit the 20 MHz slave SCK
+    ceiling (datasheet Table 4.2).
+    """
+    return b"QSPI" + struct.pack("<BBBBBB", 2, role, sys_clk,
+                                 clk_div, mode, flags)
 
 
 def _tlv(tag, payload):
@@ -46,6 +62,16 @@ def write_prbs(seed, n):      return _tlv(0x07, struct.pack("<II", seed, n))
 def read_verify_prbs(seed, n):return _tlv(0x08, struct.pack("<II", seed, n))
 def xfer_prbs(seed, n):       return _tlv(0x09, struct.pack("<II", seed, n))
 def uart_tx(data):            return _tlv(0x0A, bytes(data))
+
+# slave-role ops (only valid when header role=ROLE_SLAVE)
+def slave_write(data):
+    return _tlv(0x20, bytes(data))
+def slave_read(nbytes, timeout_ms):
+    return _tlv(0x21, struct.pack("<II", nbytes, timeout_ms))
+def slave_read_verify_prbs(seed, nbytes, timeout_ms):
+    return _tlv(0x22, struct.pack("<III", seed, nbytes, timeout_ms))
+def slave_write_prbs(seed, nbytes):
+    return _tlv(0x23, struct.pack("<II", seed, nbytes))
 
 
 def prbs_xorshift32(seed, nbytes):

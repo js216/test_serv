@@ -198,12 +198,24 @@ class QspiTest:
         7: ft4222.SPIMaster.Clock.DIV_256,
         8: ft4222.SPIMaster.Clock.DIV_512,
     }
+    # FT4222 system clock options; max slave SCK scales with this
+    # (datasheet Table 4.2: 80 MHz -> 20 MHz SCK, 60 -> 15, 48 -> 12, 24 -> 6).
+    SYS_CLK_MAP = {
+        0: "SYS_CLK_24",
+        1: "SYS_CLK_48",
+        2: "SYS_CLK_60",
+        3: "SYS_CLK_80",
+    }
 
-    def _init_dev(self, dev, clk, mode, flags):
+    def _cpol_cpha(self, flags):
         cpol = (ft4222.SPI.Cpol.IDLE_HIGH if (flags & 0x1)
                 else ft4222.SPI.Cpol.IDLE_LOW)
         cpha = (ft4222.SPI.Cpha.CLK_LEADING if (flags & 0x2)
                 else ft4222.SPI.Cpha.CLK_TRAILING)
+        return cpol, cpha
+
+    def _init_master(self, dev, clk, mode, flags):
+        cpol, cpha = self._cpol_cpha(flags)
         dev.spiMaster_Init(
             self.MODE_MAP[mode],
             self.CLK_MAP[clk],
@@ -212,23 +224,83 @@ class QspiTest:
             ft4222.SPIMaster.SlaveSelect.SS0,
         )
 
+    def _init_slave(self, dev, flags):
+        # FT4222 slave is single-bit only (datasheet line 1187). Raw mode
+        # (NO_PROTOCOL) passes bytes through without the library's ack
+        # framing -- we want direct byte-stream access to what the DSP
+        # shifts in / out.
+        dev.spiSlave_InitEx(ft4222.SPISlave.IoProtocol.NO_PROTOCOL)
+        cpol, cpha = self._cpol_cpha(flags)
+        dev.spiSlave_SetMode(cpol, cpha)
+
+    def _slave_drain(self, dev, nbytes, timeout_ms):
+        """Block until ``nbytes`` have landed in the FT4222 slave RX FIFO
+        or ``timeout_ms`` elapses, whichever first. Returns what we got.
+
+        FT4222 slave RX FIFO is backed by the shared 4160 B endpoint SRAM
+        (datasheet line 1009), so long streams must be drained faster
+        than the DSP master fills them.
+        """
+        deadline = time.time() + timeout_ms / 1000.0
+        got = bytearray()
+        while len(got) < nbytes and time.time() < deadline:
+            avail = dev.spiSlave_GetRxStatus()
+            if avail <= 0:
+                time.sleep(0.0005)
+                continue
+            want = min(avail, nbytes - len(got))
+            got += bytes(dev.spiSlave_Read(want))
+        return bytes(got)
+
+    def _set_sys_clk(self, sys_clk):
+        # sys_clk byte is optional (v1 headers don't carry it). Use the
+        # module-level clock rate enum; if the installed pyft4222 names
+        # things differently the import below will raise and main() logs
+        # it once.
+        name = self.SYS_CLK_MAP[sys_clk]
+        rate = getattr(ft4222.ClockRate, name)
+        ft4222.setClock(rate)
+
     def run(self, payload, ser=None):
         if payload[:4] != b"QSPI":
             raise ValueError("bad magic")
-        ver, clk, mode, flags = struct.unpack("<BBBB", payload[4:8])
-        if ver != 1:
+        ver = payload[4]
+        if ver == 1:
+            clk, mode, flags = struct.unpack("<BBB", payload[5:8])
+            role = 0
+            sys_clk = None
+            hdr_len = 8
+        elif ver == 2:
+            role, sys_clk, clk, mode, flags = struct.unpack(
+                "<BBBBB", payload[5:10])
+            hdr_len = 10
+        else:
             raise ValueError(f"unsupported qspi job version {ver}")
+
+        if role == 1 and mode != 1:
+            raise ValueError("slave mode requires mode=1 (SINGLE); "
+                             "FT4222 slave is single-bit only")
 
         read_bin = bytearray()
         log = []
-        log.append(f"init clk_div={clk} mode={mode} flags=0x{flags:02x}")
+        log.append(
+            f"init role={'slave' if role else 'master'} "
+            f"sys_clk={sys_clk} clk_div={clk} mode={mode} "
+            f"flags=0x{flags:02x}"
+        )
+
+        if sys_clk is not None:
+            self._set_sys_clk(sys_clk)
 
         dev = ft4222.openByDescription('FT4222 A')
         t0 = time.time()
         try:
-            self._init_dev(dev, clk, mode, flags)
+            if role == 0:
+                self._init_master(dev, clk, mode, flags)
+            else:
+                self._init_slave(dev, flags)
 
-            pos = 8
+            pos = hdr_len
             op_idx = 0
             while pos < len(payload):
                 tag = payload[pos]
@@ -236,6 +308,18 @@ class QspiTest:
                 body = payload[pos+5:pos+5+ln]
                 pos += 5 + ln
                 op_idx += 1
+
+                # Master opcodes 0x01..0x09 require master role; slave
+                # opcodes 0x20..0x23 require slave role; the rest are
+                # role-neutral (delay_us, reinit, uart_tx).
+                if 0x01 <= tag <= 0x09 and role != 0:
+                    raise ValueError(
+                        f"master opcode 0x{tag:02x} not allowed in "
+                        f"slave-role session")
+                if 0x20 <= tag <= 0x23 and role != 1:
+                    raise ValueError(
+                        f"slave opcode 0x{tag:02x} not allowed in "
+                        f"master-role session")
 
                 top = time.time()
                 if tag == 0x01:   # write
@@ -263,7 +347,13 @@ class QspiTest:
                     log.append(f"[{op_idx}] delay {us} us")
                 elif tag == 0x05:   # reinit
                     nclk, nmode, nflags, _rsv = struct.unpack("<BBBB", body[:4])
-                    self._init_dev(dev, nclk, nmode, nflags)
+                    if role == 0:
+                        self._init_master(dev, nclk, nmode, nflags)
+                    else:
+                        if nmode != 1:
+                            raise ValueError(
+                                "slave reinit requires mode=1 (SINGLE)")
+                        self._init_slave(dev, nflags)
                     log.append(f"[{op_idx}] reinit clk_div={nclk} "
                                f"mode={nmode} flags=0x{nflags:02x}")
                 elif tag == 0x06:   # mixed_xfer (flash-style frame)
@@ -324,6 +414,57 @@ class QspiTest:
                     ser.write(bytes(body))
                     ser.flush()
                     log.append(f"[{op_idx}] uart_tx {len(body)}B")
+                elif tag == 0x20:   # slave_write
+                    # Queue bytes for FT4222 slave TX FIFO. The DSP master
+                    # clocks them out of MISO at its own pace.
+                    dev.spiSlave_Write(bytes(body))
+                    log.append(f"[{op_idx}] slave_write {len(body)}B queued")
+                elif tag == 0x21:   # slave_read(n, timeout_ms)
+                    n, tmo = struct.unpack("<II", body[:8])
+                    got = self._slave_drain(dev, n, tmo)
+                    read_bin += got
+                    dt = time.time() - top
+                    log.append(
+                        f"[{op_idx}] slave_read want={n} got={len(got)} "
+                        f"timeout={tmo}ms  {dt*1e3:.2f} ms"
+                    )
+                elif tag == 0x22:   # slave_read_verify_prbs(seed,n,timeout)
+                    seed, n, tmo = struct.unpack("<III", body[:12])
+                    got = self._slave_drain(dev, n, tmo)
+                    expected = prbs_xorshift32(seed, n)
+                    dt = time.time() - top
+                    if len(got) != n:
+                        log.append(
+                            f"[{op_idx}] slave_read_verify_prbs "
+                            f"seed=0x{seed:08x} want={n} got={len(got)} "
+                            f"SHORT timeout={tmo}ms  {dt*1e3:.2f} ms"
+                        )
+                        read_bin += b"--SHORT--" + got
+                    elif got == expected:
+                        log.append(
+                            f"[{op_idx}] slave_read_verify_prbs "
+                            f"seed=0x{seed:08x} {n}B OK  {dt*1e3:.2f} ms"
+                        )
+                    else:
+                        mism = sum(1 for a, b in zip(got, expected) if a != b)
+                        first = next(
+                            (i for i, (a, b) in
+                             enumerate(zip(got, expected)) if a != b), -1)
+                        log.append(
+                            f"[{op_idx}] slave_read_verify_prbs "
+                            f"seed=0x{seed:08x} {n}B FAIL "
+                            f"mismatches={mism} first_at={first}  "
+                            f"{dt*1e3:.2f} ms"
+                        )
+                        start = max(0, first - 64)
+                        read_bin += b"--MISMATCH--"
+                        read_bin += bytes(got[start:start+256])
+                elif tag == 0x23:   # slave_write_prbs
+                    seed, n = struct.unpack("<II", body[:8])
+                    buf = prbs_xorshift32(seed, n)
+                    dev.spiSlave_Write(buf)
+                    log.append(f"[{op_idx}] slave_write_prbs "
+                               f"seed=0x{seed:08x} {n}B queued")
                 else:
                     raise ValueError(f"unknown tag 0x{tag:02x} at pos {pos}")
         finally:
@@ -680,39 +821,55 @@ class DspHandler(JobHandler):
 class QspiHandler(JobHandler):
     """Run a server-defined QSPI opcode script against an already-booted DSP.
 
-    Job file grammar (little-endian throughout):
+    Job file grammar (little-endian throughout). Two header versions are
+    supported; v1 is master-only, v2 adds a role byte + system clock.
 
-        header (8 bytes):
+        v1 header (8 bytes):
             magic       = b"QSPI"
             version u8  = 1
             clk_div u8  (FT4222 Clock enum: 0=DIV_2, 1=DIV_4, ... 8=DIV_512)
             mode    u8  (1=SINGLE, 2=DUAL, 4=QUAD)
             flags   u8  (bit0 = CPOL idle-high, bit1 = CPHA clock-leading)
 
+        v2 header (10 bytes):
+            magic       = b"QSPI"
+            version u8  = 2
+            role    u8  (0 = FT4222 master / DSP slave,
+                         1 = FT4222 slave  / DSP master)
+            sys_clk u8  (0=24 MHz, 1=48 MHz, 2=60 MHz, 3=80 MHz;
+                         caps max slave SCK per datasheet Table 4.2:
+                         80->20, 60->15, 48->12, 24->6 MHz)
+            clk_div u8  (FT4222 Clock enum; master only, ignored in slave)
+            mode    u8  (master: 1/2/4 lanes; slave: must be 1)
+            flags   u8  (CPOL/CPHA as in v1)
+
         then repeated ops:
             tag u8, len u32, payload[len]
 
-        tags:
+        master opcodes (require role=0):
             0x01 write           payload = bytes out
             0x02 read            payload = u32 nbytes
             0x03 xfer            payload = bytes out (single-lane full-duplex)
-            0x04 delay_us        payload = u32 microseconds
-            0x05 reinit          payload = clk_div u8, mode u8, flags u8, _rsv u8
             0x06 mixed_xfer      payload = u16 ns, u16 nw, u32 nr,
                                            then ns + nw bytes
                                   (single-lane nsB write, multi-lane nwB write,
                                    multi-lane nrB read; one CS assertion)
             0x07 write_prbs      payload = u32 seed, u32 nbytes
-                                  (PRBS: xorshift32, see prbs_xorshift32)
             0x08 read_verify_prbs payload = u32 seed, u32 nbytes
-                                  (captures nothing to .bin unless mismatch)
             0x09 xfer_prbs       payload = u32 seed, u32 nbytes
-                                  (writes PRBS, captures MISO bytes)
+
+        slave opcodes (require role=1):
+            0x20 slave_write     payload = bytes (queued; DSP clocks them out)
+            0x21 slave_read      payload = u32 nbytes, u32 timeout_ms
+            0x22 slave_read_verify_prbs
+                                 payload = u32 seed, u32 nbytes, u32 timeout_ms
+            0x23 slave_write_prbs payload = u32 seed, u32 nbytes
+
+        role-neutral opcodes:
+            0x04 delay_us        payload = u32 microseconds
+            0x05 reinit          payload = clk_div u8, mode u8, flags u8, _rsv u8
+                                  (slave role: clk_div ignored, mode must be 1)
             0x0A uart_tx         payload = bytes to send on the DSP UART
-                                  (requires serial_port configured; use for
-                                   small control nudges mid-script -- the
-                                   DSP's UART replies land in the .uart
-                                   artefact via the background reader)
 
     Artefacts:
         .bin -- concatenation of bytes captured by read / xfer / xfer_prbs ops
