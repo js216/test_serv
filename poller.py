@@ -882,8 +882,13 @@ class DspHandler(JobHandler):
 
             if qspi_payload is not None:
                 try:
+                    # Pass the live ser so uart_tx opcodes can push
+                    # command bytes into the same session the reader
+                    # thread is draining.  pyserial supports concurrent
+                    # read (reader thread) and write (here) on one
+                    # handle.
                     qspi_bin, qspi_log = QspiTest().run(qspi_payload,
-                                                        ser=None)
+                                                        ser=ser)
                 except Exception:
                     qspi_err = ("qspi executor raised:\n"
                                 + traceback.format_exc())
