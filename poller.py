@@ -2,6 +2,7 @@ import sys
 import time
 import struct
 import threading
+import traceback
 import ft4222
 import serial
 import serial.tools.list_ports
@@ -253,13 +254,27 @@ class QspiTest:
         return bytes(got)
 
     def _set_sys_clk(self, sys_clk):
-        # sys_clk byte is optional (v1 headers don't carry it). Use the
-        # module-level clock rate enum; if the installed pyft4222 names
-        # things differently the import below will raise and main() logs
-        # it once.
+        # sys_clk byte is optional (v1 headers don't carry it). The
+        # LibFT4222 system clock enum is exposed under slightly different
+        # names across pyft4222 releases -- try the known ones before
+        # giving up so a binding mismatch produces a clean error in the
+        # job log rather than a silent drop.
         name = self.SYS_CLK_MAP[sys_clk]
-        rate = getattr(ft4222.ClockRate, name)
-        ft4222.setClock(rate)
+        rate_enum = None
+        for attr in ("ClockRate", "SysClock", "Clock"):
+            ns = getattr(ft4222, attr, None)
+            if ns is not None and hasattr(ns, name):
+                rate_enum = getattr(ns, name)
+                break
+        if rate_enum is None:
+            raise RuntimeError(
+                f"pyft4222 has no system clock enum exposing {name}; "
+                f"tried ft4222.{{ClockRate,SysClock,Clock}}"
+            )
+        setter = getattr(ft4222, "setClock", None)
+        if setter is None:
+            raise RuntimeError("pyft4222 has no ft4222.setClock()")
+        setter(rate_enum)
 
     def run(self, payload, ser=None):
         if payload[:4] != b"QSPI":
@@ -904,30 +919,53 @@ class QspiHandler(JobHandler):
         uart_buf = []
         stop_evt = threading.Event()
         reader = None
-        if self.serial_port is not None:
-            ser = serial.Serial(
-                self.serial_port,
-                baudrate=self.baudrate,
-                timeout=0.1,
-            )
-            ser.reset_input_buffer()
-            reader = threading.Thread(
-                target=self._uart_reader,
-                args=(ser, stop_evt, uart_buf),
-                daemon=True,
-            )
-            reader.start()
+        read_bin = b""
+        log = ""
+        err_tb = None
 
         try:
-            read_bin, log = self.qspi_test.run(payload, ser=ser)
+            if self.serial_port is not None:
+                try:
+                    ser = serial.Serial(
+                        self.serial_port,
+                        baudrate=self.baudrate,
+                        timeout=0.1,
+                    )
+                    ser.reset_input_buffer()
+                    reader = threading.Thread(
+                        target=self._uart_reader,
+                        args=(ser, stop_evt, uart_buf),
+                        daemon=True,
+                    )
+                    reader.start()
+                except Exception:
+                    # UART unavailable should not prevent the SPI part
+                    # from running or from reporting its own failure.
+                    err_tb = ("UART open failed:\n" + traceback.format_exc())
+                    ser = None
+                    reader = None
+
+            try:
+                read_bin, log = self.qspi_test.run(payload, ser=ser)
+            except Exception:
+                # Capture whatever log the executor had built up before
+                # blowing up, so the user can see where it got to.
+                err_tb = ((err_tb + "\n") if err_tb else "") \
+                    + "qspi executor raised:\n" + traceback.format_exc()
         finally:
             if reader is not None:
                 stop_evt.set()
                 reader.join(timeout=2.0)
             if ser is not None:
-                ser.close()
+                try:
+                    ser.close()
+                except Exception:
+                    pass
 
-        out = {".txt": log}
+        if err_tb is not None:
+            log = (log or "") + "\n--- EXCEPTION ---\n" + err_tb
+
+        out = {".txt": log or "(empty log)\n"}
         if read_bin:
             out[".bin"] = read_bin
         if uart_buf:
@@ -948,16 +986,36 @@ class Poller:
     def _dispatch(self, kind, payload, headers):
         job_id = hashlib.sha256(payload).hexdigest()
         handler = self.handlers[kind]
-        print(datetime.now(), kind, type(handler).__name__, job_id)
+        print(datetime.now(), "pickup", kind,
+              type(handler).__name__, job_id)
 
-        artefacts = handler.run(payload, headers)
+        try:
+            artefacts = handler.run(payload, headers)
+        except Exception:
+            tb = traceback.format_exc()
+            print(datetime.now(), "handler", type(handler).__name__,
+                  "raised:\n" + tb)
+            artefacts = {
+                ".txt": (f"handler {type(handler).__name__} raised "
+                         f"before returning any artefacts:\n{tb}")
+            }
 
         # .txt is the completion sentinel -- every other artefact must be
-        # on disk by the time submit.py sees it, so POST it last.
-        txt = artefacts.pop(".txt", b"")
+        # on disk by the time submit.py sees it, so POST it last. Never
+        # let a POST failure on a sibling artefact prevent the sentinel
+        # from going out, or submit.py --wait hangs until timeout.
+        txt = artefacts.pop(".txt", b"(no .txt produced)\n")
         for ext, data in artefacts.items():
-            self.remote.post_resp(job_id, data, suffix=ext)
-        self.remote.post_resp(job_id, txt)
+            try:
+                self.remote.post_resp(job_id, data, suffix=ext)
+            except Exception:
+                print(datetime.now(), f"post {ext} failed:\n"
+                      + traceback.format_exc())
+        try:
+            self.remote.post_resp(job_id, txt)
+        except Exception:
+            print(datetime.now(), "post .txt failed:\n"
+                  + traceback.format_exc())
 
     def run(self):
         try:
