@@ -829,7 +829,22 @@ class DspHandler(JobHandler):
 
         return b"".join(buf).decode(errors="replace")
 
+    # Sentinel used by submit.py to staple a qspi TLV stream onto the
+    # back of an LDR payload so both travel as a single job.  DspHandler
+    # splits on this and runs the qspi opcodes as a post-boot phase of
+    # the same session, so UART + scope capture spans reset -> boot ->
+    # qspi ops -> trailing prints without interruption.
+    QSPI_ATTACH_SEP = b"\n!QSPI-ATTACH!\n"
+
+    def _split_payload(self, payload):
+        i = payload.find(self.QSPI_ATTACH_SEP)
+        if i < 0:
+            return payload, None
+        return payload[:i], payload[i + len(self.QSPI_ATTACH_SEP):]
+
     def run(self, payload, headers):
+        ldr_payload, qspi_payload = self._split_payload(payload)
+
         # Open the UART before loading so the first byte of the new
         # firmware's output is captured. Reset halts the old firmware;
         # drain clears any bytes it emitted before reset took effect.
@@ -838,23 +853,79 @@ class DspHandler(JobHandler):
             baudrate=self.baudrate,
             timeout=0.1
         )
+        uart_buf = []
+        uart_err = []
+        stop_evt = threading.Event()
+        reader = None
+
+        qspi_log = ""
+        qspi_bin = b""
+        qspi_err = None
+
         try:
             self.expander.reset()
             self.expander.exp_init()
             ser.reset_input_buffer()
 
-            self.qspi.accept_ldr(payload)
+            # Start the UART reader *before* the boot loader runs so the
+            # first byte emitted by the new firmware is captured.  The
+            # reader runs in the background for the whole session and is
+            # only stopped after the post-op trailing window below.
+            reader = threading.Thread(
+                target=QspiHandler._uart_reader_fn,
+                args=(ser, stop_evt, uart_buf, uart_err),
+                daemon=True,
+            )
+            reader.start()
+
+            self.qspi.accept_ldr(ldr_payload)
+
+            if qspi_payload is not None:
+                try:
+                    qspi_bin, qspi_log = QspiTest().run(qspi_payload,
+                                                        ser=None)
+                except Exception:
+                    qspi_err = ("qspi executor raised:\n"
+                                + traceback.format_exc())
 
             duration = float(headers.get("X-Test-Runtime", self.rx_duration_s))
-            uart_msg = self._read_serial_for(ser, duration)
+            # Hold the session open for the full runtime so the reader
+            # keeps draining any trailing prints the firmware emits
+            # after the qspi ops finish.
+            time.sleep(duration)
         finally:
-            ser.close()
+            if reader is not None:
+                stop_evt.set()
+                reader.join(timeout=2.0)
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+        uart_msg = b"".join(uart_buf).decode(errors="replace")
+        uart_bytes = len(uart_msg.encode(errors="replace"))
+        reader_state = ("not started" if reader is None
+                        else "alive" if reader.is_alive()
+                        else "exited")
+
+        log = uart_msg
+        if qspi_payload is not None:
+            log += ("\n--- QSPI SESSION ---\n" + (qspi_log or "")
+                    + f"\nqspi_bin={len(qspi_bin)} bytes\n")
+        log += (f"\nuart reader: {reader_state}, drained {uart_bytes} bytes"
+                f" over {duration:.3f}s\n")
+        for e in uart_err:
+            log += "\n--- UART READER EXCEPTION ---\n" + e
+        if qspi_err is not None:
+            log += "\n--- QSPI EXCEPTION ---\n" + qspi_err
 
         artefacts = {}
         if self.scope is not None:
             traces = self.scope.get_traces(("C1", "C2", "C3", "C4"))
             artefacts[".csv"] = self.scope.traces_to_csv(traces)
-        artefacts[".txt"] = uart_msg
+        artefacts[".txt"] = log
+        if qspi_bin:
+            artefacts[".bin"] = qspi_bin
         return artefacts
 
 
@@ -922,7 +993,13 @@ class QspiHandler(JobHandler):
         self.serial_port = serial_port
         self.baudrate = baudrate
 
+    # Kept as a thin wrapper around the shared helper so existing
+    # QspiHandler.run() call sites don't have to change.
     def _uart_reader(self, ser, stop_evt, out_buf, err_sink):
+        QspiHandler._uart_reader_fn(ser, stop_evt, out_buf, err_sink)
+
+    @staticmethod
+    def _uart_reader_fn(ser, stop_evt, out_buf, err_sink):
         """Drain ``ser`` into ``out_buf`` until ``stop_evt`` is set.
 
         Runs in a daemon thread so that UART bytes emitted by the DSP
@@ -940,7 +1017,7 @@ class QspiHandler(JobHandler):
                 data = ser.read(1024)
                 if data:
                     out_buf.append(data)
-            # Final drain after the SPI script is done, in case the DSP
+            # Final drain after the stop event fires, in case the DSP
             # emits a trailing summary line.
             data = ser.read(4096)
             if data:

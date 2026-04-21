@@ -27,6 +27,10 @@ SCOPE_SIGNALS = {
     "C4": ("DSP_SIG_2", lambda v: v < 150),
 }
 
+# Sentinel stapling qspi TLV onto an LDR.  Must match
+# poller.DspHandler.QSPI_ATTACH_SEP verbatim.
+QSPI_ATTACH_SEP = b"\n!QSPI-ATTACH!\n"
+
 STATE_DIR = os.environ.get(
     "TEST_SERV_DIR",
     f"/tmp/test_serv-{os.getenv('USER', 'anon')}",
@@ -45,11 +49,19 @@ def output_paths(digest):
     return paths
 
 
-def submit(src_path, meta):
+def submit(src_path, meta, qspi_path=None):
     with open(src_path, "rb") as f:
         data = f.read()
-    digest = hashlib.sha256(data).hexdigest()
     ext = os.path.splitext(src_path)[1].lstrip(".")
+    if qspi_path is not None:
+        if ext != "ldr":
+            raise ValueError(f"--qspi requires an .ldr primary, got .{ext}")
+        with open(qspi_path, "rb") as f:
+            qspi_data = f.read()
+        if QSPI_ATTACH_SEP in data or QSPI_ATTACH_SEP in qspi_data:
+            raise ValueError("payload collides with QSPI_ATTACH_SEP sentinel")
+        data = data + QSPI_ATTACH_SEP + qspi_data
+    digest = hashlib.sha256(data).hexdigest()
     if not ext:
         raise ValueError(f"{src_path}: cannot infer extension (kind)")
     if output_paths(digest):
@@ -70,7 +82,10 @@ def submit(src_path, meta):
             f.flush()
             os.fsync(f.fileno())
     tmp = f"{dst}.inprogress"
-    shutil.copyfile(src_path, tmp)
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
     os.rename(tmp, dst)
     return digest
 
@@ -208,6 +223,11 @@ def main():
     ap.add_argument("--expected")
     ap.add_argument("--runtime", type=float,
                     help="capture duration in seconds (sent as X-Test-Runtime)")
+    ap.add_argument("--qspi", metavar="FILE",
+                    help="staple a .qspi TLV stream onto the .ldr job; the "
+                         "hardware harness executes the qspi ops in the same "
+                         "UART+scope session, between boot and the trailing "
+                         "capture window")
     ap.add_argument("--meta", action="append", metavar="KEY=VAL",
                     help="extra sidecar key=value (repeatable)")
     ap.add_argument("--raw-scope", action="store_true",
@@ -234,7 +254,7 @@ def main():
         meta["runtime"] = str(args.runtime)
 
     try:
-        digest = submit(args.job, meta)
+        digest = submit(args.job, meta, qspi_path=args.qspi)
     except StaleOutputsError as e:
         print(f"output stale; run:\n    python3 submit.py --fetch {e}",
               file=sys.stderr)
