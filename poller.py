@@ -922,26 +922,37 @@ class QspiHandler(JobHandler):
         self.serial_port = serial_port
         self.baudrate = baudrate
 
-    def _uart_reader(self, ser, stop_evt, out_buf):
+    def _uart_reader(self, ser, stop_evt, out_buf, err_sink):
         """Drain ``ser`` into ``out_buf`` until ``stop_evt`` is set.
 
         Runs in a daemon thread so that UART bytes emitted by the DSP
         while the SPI opcode script executes are captured alongside
         the SPI traffic, not only after it finishes.
+
+        Any exception is captured into ``err_sink`` instead of killing
+        the thread silently -- without this, a raise inside ``ser.read``
+        (port contention, USB hot-unplug, ...) would leave ``out_buf``
+        mysteriously empty and we'd have no way to tell that the
+        reader died mid-job.
         """
-        while not stop_evt.is_set():
-            data = ser.read(1024)
+        try:
+            while not stop_evt.is_set():
+                data = ser.read(1024)
+                if data:
+                    out_buf.append(data)
+            # Final drain after the SPI script is done, in case the DSP
+            # emits a trailing summary line.
+            data = ser.read(4096)
             if data:
                 out_buf.append(data)
-        # Final drain after the SPI script is done, in case the DSP
-        # emits a trailing summary line.
-        data = ser.read(4096)
-        if data:
-            out_buf.append(data)
+        except Exception:
+            err_sink.append("uart reader raised:\n"
+                            + traceback.format_exc())
 
     def run(self, payload, headers):
         ser = None
         uart_buf = []
+        uart_err = []
         stop_evt = threading.Event()
         reader = None
         read_bin = b""
@@ -959,7 +970,7 @@ class QspiHandler(JobHandler):
                     ser.reset_input_buffer()
                     reader = threading.Thread(
                         target=self._uart_reader,
-                        args=(ser, stop_evt, uart_buf),
+                        args=(ser, stop_evt, uart_buf, uart_err),
                         daemon=True,
                     )
                     reader.start()
@@ -987,8 +998,20 @@ class QspiHandler(JobHandler):
                 except Exception:
                     pass
 
+        # Surface reader-thread lifecycle in the log so an empty .uart
+        # is distinguishable from a crashed reader.
+        uart_bytes = sum(len(b) for b in uart_buf)
+        reader_state = ("not started" if reader is None
+                        else "alive" if reader.is_alive()
+                        else "exited")
+        log = (log or "") + (
+            f"\nuart reader: {reader_state}, drained {uart_bytes} bytes\n"
+        )
+        for e in uart_err:
+            log += "\n--- UART READER EXCEPTION ---\n" + e
+
         if err_tb is not None:
-            log = (log or "") + "\n--- EXCEPTION ---\n" + err_tb
+            log += "\n--- EXCEPTION ---\n" + err_tb
 
         out = {".txt": log or "(empty log)\n"}
         if read_bin:
