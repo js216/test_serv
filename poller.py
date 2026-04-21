@@ -254,12 +254,18 @@ class QspiTest:
         return bytes(got)
 
     def _set_sys_clk(self, sys_clk):
-        # sys_clk byte is optional (v1 headers don't carry it). The
-        # LibFT4222 system clock enum is exposed under slightly different
-        # names across pyft4222 releases -- try the known ones before
-        # giving up so a binding mismatch produces a clean error in the
-        # job log rather than a silent drop.
+        # sys_clk is a slave-role constraint: it caps the maximum SCK
+        # the FT4222 can follow as a slave (datasheet Table 4.2).
+        # Master-role callers can ignore it, which is why run() below
+        # only invokes this for role == 1.
+        #
+        # The enum and setter live under slightly different names
+        # across pyft4222 releases. Try the known paths, then fall
+        # back to introspecting the module -- and if that still
+        # fails, dump what's actually available so the next fix can
+        # name the right attribute without another round-trip.
         name = self.SYS_CLK_MAP[sys_clk]
+
         rate_enum = None
         for attr in ("ClockRate", "SysClock", "Clock"):
             ns = getattr(ft4222, attr, None)
@@ -267,13 +273,28 @@ class QspiTest:
                 rate_enum = getattr(ns, name)
                 break
         if rate_enum is None:
+            for top in dir(ft4222):
+                ns = getattr(ft4222, top, None)
+                if hasattr(ns, name):
+                    rate_enum = getattr(ns, name)
+                    break
+        if rate_enum is None:
+            clockish = [n for n in dir(ft4222)
+                        if "CLK" in n.upper() or "CLOCK" in n.upper()]
             raise RuntimeError(
                 f"pyft4222 has no system clock enum exposing {name}; "
-                f"tried ft4222.{{ClockRate,SysClock,Clock}}"
+                f"ft4222 attrs matching CLK/CLOCK: {clockish}; "
+                f"full dir(ft4222)={dir(ft4222)}"
             )
-        setter = getattr(ft4222, "setClock", None)
+
+        setter = (getattr(ft4222, "setClock", None)
+                  or getattr(ft4222, "setSysClock", None))
         if setter is None:
-            raise RuntimeError("pyft4222 has no ft4222.setClock()")
+            setterish = [n for n in dir(ft4222) if "et" in n and "lock" in n]
+            raise RuntimeError(
+                f"pyft4222 has no setClock/setSysClock; "
+                f"ft4222 attrs matching *et*lock*: {setterish}"
+            )
         setter(rate_enum)
 
     def run(self, payload, ser=None):
@@ -304,7 +325,11 @@ class QspiTest:
             f"flags=0x{flags:02x}"
         )
 
-        if sys_clk is not None:
+        # sys_clk only matters when the FT4222 is the slave (it caps
+        # the SCK it can track, per datasheet Table 4.2). For master
+        # role it is cosmetic, so skip the call and avoid an
+        # unnecessary dependency on the pyft4222 clock-enum naming.
+        if sys_clk is not None and role == 1:
             self._set_sys_clk(sys_clk)
 
         dev = ft4222.openByDescription('FT4222 A')
