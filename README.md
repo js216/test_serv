@@ -4,8 +4,8 @@ A minimal hardware-test dispatcher: a submitter drops a job file into a
 shared directory, the hardware-side harness polls for jobs matching its
 kind, runs them, and posts the result artefacts back.  Jobs are routed
 by file extension, so a single server handles any mix of hardware kinds
-(`.ldr` for DSP firmware, `.bin` for iCE40 FPGA bitstreams, etc.) with
-no code changes.
+(`.ldr` for DSP firmware, `.bin` for iCE40 FPGA bitstreams, `.qspi` for
+post-boot QSPI link tests, etc.) with no code changes.
 
 ### Running the server
 
@@ -32,6 +32,10 @@ Flags:
                         byte against FILE; exit 0 on SUCCESS, 1 on FAIL
     --fetch DIGEST      dump and clean up outputs for a previously-submitted
                         digest; use after a fire-and-forget submit
+    --out DIR           move non-.txt artefacts (e.g. .bin, .csv) into DIR
+                        instead of deleting them after summarizing; required
+                        whenever you want to keep the raw bytes, since binary
+                        artefacts are never dumped to stdout
 
 Without `--wait`, submit.py returns as soon as the job is queued and
 prints the SHA-256 digest to stdout (fire-and-forget).  The job's kind
@@ -61,6 +65,27 @@ artefact back:
 The `.txt` is the completion marker; by convention the harness posts all
 other artefacts first so that by the time the submitter sees the
 `.txt`, every sibling file is already on disk.
+
+### Post-boot QSPI link tests (`.qspi`)
+
+Once the DSP has booted (via an `.ldr` job), the FT4222 QSPI master can be
+re-used for link-quality and throughput tests.  The poller exposes a thin
+opcode executor: the server-side test author builds a binary TLV stream
+describing init + a sequence of primitive SPI operations, the poller runs
+them against whatever post-boot firmware the DSP exposes on its SPI slave,
+and returns captured MISO bytes plus a per-op timing log.
+
+The poller has no test semantics of its own beyond one shared PRBS generator
+(32-bit xorshift) that both it and the DSP firmware must implement
+identically, so large patterns can be described by a seed + length rather
+than by embedding the bytes in the job file.
+
+See `examples/make_qspi.py` for the TLV grammar and helper constructors,
+and `poller.py :: QspiHandler` for the canonical opcode table.
+
+While the opcode script runs, the DSP UART is drained in a background
+thread and returned as a `.uart` artefact, so any diagnostic prints the
+firmware emits during a PRBS stream are captured in the same job.
 
 ### Author
 

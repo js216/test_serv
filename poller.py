@@ -1,5 +1,7 @@
 import sys
 import time
+import struct
+import threading
 import ft4222
 import serial
 import serial.tools.list_ports
@@ -153,6 +155,186 @@ class QSPI:
         self._write_chunked(dev, boot_buffer)
 
         dev.close()
+
+
+# PRBS generator: 32-bit xorshift. Must be bit-identical on DSP side.
+# Initial state = seed (must be non-zero). Each call updates state by:
+#     x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+# Then emits the low 8 bits of the new state as the next output byte.
+def prbs_xorshift32(seed, nbytes):
+    x = seed & 0xFFFFFFFF
+    if x == 0:
+        x = 0x1
+    out = bytearray(nbytes)
+    for i in range(nbytes):
+        x ^= (x << 13) & 0xFFFFFFFF
+        x ^= (x >> 17) & 0xFFFFFFFF
+        x ^= (x << 5)  & 0xFFFFFFFF
+        out[i] = x & 0xFF
+    return bytes(out)
+
+
+class QspiTest:
+    """Server-driven QSPI test executor.
+
+    Input job file is a TLV stream; see handler docstring for the grammar.
+    The poller has no test semantics beyond the per-op FT4222 calls and
+    a bit-exact PRBS generator shared with the DSP firmware.
+    """
+
+    MODE_MAP = {
+        1: ft4222.SPIMaster.Mode.SINGLE,
+        2: ft4222.SPIMaster.Mode.DUAL,
+        4: ft4222.SPIMaster.Mode.QUAD,
+    }
+    CLK_MAP = {
+        0: ft4222.SPIMaster.Clock.DIV_2,
+        1: ft4222.SPIMaster.Clock.DIV_4,
+        2: ft4222.SPIMaster.Clock.DIV_8,
+        3: ft4222.SPIMaster.Clock.DIV_16,
+        4: ft4222.SPIMaster.Clock.DIV_32,
+        5: ft4222.SPIMaster.Clock.DIV_64,
+        6: ft4222.SPIMaster.Clock.DIV_128,
+        7: ft4222.SPIMaster.Clock.DIV_256,
+        8: ft4222.SPIMaster.Clock.DIV_512,
+    }
+
+    def _init_dev(self, dev, clk, mode, flags):
+        cpol = (ft4222.SPI.Cpol.IDLE_HIGH if (flags & 0x1)
+                else ft4222.SPI.Cpol.IDLE_LOW)
+        cpha = (ft4222.SPI.Cpha.CLK_LEADING if (flags & 0x2)
+                else ft4222.SPI.Cpha.CLK_TRAILING)
+        dev.spiMaster_Init(
+            self.MODE_MAP[mode],
+            self.CLK_MAP[clk],
+            cpol,
+            cpha,
+            ft4222.SPIMaster.SlaveSelect.SS0,
+        )
+
+    def run(self, payload, ser=None):
+        if payload[:4] != b"QSPI":
+            raise ValueError("bad magic")
+        ver, clk, mode, flags = struct.unpack("<BBBB", payload[4:8])
+        if ver != 1:
+            raise ValueError(f"unsupported qspi job version {ver}")
+
+        read_bin = bytearray()
+        log = []
+        log.append(f"init clk_div={clk} mode={mode} flags=0x{flags:02x}")
+
+        dev = ft4222.openByDescription('FT4222 A')
+        t0 = time.time()
+        try:
+            self._init_dev(dev, clk, mode, flags)
+
+            pos = 8
+            op_idx = 0
+            while pos < len(payload):
+                tag = payload[pos]
+                ln = struct.unpack("<I", payload[pos+1:pos+5])[0]
+                body = payload[pos+5:pos+5+ln]
+                pos += 5 + ln
+                op_idx += 1
+
+                top = time.time()
+                if tag == 0x01:   # write
+                    dev.spiMaster_SingleWrite(bytes(body), True)
+                    dt = time.time() - top
+                    log.append(f"[{op_idx}] write {len(body)}B  {dt*1e3:.2f} ms "
+                               f"{len(body)/dt/1e6:.2f} MB/s" if dt > 0
+                               else f"[{op_idx}] write {len(body)}B")
+                elif tag == 0x02:   # read
+                    n = struct.unpack("<I", body[:4])[0]
+                    got = dev.spiMaster_SingleRead(n, True)
+                    read_bin += bytes(got)
+                    dt = time.time() - top
+                    log.append(f"[{op_idx}] read {n}B  {dt*1e3:.2f} ms "
+                               f"{n/dt/1e6:.2f} MB/s" if dt > 0
+                               else f"[{op_idx}] read {n}B")
+                elif tag == 0x03:   # xfer (single-lane full-duplex)
+                    got = dev.spiMaster_SingleReadWrite(bytes(body), True)
+                    read_bin += bytes(got)
+                    dt = time.time() - top
+                    log.append(f"[{op_idx}] xfer {len(body)}B  {dt*1e3:.2f} ms")
+                elif tag == 0x04:   # delay_us
+                    us = struct.unpack("<I", body[:4])[0]
+                    time.sleep(us / 1e6)
+                    log.append(f"[{op_idx}] delay {us} us")
+                elif tag == 0x05:   # reinit
+                    nclk, nmode, nflags, _rsv = struct.unpack("<BBBB", body[:4])
+                    self._init_dev(dev, nclk, nmode, nflags)
+                    log.append(f"[{op_idx}] reinit clk_div={nclk} "
+                               f"mode={nmode} flags=0x{nflags:02x}")
+                elif tag == 0x06:   # mixed_xfer (flash-style frame)
+                    ns, nw = struct.unpack("<HH", body[:4])
+                    nr = struct.unpack("<I", body[4:8])[0]
+                    sbuf = bytes(body[8:8+ns])
+                    mbuf = bytes(body[8+ns:8+ns+nw])
+                    got = dev.spiMaster_MultiReadWrite(sbuf, mbuf, nr)
+                    if got:
+                        read_bin += bytes(got)
+                    dt = time.time() - top
+                    log.append(f"[{op_idx}] mixed_xfer ns={ns} nw={nw} nr={nr}  "
+                               f"{dt*1e3:.2f} ms")
+                elif tag == 0x07:   # write_prbs
+                    seed, n = struct.unpack("<II", body[:8])
+                    buf = prbs_xorshift32(seed, n)
+                    dev.spiMaster_SingleWrite(buf, True)
+                    dt = time.time() - top
+                    log.append(f"[{op_idx}] write_prbs seed=0x{seed:08x} {n}B  "
+                               f"{dt*1e3:.2f} ms "
+                               f"{n/dt/1e6:.2f} MB/s" if dt > 0 else
+                               f"[{op_idx}] write_prbs seed=0x{seed:08x} {n}B")
+                elif tag == 0x08:   # read_verify_prbs
+                    seed, n = struct.unpack("<II", body[:8])
+                    got = bytes(dev.spiMaster_SingleRead(n, True))
+                    expected = prbs_xorshift32(seed, n)
+                    dt = time.time() - top
+                    if got == expected:
+                        log.append(f"[{op_idx}] read_verify_prbs "
+                                   f"seed=0x{seed:08x} {n}B OK  "
+                                   f"{dt*1e3:.2f} ms")
+                    else:
+                        mism = sum(1 for a, b in zip(got, expected) if a != b)
+                        first = next((i for i, (a, b) in
+                                      enumerate(zip(got, expected)) if a != b), -1)
+                        log.append(f"[{op_idx}] read_verify_prbs "
+                                   f"seed=0x{seed:08x} {n}B FAIL "
+                                   f"mismatches={mism} first_at={first}  "
+                                   f"{dt*1e3:.2f} ms")
+                        # keep first 256 bytes around the first mismatch in .bin
+                        start = max(0, first - 64)
+                        read_bin += b"--MISMATCH--"
+                        read_bin += bytes(got[start:start+256])
+                elif tag == 0x09:   # xfer_prbs
+                    seed, n = struct.unpack("<II", body[:8])
+                    buf = prbs_xorshift32(seed, n)
+                    got = bytes(dev.spiMaster_SingleReadWrite(buf, True))
+                    read_bin += got
+                    dt = time.time() - top
+                    log.append(f"[{op_idx}] xfer_prbs seed=0x{seed:08x} {n}B  "
+                               f"{dt*1e3:.2f} ms")
+                elif tag == 0x0A:   # uart_tx
+                    if ser is None:
+                        raise RuntimeError(
+                            "uart_tx opcode requires QspiHandler "
+                            "with serial_port configured"
+                        )
+                    ser.write(bytes(body))
+                    ser.flush()
+                    log.append(f"[{op_idx}] uart_tx {len(body)}B")
+                else:
+                    raise ValueError(f"unknown tag 0x{tag:02x} at pos {pos}")
+        finally:
+            dev.close()
+
+        total = time.time() - t0
+        log.append(f"done: {op_idx} ops, {total*1e3:.2f} ms total, "
+                   f"{len(read_bin)} bytes read")
+        if read_bin:
+            log.append(f"read sha256={hashlib.sha256(read_bin).hexdigest()}")
+        return bytes(read_bin), "\n".join(log) + "\n"
 
 
 class ScopeDriver:
@@ -495,6 +677,107 @@ class DspHandler(JobHandler):
         return artefacts
 
 
+class QspiHandler(JobHandler):
+    """Run a server-defined QSPI opcode script against an already-booted DSP.
+
+    Job file grammar (little-endian throughout):
+
+        header (8 bytes):
+            magic       = b"QSPI"
+            version u8  = 1
+            clk_div u8  (FT4222 Clock enum: 0=DIV_2, 1=DIV_4, ... 8=DIV_512)
+            mode    u8  (1=SINGLE, 2=DUAL, 4=QUAD)
+            flags   u8  (bit0 = CPOL idle-high, bit1 = CPHA clock-leading)
+
+        then repeated ops:
+            tag u8, len u32, payload[len]
+
+        tags:
+            0x01 write           payload = bytes out
+            0x02 read            payload = u32 nbytes
+            0x03 xfer            payload = bytes out (single-lane full-duplex)
+            0x04 delay_us        payload = u32 microseconds
+            0x05 reinit          payload = clk_div u8, mode u8, flags u8, _rsv u8
+            0x06 mixed_xfer      payload = u16 ns, u16 nw, u32 nr,
+                                           then ns + nw bytes
+                                  (single-lane nsB write, multi-lane nwB write,
+                                   multi-lane nrB read; one CS assertion)
+            0x07 write_prbs      payload = u32 seed, u32 nbytes
+                                  (PRBS: xorshift32, see prbs_xorshift32)
+            0x08 read_verify_prbs payload = u32 seed, u32 nbytes
+                                  (captures nothing to .bin unless mismatch)
+            0x09 xfer_prbs       payload = u32 seed, u32 nbytes
+                                  (writes PRBS, captures MISO bytes)
+            0x0A uart_tx         payload = bytes to send on the DSP UART
+                                  (requires serial_port configured; use for
+                                   small control nudges mid-script -- the
+                                   DSP's UART replies land in the .uart
+                                   artefact via the background reader)
+
+    Artefacts:
+        .bin -- concatenation of bytes captured by read / xfer / xfer_prbs ops
+                and mismatch excerpts from read_verify_prbs
+        .txt -- per-op log with timing and throughput; pass/fail for PRBS verify
+    """
+
+    def __init__(self, serial_port=None, baudrate=115200):
+        self.qspi_test = QspiTest()
+        self.serial_port = serial_port
+        self.baudrate = baudrate
+
+    def _uart_reader(self, ser, stop_evt, out_buf):
+        """Drain ``ser`` into ``out_buf`` until ``stop_evt`` is set.
+
+        Runs in a daemon thread so that UART bytes emitted by the DSP
+        while the SPI opcode script executes are captured alongside
+        the SPI traffic, not only after it finishes.
+        """
+        while not stop_evt.is_set():
+            data = ser.read(1024)
+            if data:
+                out_buf.append(data)
+        # Final drain after the SPI script is done, in case the DSP
+        # emits a trailing summary line.
+        data = ser.read(4096)
+        if data:
+            out_buf.append(data)
+
+    def run(self, payload, headers):
+        ser = None
+        uart_buf = []
+        stop_evt = threading.Event()
+        reader = None
+        if self.serial_port is not None:
+            ser = serial.Serial(
+                self.serial_port,
+                baudrate=self.baudrate,
+                timeout=0.1,
+            )
+            ser.reset_input_buffer()
+            reader = threading.Thread(
+                target=self._uart_reader,
+                args=(ser, stop_evt, uart_buf),
+                daemon=True,
+            )
+            reader.start()
+
+        try:
+            read_bin, log = self.qspi_test.run(payload, ser=ser)
+        finally:
+            if reader is not None:
+                stop_evt.set()
+                reader.join(timeout=2.0)
+            if ser is not None:
+                ser.close()
+
+        out = {".txt": log}
+        if read_bin:
+            out[".bin"] = read_bin
+        if uart_buf:
+            out[".uart"] = b"".join(uart_buf)
+        return out
+
+
 class Poller:
     def __init__(self, handlers, http_port=8080, poll_interval_s=1.0):
         self.handlers = handlers
@@ -621,6 +904,7 @@ def main():
                     scope_resource=scope,
                 ),
                 "bin": IcestickHandler(serial_port=ice_port),
+                "qspi": QspiHandler(serial_port=dsp_port, baudrate=115200),
             }
             Poller(
                 handlers=handlers,

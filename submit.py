@@ -127,7 +127,16 @@ def summarize_scope_csv(data):
     return "\n".join(lines) + "\n"
 
 
-def dump_and_cleanup(paths, raw_scope=False):
+def summarize_bin(data):
+    h = hashlib.sha256(data).hexdigest()
+    head = data[:32].hex()
+    tail = data[-32:].hex() if len(data) > 32 else ""
+    return (f"{len(data)} bytes  sha256={h}\n"
+            f"head[0:32]={head}\n"
+            + (f"tail[-32:]={tail}\n" if tail else ""))
+
+
+def dump_and_cleanup(paths, raw_scope=False, out_dir=None):
     txt_bytes = None
     for p in paths:
         with open(p, "rb") as f:
@@ -136,6 +145,11 @@ def dump_and_cleanup(paths, raw_scope=False):
         sys.stdout.buffer.write(f"=== {name} ===\n".encode())
         if p.endswith(".csv") and not raw_scope:
             sys.stdout.buffer.write(summarize_scope_csv(data).encode())
+        elif p.endswith(".bin"):
+            sys.stdout.buffer.write(summarize_bin(data).encode())
+            if out_dir is not None:
+                dst = os.path.join(out_dir, name)
+                sys.stdout.buffer.write(f"saved to {dst}\n".encode())
         else:
             sys.stdout.buffer.write(data)
             if not data.endswith(b"\n"):
@@ -144,7 +158,11 @@ def dump_and_cleanup(paths, raw_scope=False):
             txt_bytes = data
     sys.stdout.buffer.flush()
     for p in paths:
-        os.remove(p)
+        name = os.path.basename(p)
+        if out_dir is not None and not p.endswith(".txt"):
+            os.rename(p, os.path.join(out_dir, name))
+        else:
+            os.remove(p)
     return txt_bytes
 
 
@@ -168,12 +186,12 @@ def parse_meta_kv(pairs):
     return meta
 
 
-def fetch(digest, expected_path, raw_scope=False):
+def fetch(digest, expected_path, raw_scope=False, out_dir=None):
     paths = output_paths(digest)
     if not paths:
         print(f"no outputs for digest {digest}", file=sys.stderr)
         return 1
-    txt_bytes = dump_and_cleanup(paths, raw_scope=raw_scope)
+    txt_bytes = dump_and_cleanup(paths, raw_scope=raw_scope, out_dir=out_dir)
     if expected_path is not None:
         return compare(txt_bytes, expected_path)
     return 0
@@ -194,7 +212,13 @@ def main():
                     help="extra sidecar key=value (repeatable)")
     ap.add_argument("--raw-scope", action="store_true",
                     help="dump the full scope CSV instead of the summary")
+    ap.add_argument("--out", metavar="DIR",
+                    help="move non-.txt artefacts (.bin, .csv, ...) into DIR "
+                         "instead of deleting them after summarizing")
     args = ap.parse_args()
+
+    if args.out is not None:
+        os.makedirs(args.out, exist_ok=True)
 
     if args.fetch and args.job:
         ap.error("--fetch is mutually exclusive with a job file")
@@ -202,7 +226,8 @@ def main():
         ap.error("either a job file or --fetch DIGEST is required")
 
     if args.fetch:
-        return fetch(args.fetch, args.expected, raw_scope=args.raw_scope)
+        return fetch(args.fetch, args.expected,
+                     raw_scope=args.raw_scope, out_dir=args.out)
 
     meta = parse_meta_kv(args.meta)
     if args.runtime is not None:
@@ -226,7 +251,8 @@ def main():
     if paths is None:
         return 1
 
-    txt_bytes = dump_and_cleanup(paths, raw_scope=args.raw_scope)
+    txt_bytes = dump_and_cleanup(paths, raw_scope=args.raw_scope,
+                                 out_dir=args.out)
 
     if args.expected is not None:
         return compare(txt_bytes, args.expected)
