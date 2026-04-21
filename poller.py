@@ -453,6 +453,17 @@ class QspiTest:
                         )
                     ser.write(bytes(body))
                     ser.flush()
+                    # pyserial's flush() on Windows with a concurrent
+                    # reader thread has been observed to return before
+                    # the USB TX endpoint has actually drained, so a
+                    # subsequent opcode's bytes never reach the DSP.
+                    # Sleep for a conservative wire-time estimate
+                    # (bytes * 11 bit-times / baud rate, plus 2 ms
+                    # slack) so the next op starts only after the
+                    # write has physically finished.  10 bits per byte
+                    # plus 1 bit of stop-bit / USB overhead.
+                    baud = ser.baudrate or 115200
+                    time.sleep(len(body) * 11.0 / baud + 0.002)
                     log.append(f"[{op_idx}] uart_tx {len(body)}B")
                 elif tag == 0x20:   # slave_write
                     # Queue bytes for FT4222 slave TX FIFO. The DSP master
