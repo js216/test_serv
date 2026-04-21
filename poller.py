@@ -892,17 +892,31 @@ class DspHandler(JobHandler):
             self.qspi.accept_ldr(ldr_payload)
 
             if qspi_payload is not None:
+                # Pause the background reader while the qspi executor
+                # runs.  On Windows, pyserial's read and write paths
+                # share enough state (OVERLAPPED event handles, cached
+                # comm-state) that concurrent read(1024) in a reader
+                # thread corrupts subsequent ser.write() calls and the
+                # second+ uart_tx opcode never reaches the DSP.  Stop
+                # the reader, drain anything it captured to preserve
+                # the boot banner, run the qspi ops alone, then
+                # restart a fresh reader for the trailing window.
+                stop_evt.set()
+                if reader is not None:
+                    reader.join(timeout=2.0)
                 try:
-                    # Pass the live ser so uart_tx opcodes can push
-                    # command bytes into the same session the reader
-                    # thread is draining.  pyserial supports concurrent
-                    # read (reader thread) and write (here) on one
-                    # handle.
                     qspi_bin, qspi_log = QspiTest().run(qspi_payload,
                                                         ser=ser)
                 except Exception:
                     qspi_err = ("qspi executor raised:\n"
                                 + traceback.format_exc())
+                stop_evt = threading.Event()
+                reader = threading.Thread(
+                    target=QspiHandler._uart_reader_fn,
+                    args=(ser, stop_evt, uart_buf, uart_err),
+                    daemon=True,
+                )
+                reader.start()
 
             duration = float(headers.get("X-Test-Runtime", self.rx_duration_s))
             # Hold the session open for the full runtime so the reader
