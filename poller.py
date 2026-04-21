@@ -451,19 +451,18 @@ class QspiTest:
                             "uart_tx opcode requires QspiHandler "
                             "with serial_port configured"
                         )
-                    ser.write(bytes(body))
-                    ser.flush()
-                    # pyserial's flush() on Windows with a concurrent
-                    # reader thread has been observed to return before
-                    # the USB TX endpoint has actually drained, so a
-                    # subsequent opcode's bytes never reach the DSP.
-                    # Sleep for a conservative wire-time estimate
-                    # (bytes * 11 bit-times / baud rate, plus 2 ms
-                    # slack) so the next op starts only after the
-                    # write has physically finished.  10 bits per byte
-                    # plus 1 bit of stop-bit / USB overhead.
-                    baud = ser.baudrate or 115200
-                    time.sleep(len(body) * 11.0 / baud + 0.002)
+                    # Byte-at-a-time with a fixed inter-byte gap.  Bulk
+                    # ser.write() through a pyserial handle shared with
+                    # a background read thread on Windows drops bytes
+                    # unpredictably (concurrent OVERLAPPED I/O state);
+                    # serialising the writes sidesteps the problem
+                    # entirely.  Cost is 50 ms per byte, i.e. ~650 ms
+                    # for a 13-byte ASCII command -- trivial compared
+                    # to the capture window.
+                    for ch in body:
+                        ser.write(bytes([ch]))
+                        ser.flush()
+                        time.sleep(0.05)
                     log.append(f"[{op_idx}] uart_tx {len(body)}B")
                 elif tag == 0x20:   # slave_write
                     # Queue bytes for FT4222 slave TX FIFO. The DSP master
@@ -892,31 +891,12 @@ class DspHandler(JobHandler):
             self.qspi.accept_ldr(ldr_payload)
 
             if qspi_payload is not None:
-                # Pause the background reader while the qspi executor
-                # runs.  On Windows, pyserial's read and write paths
-                # share enough state (OVERLAPPED event handles, cached
-                # comm-state) that concurrent read(1024) in a reader
-                # thread corrupts subsequent ser.write() calls and the
-                # second+ uart_tx opcode never reaches the DSP.  Stop
-                # the reader, drain anything it captured to preserve
-                # the boot banner, run the qspi ops alone, then
-                # restart a fresh reader for the trailing window.
-                stop_evt.set()
-                if reader is not None:
-                    reader.join(timeout=2.0)
                 try:
                     qspi_bin, qspi_log = QspiTest().run(qspi_payload,
                                                         ser=ser)
                 except Exception:
                     qspi_err = ("qspi executor raised:\n"
                                 + traceback.format_exc())
-                stop_evt = threading.Event()
-                reader = threading.Thread(
-                    target=QspiHandler._uart_reader_fn,
-                    args=(ser, stop_evt, uart_buf, uart_err),
-                    daemon=True,
-                )
-                reader.start()
 
             duration = float(headers.get("X-Test-Runtime", self.rx_duration_s))
             # Hold the session open for the full runtime so the reader
