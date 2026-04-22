@@ -63,6 +63,21 @@ def read_verify_prbs(seed, n):return _tlv(0x08, struct.pack("<II", seed, n))
 def xfer_prbs(seed, n):       return _tlv(0x09, struct.pack("<II", seed, n))
 def uart_tx(data):            return _tlv(0x0A, bytes(data))
 
+
+def write_prbs_multi(seed, n):
+    """PRBS write that goes over the multi-IO lanes.
+
+    Wraps ``mixed_xfer`` with an empty single-IO phase and no read,
+    so the whole PRBS stream lands in the FT4222's multi-IO write
+    phase -- which, when the master was initialized with
+    ``MODE_DUAL`` or ``MODE_QUAD``, actually spreads the bits across
+    D0/D1 (dual) or D0..D3 (quad). The tag-0x07 ``write_prbs`` path
+    always uses ``spiMaster_SingleWrite`` and therefore only drives
+    MOSI (D0) regardless of the init mode, so it cannot exercise
+    the DSP's dual/quad slave receive.
+    """
+    return mixed_xfer(b"", prbs_xorshift32(seed, n), 0)
+
 # slave-role ops (only valid when header role=ROLE_SLAVE)
 def slave_write(data):
     return _tlv(0x20, bytes(data))
