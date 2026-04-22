@@ -217,6 +217,12 @@ class QspiTest:
 
     def _init_master(self, dev, clk, mode, flags):
         cpol, cpha = self._cpol_cpha(flags)
+        # Bump operating clock to 80 MHz so CLK_DIV_2 yields 40 MHz
+        # SCK -- the FT4222 datasheet peak (§4, Table 4.1).  Default
+        # OpClk 60 MHz caps SCK at 30 MHz.  Harmless at lower clk
+        # divisors; the SCK table still divides OpClk by the same
+        # ratio.
+        dev.setClock(ft4222.SysClock.CLK_80)
         dev.spiMaster_Init(
             self.MODE_MAP[mode],
             self.CLK_MAP[clk],
@@ -363,7 +369,14 @@ class QspiTest:
 
                 top = time.time()
                 if tag == 0x01:   # write
-                    dev.spiMaster_SingleWrite(bytes(body), True)
+                    # Chunk with CS held: pyft4222 caps a single
+                    # SingleWrite call at 65535 B.  Bootloader uses
+                    # the same pattern to stream large payloads.
+                    raw = bytes(body)
+                    CHUNK = 16384
+                    for off in range(0, len(raw), CHUNK):
+                        last = (off + CHUNK) >= len(raw)
+                        dev.spiMaster_SingleWrite(raw[off:off+CHUNK], last)
                     dt = time.time() - top
                     log.append(f"[{op_idx}] write {len(body)}B  {dt*1e3:.2f} ms "
                                f"{len(body)/dt/1e6:.2f} MB/s" if dt > 0
@@ -410,7 +423,16 @@ class QspiTest:
                 elif tag == 0x07:   # write_prbs
                     seed, n = struct.unpack("<II", body[:8])
                     buf = prbs_xorshift32(seed, n)
-                    dev.spiMaster_SingleWrite(buf, True)
+                    # pyft4222 rejects single-call buffers larger
+                    # than ~32 KiB with INVALID_POINTER.  Chunk the
+                    # write the same way the bootloader does: keep
+                    # CS low by passing isEndTransaction=False until
+                    # the final chunk.
+                    CHUNK = 16384
+                    total = len(buf)
+                    for off in range(0, total, CHUNK):
+                        last = (off + CHUNK) >= total
+                        dev.spiMaster_SingleWrite(buf[off:off+CHUNK], last)
                     dt = time.time() - top
                     log.append(f"[{op_idx}] write_prbs seed=0x{seed:08x} {n}B  "
                                f"{dt*1e3:.2f} ms "
