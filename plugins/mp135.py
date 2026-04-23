@@ -8,6 +8,7 @@ import time
 import config
 from plugin import DevicePlugin, Op
 from . import _usb
+from ._text import decode_escapes
 
 
 # --- handle with background UART reader ---
@@ -85,11 +86,14 @@ def _op_uart_close(session, h, args):
 
 
 def _op_uart_write(session, h, args):
-    h.uart_write(args["data"].encode("utf-8"))
+    # decode_escapes lets plans send CR / LF / NUL via "\r", "\n", "\0".
+    # Without it shlex keeps the backslash literal and the bootloader
+    # shell never sees the Enter keystroke it needs.
+    h.uart_write(decode_escapes(args["data"]))
 
 
 def _op_uart_expect(session, h, args):
-    sentinel = args["sentinel"].encode("utf-8")
+    sentinel = decode_escapes(args["sentinel"])
     timeout_ms = args["timeout_ms"]
     stream = session.stream("mp135.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
@@ -117,7 +121,8 @@ class Mp135Plugin(DevicePlugin):
         "uart_close": Op(args={}, doc="Stop capture, close port.",
                          run=_op_uart_close),
         "uart_write": Op(args={"data": "str"},
-                         doc="Write UTF-8 bytes to console.",
+                         doc=("Write to console. Python-style escapes "
+                              "decoded: \\r \\n \\t \\0 \\xNN etc."),
                          run=_op_uart_write),
         "uart_expect": Op(args={"sentinel": "str", "timeout_ms": "int"},
                           doc="Block until sentinel in mp135.uart; sets "

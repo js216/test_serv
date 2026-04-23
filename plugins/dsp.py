@@ -9,6 +9,7 @@ import traceback
 import config
 from plugin import DevicePlugin, Op, BusyError
 from ._prbs import prbs_xorshift32
+from ._text import decode_escapes
 from . import _usb
 
 
@@ -219,11 +220,11 @@ def _op_uart_close(session, h, args):
 
 
 def _op_uart_write(session, h, args):
-    h.uart_write(args["data"].encode("utf-8"))
+    h.uart_write(decode_escapes(args["data"]))
 
 
 def _op_uart_expect(session, h, args):
-    sentinel = args["sentinel"].encode("utf-8")
+    sentinel = decode_escapes(args["sentinel"])
     timeout_ms = args["timeout_ms"]
     stream = session.stream("dsp.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
@@ -328,7 +329,9 @@ class DspPlugin(DevicePlugin):
         "uart_close": Op(args={}, doc="Stop UART capture.",
                          run=_op_uart_close),
         "uart_write": Op(args={"data": "str"},
-                         doc="Write ASCII to DSP UART, byte-at-a-time.",
+                         doc=("Write to DSP UART byte-at-a-time. "
+                              "Python-style escapes decoded: "
+                              "\\r \\n \\t \\0 \\xNN etc."),
                          run=_op_uart_write),
         "uart_expect": Op(args={"sentinel": "str", "timeout_ms": "int"},
                           doc="Block until sentinel appears in dsp.uart; "

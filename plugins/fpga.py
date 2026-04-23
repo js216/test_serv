@@ -9,6 +9,7 @@ import time
 import config
 from plugin import DevicePlugin, Op
 from . import _usb
+from ._text import decode_escapes
 
 
 FT2232H_DESC_A_DEFAULT = "Dual RS232-HS A"    # MPSSE channel
@@ -240,7 +241,7 @@ def _op_uart_close(session, h, args):
 
 
 def _op_uart_expect(session, h, args):
-    sentinel = args["sentinel"].encode("utf-8")
+    sentinel = decode_escapes(args["sentinel"])
     timeout_ms = args["timeout_ms"]
     stream = session.stream("fpga.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
