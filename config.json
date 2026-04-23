@@ -45,7 +45,7 @@
         "expected_usb_vid":       "0x0483",
         "expected_usb_pid":       "0x3753",
         "expected_usb_interface": 1,
-        "expected_usb_serial":    null
+        "expected_usb_serial":    "0044002F3132511838363431"
       }
     ]
   },

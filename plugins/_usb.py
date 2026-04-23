@@ -39,9 +39,11 @@ def find_com_by_vid_pid(vid, pid=None, pid_any=None, interface=None):
             continue
         if interface is not None:
             loc = (p.location or "") + " " + (p.hwid or "")
-            needle_a = f"MI_{int(interface):02d}"
-            needle_b = f":1.{int(interface)}"
-            if needle_a not in loc and needle_b not in loc:
+            n = int(interface)
+            # Windows usbser.sys: MI_0N; Linux sysfs: :1.N;
+            # Windows STLink VCP (some driver versions): :x.N.
+            if not any(s in loc for s in
+                       (f"MI_{n:02d}", f":1.{n}", f":x.{n}")):
                 continue
         return p.device
     return None

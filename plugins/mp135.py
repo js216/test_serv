@@ -186,12 +186,18 @@ class Mp135Plugin(DevicePlugin):
             verified = True
         if exp_if is not None:
             loc = (info.location or "") + " " + (info.hwid or "")
-            needle_a = f"MI_{int(exp_if):02d}"
-            needle_b = f":1.{int(exp_if)}"
-            if needle_a not in loc and needle_b not in loc:
+            n = int(exp_if)
+            # Various driver stacks encode the USB interface number
+            # differently in hwid / location strings:
+            #   Windows usbser.sys:        MI_0N
+            #   Linux sysfs-derived:       :1.N
+            #   Some Windows STLink VCP:   :x.N   (config index is 'x')
+            needles = (f"MI_{n:02d}", f":1.{n}", f":x.{n}")
+            if not any(x in loc for x in needles):
                 raise RuntimeError(
                     f"mp135 USB interface mismatch on {h.port}: "
-                    f"expected MI_{int(exp_if):02d}, got {loc!r}")
+                    f"expected interface {n} "
+                    f"(one of {needles}), got {loc!r}")
             verified = True
 
         # Claim the port briefly so contention (PuTTY etc.) fails now.
