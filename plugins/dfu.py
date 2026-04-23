@@ -131,6 +131,7 @@ def _rewrite_tsv(tsv_text, blobs, staging_dir):
 
 def _op_flash_layout(session, h, args):
     tsv_bytes = args["layout"]
+    no_reconnect = bool(args.get("no_reconnect"))
     try:
         tsv_text = tsv_bytes.decode("utf-8")
     except UnicodeDecodeError as e:
@@ -141,7 +142,6 @@ def _op_flash_layout(session, h, args):
         plan_blobs = session.plan.blobs
         rewritten, needed = _rewrite_tsv(tsv_text, plan_blobs, staging)
 
-        # Materialize each referenced blob into the staging dir.
         for name, (path, data) in needed.items():
             with open(path, "wb") as f:
                 f.write(data)
@@ -151,20 +151,118 @@ def _op_flash_layout(session, h, args):
             f.write(rewritten)
 
         argv = ["-c", f"port={h.usb_index}", "-w", tsv_path]
-        session.log_event("DFU", "dfu:flash_layout",
-                          f"cubeprog -c port={h.usb_index} -w <{len(needed)} "
-                          f"blob(s) staged in {staging}>")
-        result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
-        if result.stdout:
-            session.stream("dfu.flash.stdout").append(result.stdout)
-        if result.stderr:
-            session.stream("dfu.flash.stderr").append(result.stderr)
-        if result.returncode != 0:
-            raise RuntimeError(
-                f"cubeprog flash exit={result.returncode}; see "
-                f"dfu.flash.stderr stream")
+        session.log_event(
+            "DFU", "dfu:flash_layout",
+            f"cubeprog -c port={h.usb_index} -w <{len(needed)} blob(s) "
+            f"staged in {staging}> no_reconnect={no_reconnect}")
+
+        if no_reconnect:
+            _run_with_early_kill(
+                session, h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
+        else:
+            result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
+            if result.stdout:
+                session.stream("dfu.flash.stdout").append(result.stdout)
+            if result.stderr:
+                session.stream("dfu.flash.stderr").append(result.stderr)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"cubeprog flash exit={result.returncode}; see "
+                    f"dfu.flash.stderr stream")
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def _run_with_early_kill(session, exe, argv_tail, timeout_s):
+    """Run cubeprog, tee stdout to the stream as it arrives, and
+    terminate as soon as the target has been handed control.
+
+    Cubeprog's TSV flow always loops at the end trying to reconnect
+    to the target (so it can chain further partitions). When the
+    target is a SYSRAM-resident image that never re-enters DFU, this
+    loop is pure dead time (~30 s on MP135). Kill cubeprog once we
+    observe "Reconnecting the device" on stdout; declare success iff
+    "RUNNING Program" was seen before then.
+
+    Runs a single reader thread draining stdout line-by-line; stderr
+    is drained post-exit via communicate() on the kill path.
+    """
+    import subprocess
+    import threading
+
+    argv = [exe] + list(argv_tail)
+    proc = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+
+    seen_running = [False]
+    seen_reconnect = [False]
+    reader_err = []
+    deadline = time.monotonic() + timeout_s
+
+    stream_out = session.stream("dfu.flash.stdout")
+
+    def _reader():
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    return
+                stream_out.append(line)
+                if b"RUNNING Program" in line:
+                    seen_running[0] = True
+                if b"Reconnecting the device" in line:
+                    seen_reconnect[0] = True
+                    return
+        except Exception as e:
+            reader_err.append(repr(e))
+
+    t = threading.Thread(target=_reader, daemon=True)
+    t.start()
+
+    # Wait for either the reader to signal reconnect, for cubeprog to
+    # exit on its own, or for the overall timeout to expire.
+    while time.monotonic() < deadline:
+        if seen_reconnect[0]:
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.05)
+
+    # Kill path: give cubeprog a chance to exit cleanly, then escalate.
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+
+    # Drain whatever's left on both pipes.
+    try:
+        _rest_stdout, rest_stderr = proc.communicate(timeout=5)
+    except Exception:
+        _rest_stdout, rest_stderr = (b"", b"")
+    if _rest_stdout:
+        stream_out.append(_rest_stdout)
+    if rest_stderr:
+        session.stream("dfu.flash.stderr").append(rest_stderr)
+    t.join(timeout=2)
+
+    if reader_err:
+        session.log_event("DFU", "dfu:flash_layout",
+                          f"reader errors: {reader_err}")
+
+    if seen_reconnect[0] and not seen_running[0]:
+        raise RuntimeError(
+            "cubeprog reached reconnect phase without RUNNING Program "
+            "-- flash did not complete the launch step")
+    if not seen_running[0]:
+        raise RuntimeError(
+            f"cubeprog exited rc={proc.returncode} before RUNNING "
+            f"Program; see dfu.flash.stdout/stderr streams")
+    session.log_event(
+        "DFU", "dfu:flash_layout",
+        f"no_reconnect: early-killed cubeprog after RUNNING Program")
 
 
 # --- op: flash (single file) ---
@@ -233,9 +331,15 @@ class DfuPlugin(DevicePlugin):
                     run=_op_flash),
         "flash_layout": Op(
             args={"layout": "blob"},
+            optional_args={"no_reconnect": "bool"},
             doc=("Multi-partition flash from a TSV flashlayout (see "
                  "STM32CubeProgrammer docs).  Every Binary column must "
-                 "be @blobname; filesystem paths are rejected."),
+                 "be @blobname; filesystem paths are rejected. "
+                 "no_reconnect=true kills cubeprog once "
+                 "'Reconnecting the device' appears on stdout -- "
+                 "saves ~30 s per iteration when loading a "
+                 "SYSRAM-resident image that never re-enters DFU. "
+                 "Success requires 'RUNNING Program' seen first."),
             run=_op_flash_layout),
     }
 

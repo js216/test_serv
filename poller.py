@@ -60,7 +60,9 @@ def _publish_status(registry, plugins_by_name):
     for name, pl in plugins_by_name.items():
         ops_map[name] = {
             "doc": pl.doc,
-            "ops": {op_name: {"args": op.args, "doc": op.doc}
+            "ops": {op_name: {"args": op.args,
+                              "optional_args": op.optional_args or {},
+                              "doc": op.doc}
                     for op_name, op in pl.ops.items()},
         }
     _write_atomic(os.path.join(STATUS, "ops.json"),
