@@ -1,35 +1,23 @@
 # SPDX-License-Identifier: MIT
-# submit.py --- Submit a job and wait for its result artefacts
+# submit.py --- Submit a .plan job and collect artefacts
 # Copyright (c) 2026 Jakob Kastelic
 
 import argparse
-import csv
 import glob
 import hashlib
 import io
+import json
 import os
-import shutil
 import sys
+import tarfile
 import time
+
+from plan import pack_tar
 
 
 GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
-
-# Scope CSV column -> (signal name, "active" predicate on the column
-# value as it appears in the CSV). Edit this table to change thresholds
-# or rename signals.
-SCOPE_SIGNALS = {
-    "C1": ("DSP_LED",   lambda v: v < 68),
-    "C2": ("DSP_FAULT", lambda v: v < 150),
-    "C3": ("DSP_SIG_1", lambda v: v < 150),
-    "C4": ("DSP_SIG_2", lambda v: v < 150),
-}
-
-# Sentinel stapling qspi TLV onto an LDR.  Must match
-# poller.DspHandler.QSPI_ATTACH_SEP verbatim.
-QSPI_ATTACH_SEP = b"\n!QSPI-ATTACH!\n"
 
 STATE_DIR = os.environ.get(
     "TEST_SERV_DIR",
@@ -43,35 +31,34 @@ class StaleOutputsError(Exception):
     pass
 
 
-def output_paths(digest):
+def _output_paths(digest):
     paths = sorted(glob.glob(os.path.join(OUTPUTS, f"{digest}.*")))
+    # Put .txt last so a reader can trust "last file is sentinel".
     paths.sort(key=lambda p: p.endswith(".txt"))
     return paths
 
 
-def submit(src_path, meta, qspi_path=None):
-    with open(src_path, "rb") as f:
-        data = f.read()
-    ext = os.path.splitext(src_path)[1].lstrip(".")
-    if qspi_path is not None:
-        if ext != "ldr":
-            raise ValueError(f"--qspi requires an .ldr primary, got .{ext}")
-        with open(qspi_path, "rb") as f:
-            qspi_data = f.read()
-        if QSPI_ATTACH_SEP in data or QSPI_ATTACH_SEP in qspi_data:
-            raise ValueError("payload collides with QSPI_ATTACH_SEP sentinel")
-        data = data + QSPI_ATTACH_SEP + qspi_data
+def _pack_from_plan(plan_path, blob_specs):
+    with open(plan_path, "r", encoding="utf-8") as f:
+        text = f.read()
+    blobs = {}
+    for spec in blob_specs or []:
+        name, _, src = spec.partition("=")
+        if not name or not src:
+            raise ValueError(f"--blob expects NAME=PATH, got {spec!r}")
+        with open(src, "rb") as f:
+            blobs[name] = f.read()
+    return pack_tar(text, blobs)
+
+
+def _submit(data, meta):
     digest = hashlib.sha256(data).hexdigest()
-    if not ext:
-        raise ValueError(f"{src_path}: cannot infer extension (kind)")
-    if output_paths(digest):
+    if _output_paths(digest):
         raise StaleOutputsError(digest)
-    dst = os.path.join(INPUTS, f"{digest}.{ext}")
+    dst = os.path.join(INPUTS, f"{digest}.plan")
     if os.path.exists(dst):
         raise FileExistsError(digest)
     meta_path = f"{dst}.meta"
-    # Drop any stale .meta left by a previously-interrupted submit so it
-    # can't be paired with the fresh binary landing below.
     try:
         os.remove(meta_path)
     except FileNotFoundError:
@@ -90,98 +77,87 @@ def submit(src_path, meta, qspi_path=None):
     return digest
 
 
-def wait_for_result(digest, timeout):
+def _wait(digest, timeout):
     sentinel = os.path.join(OUTPUTS, f"{digest}.txt")
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if os.path.exists(sentinel):
-            return output_paths(digest)
+            return _output_paths(digest)
         time.sleep(0.05)
     return None
 
 
-def summarize_scope_csv(data):
-    """Reduce a scope CSV to one line per known channel listing how many
-    times the signal crossed into its active state and back out."""
-    r = csv.reader(io.StringIO(data.decode(errors="replace")))
-    try:
-        header = next(r)
-    except StopIteration:
-        return "(empty csv)\n"
-
-    cols = [(i, h) for i, h in enumerate(header) if h in SCOPE_SIGNALS]
-    prev = {i: None for i, _ in cols}
-    enter = {i: 0 for i, _ in cols}
-    leave = {i: 0 for i, _ in cols}
-    n_active = {i: 0 for i, _ in cols}
-    n_total = {i: 0 for i, _ in cols}
-
-    for row in r:
-        for i, _ in cols:
-            try:
-                active = SCOPE_SIGNALS[header[i]][1](float(row[i]))
-            except (ValueError, IndexError):
-                continue
-            if prev[i] is not None and active != prev[i]:
-                (enter if active else leave)[i] += 1
-            prev[i] = active
-            n_total[i] += 1
-            if active:
-                n_active[i] += 1
-
-    name_w = max(len(n) for n, _ in SCOPE_SIGNALS.values())
-    lines = []
-    for i, ch in cols:
-        name = SCOPE_SIGNALS[ch][0]
-        pct = (100.0 * n_active[i] / n_total[i]) if n_total[i] else 0.0
-        lines.append(
-            f"{ch} {name:<{name_w}}  "
-            f"went_active={enter[i]} went_inactive={leave[i]}"
-            f"  duty={pct:5.1f}%"
-        )
-    return "\n".join(lines) + "\n"
+def _summarize_tar(tar_path):
+    """Print the manifest and timeline from an artefact tarball."""
+    with open(tar_path, "rb") as f:
+        data = f.read()
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
+        members = tf.getnames()
+        manifest_m = tf.extractfile("manifest.json")
+        if manifest_m is not None:
+            sys.stdout.buffer.write(b"=== manifest.json ===\n")
+            sys.stdout.buffer.write(manifest_m.read())
+        tl = tf.extractfile("timeline.log")
+        if tl is not None:
+            sys.stdout.buffer.write(b"\n=== timeline.log ===\n")
+            sys.stdout.buffer.write(tl.read())
+        if "errors.log" in members:
+            err = tf.extractfile("errors.log")
+            if err is not None:
+                sys.stdout.buffer.write(b"\n=== errors.log ===\n")
+                sys.stdout.buffer.write(err.read())
+        sys.stdout.buffer.write(b"\n=== tarball members ===\n")
+        for n in members:
+            sys.stdout.buffer.write(f"  {n}\n".encode())
 
 
-def summarize_bin(data):
-    h = hashlib.sha256(data).hexdigest()
-    head = data[:32].hex()
-    tail = data[-32:].hex() if len(data) > 32 else ""
-    return (f"{len(data)} bytes  sha256={h}\n"
-            f"head[0:32]={head}\n"
-            + (f"tail[-32:]={tail}\n" if tail else ""))
+def _extract(tar_path, out_dir):
+    os.makedirs(out_dir, exist_ok=True)
+    with open(tar_path, "rb") as f:
+        data = f.read()
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
+        for m in tf.getmembers():
+            if ".." in m.name or m.name.startswith("/"):
+                raise RuntimeError(f"unsafe member {m.name!r}")
+        try:
+            tf.extractall(out_dir, filter="data")
+        except TypeError:
+            # Python < 3.12: no filter kwarg.
+            tf.extractall(out_dir)
 
 
-def dump_and_cleanup(paths, raw_scope=False, out_dir=None):
+def _dump_and_cleanup(paths, extract_to):
+    tar_path = None
     txt_bytes = None
     for p in paths:
-        with open(p, "rb") as f:
-            data = f.read()
-        name = os.path.basename(p)
-        sys.stdout.buffer.write(f"=== {name} ===\n".encode())
-        if p.endswith(".csv") and not raw_scope:
-            sys.stdout.buffer.write(summarize_scope_csv(data).encode())
-        elif p.endswith(".bin"):
-            sys.stdout.buffer.write(summarize_bin(data).encode())
-            if out_dir is not None:
-                dst = os.path.join(out_dir, name)
-                sys.stdout.buffer.write(f"saved to {dst}\n".encode())
-        else:
-            sys.stdout.buffer.write(data)
-            if not data.endswith(b"\n"):
+        if p.endswith(".tar"):
+            tar_path = p
+        elif p.endswith(".txt"):
+            with open(p, "rb") as f:
+                txt_bytes = f.read()
+            sys.stdout.buffer.write(b"=== sentinel .txt ===\n")
+            sys.stdout.buffer.write(txt_bytes)
+            if not txt_bytes.endswith(b"\n"):
                 sys.stdout.buffer.write(b"\n")
-        if p.endswith(".txt"):
-            txt_bytes = data
+    if tar_path is not None:
+        _summarize_tar(tar_path)
+        if extract_to is not None:
+            _extract(tar_path, extract_to)
+            sys.stdout.buffer.write(
+                f"\nextracted to {extract_to}\n".encode())
     sys.stdout.buffer.flush()
     for p in paths:
-        name = os.path.basename(p)
-        if out_dir is not None and not p.endswith(".txt"):
-            os.rename(p, os.path.join(out_dir, name))
+        if extract_to is not None and p.endswith(".tar"):
+            os.rename(p, os.path.join(extract_to, os.path.basename(p)))
         else:
-            os.remove(p)
+            try:
+                os.remove(p)
+            except FileNotFoundError:
+                pass
     return txt_bytes
 
 
-def compare(txt_bytes, expected_path):
+def _compare(txt_bytes, expected_path):
     with open(expected_path, "rb") as f:
         expected = f.read()
     if txt_bytes == expected:
@@ -191,70 +167,69 @@ def compare(txt_bytes, expected_path):
     return 1
 
 
-def parse_meta_kv(pairs):
+def _fetch(digest, expected_path, extract_to):
+    paths = _output_paths(digest)
+    if not paths:
+        print(f"no outputs for digest {digest}", file=sys.stderr)
+        return 1
+    txt = _dump_and_cleanup(paths, extract_to)
+    if expected_path is not None:
+        return _compare(txt, expected_path)
+    return 0
+
+
+def _parse_meta_kv(pairs):
     meta = {}
     for p in pairs or []:
         k, _, v = p.partition("=")
         if not k or not v:
-            raise ValueError(f"--meta expects key=value, got: {p}")
+            raise ValueError(f"--meta expects key=value, got {p!r}")
         meta[k] = v
     return meta
 
 
-def fetch(digest, expected_path, raw_scope=False, out_dir=None):
-    paths = output_paths(digest)
-    if not paths:
-        print(f"no outputs for digest {digest}", file=sys.stderr)
-        return 1
-    txt_bytes = dump_and_cleanup(paths, raw_scope=raw_scope, out_dir=out_dir)
-    if expected_path is not None:
-        return compare(txt_bytes, expected_path)
-    return 0
-
-
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("job", nargs="?",
-                    help="file to submit (extension is the job kind)")
+    ap.add_argument("plan", nargs="?",
+                    help="path to a plan.txt (blobs added via --blob) or "
+                         "a pre-packed .plan tarball")
+    ap.add_argument("--blob", action="append", metavar="NAME=PATH",
+                    help="add a blob to the job tar; reference as @NAME "
+                         "in plan. Repeatable.")
     ap.add_argument("--fetch", metavar="DIGEST",
-                    help="dump and clean up outputs for a previously-submitted "
-                         "digest; use this after a fire-and-forget submit")
-    ap.add_argument("--wait", type=float)
-    ap.add_argument("--expected")
-    ap.add_argument("--runtime", type=float,
-                    help="capture duration in seconds (sent as X-Test-Runtime)")
-    ap.add_argument("--qspi", metavar="FILE",
-                    help="staple a .qspi TLV stream onto the .ldr job; the "
-                         "hardware harness executes the qspi ops in the same "
-                         "UART+scope session, between boot and the trailing "
-                         "capture window")
+                    help="fetch artefacts for a previously-submitted digest")
+    ap.add_argument("--wait", type=float,
+                    help="block up to N seconds for artefacts")
+    ap.add_argument("--expected", help="compare sentinel .txt against this")
+    ap.add_argument("--extract", metavar="DIR",
+                    help="extract artefact tarball into DIR (keeps the tar)")
     ap.add_argument("--meta", action="append", metavar="KEY=VAL",
-                    help="extra sidecar key=value (repeatable)")
-    ap.add_argument("--raw-scope", action="store_true",
-                    help="dump the full scope CSV instead of the summary")
-    ap.add_argument("--out", metavar="DIR",
-                    help="move non-.txt artefacts (.bin, .csv, ...) into DIR "
-                         "instead of deleting them after summarizing")
+                    help="sidecar metadata (X-Test-<Key>), repeatable")
+    ap.add_argument("--runtime", type=float,
+                    help="shortcut for --meta runtime=SEC")
     args = ap.parse_args()
 
-    if args.out is not None:
-        os.makedirs(args.out, exist_ok=True)
-
-    if args.fetch and args.job:
-        ap.error("--fetch is mutually exclusive with a job file")
-    if not args.fetch and not args.job:
-        ap.error("either a job file or --fetch DIGEST is required")
+    if args.fetch and args.plan:
+        ap.error("--fetch is mutually exclusive with a plan file")
+    if not args.fetch and not args.plan:
+        ap.error("either a plan file or --fetch DIGEST is required")
 
     if args.fetch:
-        return fetch(args.fetch, args.expected,
-                     raw_scope=args.raw_scope, out_dir=args.out)
+        return _fetch(args.fetch, args.expected, args.extract)
 
-    meta = parse_meta_kv(args.meta)
+    # .plan = already-packed tar, otherwise treat as plan.txt + blobs.
+    if args.plan.endswith(".plan"):
+        with open(args.plan, "rb") as f:
+            data = f.read()
+    else:
+        data = _pack_from_plan(args.plan, args.blob)
+
+    meta = _parse_meta_kv(args.meta)
     if args.runtime is not None:
         meta["runtime"] = str(args.runtime)
 
     try:
-        digest = submit(args.job, meta, qspi_path=args.qspi)
+        digest = _submit(data, meta)
     except StaleOutputsError as e:
         print(f"output stale; run:\n    python3 submit.py --fetch {e}",
               file=sys.stderr)
@@ -267,15 +242,14 @@ def main():
         print(digest)
         return 0
 
-    paths = wait_for_result(digest, args.wait)
+    paths = _wait(digest, args.wait)
     if paths is None:
+        print(f"timeout waiting for {digest}", file=sys.stderr)
         return 1
 
-    txt_bytes = dump_and_cleanup(paths, raw_scope=args.raw_scope,
-                                 out_dir=args.out)
-
+    txt = _dump_and_cleanup(paths, args.extract)
     if args.expected is not None:
-        return compare(txt_bytes, args.expected)
+        return _compare(txt, args.expected)
     return 0
 
 

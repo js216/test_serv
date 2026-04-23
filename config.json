@@ -1,0 +1,79 @@
+{
+  "dsp": {
+    "instances": [
+      {
+        "id": "A",
+        "ft4222_desc": "FT4222 A",
+        "serial_port": "COM31",
+        "baudrate": 115200
+      }
+    ]
+  },
+
+  "fpga": {
+    "instances": [
+      {
+        "id": "0",
+        "ft2232h_desc": "Dual RS232-HS A",
+        "uart_autodetect": { "vid": "0x0403", "pid": "0x6010", "interface": 1 },
+        "baudrate": 115200
+      }
+    ]
+  },
+
+  "bench_mcu": {
+    "instances": [
+      {
+        "id": "0",
+        "serial_port": "COM39",
+        "baudrate": 115200,
+        "expected_identity": "SRS BENCH MCU",
+        "autodetect": { "vid": "0x0483", "pid_any": ["0x5740", "0x374B", "0x5710"] }
+      }
+    ]
+  },
+
+  "mp135": {
+    "instances": [
+      {
+        "id": "0",
+        "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1 },
+        "serial_port": "COM15",
+        "baudrate": 115200
+      }
+    ]
+  },
+
+  "dfu": {
+    "cubeprog_exe": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+    "instances": [
+      {
+        "id": "mp135",
+        "usb_vid": "0x0483",
+        "usb_pid": "0xDF11",
+        "usb_serial": "002800423232511538303631"
+      }
+    ]
+  },
+
+  "scope": {
+    "instances": [
+      {
+        "id": "0",
+        "resource": "USB0::0xF4EC::0x1011::SDS2PDDX6R1848::INSTR"
+      }
+    ]
+  },
+
+  "ssh": {
+    "instances": [
+      {
+        "id": "target",
+        "ip": "192.168.7.2",
+        "user": "root",
+        "key":         "~/.ssh/test_serv_embedded",
+        "known_hosts": "~/.ssh/test_serv_known_hosts"
+      }
+    ]
+  }
+}

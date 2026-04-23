@@ -1,0 +1,26 @@
+# Cross-device PRBS flow: FPGA first (acts as observer/loopback),
+# then DSP boots and streams PRBS at its SPI pins. Both UARTs captured
+# on one timeline; scope captures at the end.
+
+fpga:program bin=@observer.bin
+fpga:uart_open
+fpga:uart_expect sentinel="OBSERVER READY" timeout_ms=5000
+
+dsp:reset
+dsp:uart_open
+dsp:boot ldr=@pattern.ldr
+
+# Boot settles, then send pattern over QSPI single-lane at 5 MHz.
+delay ms=200
+dsp:qspi_write_prbs seed=0xC0FFEE n=4096 clk_div=8 mode=1
+delay ms=100
+
+# FPGA prints its own "OK" once it saw all 4096 bytes with matching PRBS.
+fpga:uart_expect sentinel="PRBS OK" timeout_ms=2000
+
+# One scope snapshot spanning the whole session.
+scope:capture chans="C1,C2,C3,C4"
+
+dsp:uart_close
+fpga:uart_close
+mark tag=done

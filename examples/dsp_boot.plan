@@ -1,0 +1,10 @@
+# Boot DSP via FT4222 QSPI and capture 5 s of UART.
+# submit with:
+#   python3 submit.py dsp_boot.plan --blob blink.ldr=examples/blink.ldr \
+#     --runtime 5 --wait 10 --extract /tmp/out
+
+dsp:reset
+dsp:uart_open
+dsp:boot ldr=@blink.ldr
+delay ms=5000
+dsp:uart_close

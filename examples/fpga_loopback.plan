@@ -1,0 +1,7 @@
+# Program iCEstick flash with a loopback bitstream and wait for the
+# FPGA to print READY. Releases FPGA reset as part of program step.
+
+fpga:program bin=@loopback.bin
+fpga:uart_open
+fpga:uart_expect sentinel="READY\r\n" timeout_ms=5000
+fpga:uart_close

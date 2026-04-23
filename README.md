@@ -1,92 +1,154 @@
 # test_serv
 
-A minimal hardware-test dispatcher: a submitter drops a job file into a
-shared directory, the hardware-side harness polls for jobs matching its
-kind, runs them, and posts the result artefacts back.  Jobs are routed
-by file extension, so a single server handles any mix of hardware kinds
-(`.ldr` for DSP firmware, `.bin` for iCE40 FPGA bitstreams, `.qspi` for
-post-boot QSPI link tests, etc.) with no code changes.
+A hardware-test dispatcher for a multi-device bench. Clients submit a
+text job plan (a `.plan` tarball containing `plan.txt` plus any binary
+blobs it references). The server queues it; a poller on the bench host
+picks it up, walks the plan against a plugin registry, drives hardware,
+and posts a single `.tar` artefact back carrying a merged timeline, raw
+streams, and a JSON manifest.
 
-### Running the server
+### running
 
-    python3 server.py [--port PORT]
+```
+python3 server.py [--port 8080]        # job broker + introspection
+python3 poller.py                      # hardware driver loop
+```
 
-Listens on `127.0.0.1`.  Default port is 8080; pick another to run a
-second instance alongside the primary one.
+Server listens on `127.0.0.1`. Both must share `$TEST_SERV_DIR`
+(default `/tmp/test_serv-$USER`).
 
-### Submitting a job
+### submit a job
 
-    python3 submit.py [FLAGS] PATH
-    python3 submit.py --fetch DIGEST [--expected FILE]
+```
+python3 submit.py plan.txt --blob foo.ldr=examples/blink.ldr --wait 30
+python3 submit.py job.plan --extract /tmp/out --wait 30
+python3 submit.py --fetch DIGEST --extract /tmp/out
+```
 
-Flags:
+The first form packs `plan.txt` + blobs into a tarball client-side.
+The second submits an already-packed `.plan` tarball. Blobs are
+referenced from the plan as `@name` where `name` is the `NAME` side of
+`--blob NAME=PATH`.
 
-    --wait SEC          block up to SEC seconds for results, then stream
-                        them to stdout (each framed by a '=== name ===' line,
-                        with .txt last) and clean outputs/
-    --runtime SEC       capture duration the harness honours (sent as
-                        X-Test-Runtime)
-    --meta KEY=VAL      extra sidecar field, repeatable; emitted by the
-                        server as X-Test-<Key>
-    --expected FILE     after returning results, compare the .txt byte-for-
-                        byte against FILE; exit 0 on SUCCESS, 1 on FAIL
-    --fetch DIGEST      dump and clean up outputs for a previously-submitted
-                        digest; use after a fire-and-forget submit
-    --out DIR           move non-.txt artefacts (e.g. .bin, .csv) into DIR
-                        instead of deleting them after summarizing; required
-                        whenever you want to keep the raw bytes, since binary
-                        artefacts are never dumped to stdout
+### discover what is available
 
-Without `--wait`, submit.py returns as soon as the job is queued and
-prints the SHA-256 digest to stdout (fire-and-forget).  The job's kind
-is its file extension: `submit.py foo.ldr` drops a `.ldr` job,
-`submit.py bar.bin` a `.bin` job.
+```
+curl http://localhost:8080/devices        # present hardware, per plugin, + identity
+curl http://localhost:8080/ops            # every op, args and one-line doc
+curl http://localhost:8080/examples       # starter plan names
+curl http://localhost:8080/examples/NAME  # fetch one
+curl -X POST http://localhost:8080/sweep  # re-probe + re-verify every device
+```
 
-Results from a fire-and-forget submit must be collected before the same
-job can be resubmitted.  If `outputs/{digest}.*` is non-empty at submit
-time, submit.py refuses with exit code 2 and a pointer to `--fetch`.
+`/ops` and `/devices` are the generated manual -- per-device ops live
+in plugin source, not in this README. Both update live when a plugin
+is added or hardware is plugged/unplugged.
 
-### Hardware harness protocol
+### device config
 
-Each harness polls its own extension:
+All per-instance parameters -- COM ports, USB VID/PID, FTDI descriptors,
+VISA resources, SSH target, cubeprog path, expected identity strings --
+live in `config.json`. Search order: `$TEST_SERV_CONFIG`,
+`$TEST_SERV_DIR/config.json`, repo-root `config.json`. First hit wins.
 
-    GET /ldr    # returns a random *.ldr payload, 204 if none
-    GET /bin    # ditto for *.bin
-    GET /<ext>  # ditto for any extension
+Each plugin's `instances` entry can specify either a hard port
+(`serial_port`: "COM15") or an `autodetect` rule (`{ "vid": "0x0483",
+"pid": "0x3753", "interface": 1 }`). Autodetect follows the board
+across Windows re-enumerations; no code edits needed.
 
-The response carries per-job parameters as `X-Test-<Key>` headers
-derived from the submitter's `--runtime` and `--meta KEY=VAL` flags
-(e.g. `X-Test-Runtime: 30`).  After capturing, the harness POSTs each
-artefact back:
+### identity verification
 
-    POST /<digest>.csv    # scope trace (any non-.txt artefact, any count)
-    POST /<digest>.txt    # UART text log -- MUST be last, it is the sentinel
+On startup the poller performs one full sweep: every probed device is
+opened, its plugin runs an identity handshake (`?` reply, `*IDN?`,
+`uname -a`, ...) against the expected substring in `config.json`, then
+the handle is immediately released. A summary table is printed and
+exposed via `/devices`. A REST-triggered `POST /sweep` re-runs the
+same sweep at any time. Identity mismatch becomes a clear failure
+instead of a run that silently drives the wrong device.
 
-The `.txt` is the completion marker; by convention the harness posts all
-other artefacts first so that by the time the submitter sees the
-`.txt`, every sibling file is already on disk.
+### plan grammar (complete)
 
-### Post-boot QSPI link tests (`.qspi`)
+One op per line. Blank lines and `# comments` ignored.
 
-Once the DSP has booted (via an `.ldr` job), the FT4222 QSPI master can be
-re-used for link-quality and throughput tests.  The poller exposes a thin
-opcode executor: the server-side test author builds a binary TLV stream
-describing init + a sequence of primitive SPI operations, the poller runs
-them against whatever post-boot firmware the DSP exposes on its SPI slave,
-and returns captured MISO bytes plus a per-op timing log.
+```
+device:op k=v k=v ...          # device op, args typed per plugin
+ctrl-verb    k=v ...           # control: barrier, mark, delay,
+                               # fork, end, join, open, close
+```
 
-The poller has no test semantics of its own beyond one shared PRBS generator
-(32-bit xorshift) that both it and the DSP firmware must implement
-identically, so large patterns can be described by a seed + length rather
-than by embedding the bytes in the job file.
+Values are parsed as:
 
-See `examples/make_qspi.py` for the TLV grammar and helper constructors,
-and `poller.py :: QspiHandler` for the canonical opcode table.
+| form                   | type   |
+|------------------------|--------|
+| `123` / `-5`           | int    |
+| `0xCAFE`               | int    |
+| `true` / `false`       | bool   |
+| `"hello world"`        | string |
+| `some_ident`           | ident  |
+| `@blob_name`           | blob   |
 
-While the opcode script runs, the DSP UART is drained in a background
-thread and returned as a `.uart` artefact, so any diagnostic prints the
-firmware emits during a PRBS stream are captured in the same job.
+Control verbs:
 
-### Author
+- `delay ms=N`
+- `mark tag=NAME` / `barrier tag=NAME` -- checkpoints in the timeline
+- `fork name=IDENT` ... `end` -- run the enclosed op list in a thread;
+  a plan can contain several `fork` blocks, each joined at its `end`.
+- `open` / `close` on any device -- pin or release its handle for the
+  remainder of the session, overriding the default lazy acquire.
 
-Jakob Kastelic (Stanford Research Systems)
+Unknown device, op, arg, or arg type is rejected before any hardware
+is touched.
+
+### artefact layout
+
+One tarball posted as `<digest>.tar`, plus a short `<digest>.txt`
+(the manifest JSON) used as the completion sentinel.
+
+```
+manifest.json         status, streams list, runtime, n_ops, n_errors
+timeline.log          merged human-sortable timeline of events + streams
+ops.jsonl             one JSON record per op: verb, start, end, status
+errors.log            tracebacks, only when something failed
+streams/NAME.bin      raw bytes per stream (uart, scope csv, prbs mismatches...)
+streams/NAME.ts       binary index: (<d t_s>,<u4 len>) records per stream
+```
+
+Read `manifest.json` first, then `timeline.log`. Pull `streams/*.bin`
+only when raw bytes are needed.
+
+### security model
+
+The protocol is a finite-opcode TLV-style grammar; there is no code
+execution path. Attackers with submit access can only issue ops that
+a plugin has registered. Specifically:
+
+- Unknown ops / args / devices rejected at parse.
+- Payload, blob, op count bounded.
+- No filesystem paths in the grammar; all binary data travels inline.
+- SSH is exposed only as per-command ops (`ssh:run_<whitelisted>`)
+  with typed placeholders, a pinned key, a pinned `known_hosts`, and
+  a fixed target IP. Run the poller under a user whose outbound
+  firewall permits only that IP on port 22.
+- `server.py` binds `127.0.0.1`.
+
+### adding a device
+
+1. Drop a new file into `plugins/` implementing `DevicePlugin` with an
+   `ops` dict of `plugin.Op` entries. Each `Op` has an `args` schema
+   (`{name: type_name}`) and a `run(session, handle, args)` callable.
+2. Implement `probe()` (side-effect-free enumeration), `open(spec)`,
+   `close(handle)`.
+3. `kill -HUP $(pgrep -f poller.py)` or restart. `/ops` updates
+   automatically; this README is not touched.
+
+### releasing a device without restarting
+
+A running poller holds device handles only for the duration of an op,
+plus a 5 s TTL afterwards. To grab a port (e.g. open PuTTY on the DSP
+UART while the bench is idle):
+
+```
+curl -X POST http://localhost:8080/devices/dsp.A/release
+```
+
+The poller drops the cached handle immediately; the next job reopens.
