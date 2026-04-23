@@ -10,7 +10,11 @@ from typing import Optional
 
 
 MAX_PLAN_BYTES = 256 * 1024
-MAX_BLOB_BYTES = 16 * 1024 * 1024
+# 512 MiB per blob is enough for a signed SD-card image used as a
+# DFU flashlayout target; still bounded to keep the poller-host RAM
+# cost predictable. Raise if you need full-image updates, but mind
+# the tar packing happens fully in-memory on both client and poller.
+MAX_BLOB_BYTES = 512 * 1024 * 1024
 MAX_BLOBS = 64
 MAX_OPS = 4096
 MAX_DEPTH = 2
