@@ -19,10 +19,9 @@ GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
 
-STATE_DIR = os.environ.get(
-    "TEST_SERV_DIR",
-    f"/tmp/test_serv-{os.getenv('USER', 'anon')}",
-)
+import paths
+
+STATE_DIR = paths.state_dir()
 INPUTS = os.path.join(STATE_DIR, "inputs")
 OUTPUTS = os.path.join(STATE_DIR, "outputs")
 

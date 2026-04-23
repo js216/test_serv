@@ -115,11 +115,12 @@ class DeviceRegistry:
             keys = sorted(self.specs.keys())
         for key in keys:
             t0 = time.monotonic()
-            entry = {"t": time.time(), "ok": False, "err": None,
-                     "latency_ms": 0.0}
+            entry = {"t": time.time(), "ok": False, "verified": False,
+                     "err": None, "latency_ms": 0.0}
             try:
-                with self.acquire(key) as _h:
-                    pass
+                with self.acquire(key) as handle:
+                    entry["verified"] = bool(
+                        getattr(handle, "_identity_verified", False))
                 entry["ok"] = True
             except Exception as e:
                 entry["err"] = f"{type(e).__name__}: {e}"

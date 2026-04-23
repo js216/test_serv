@@ -11,6 +11,7 @@ import traceback
 import urllib.request
 from datetime import datetime
 
+import paths
 import plan
 import plugins
 from plugin import Op
@@ -18,10 +19,7 @@ from registry import DeviceRegistry
 from session import Session, pack_artefact
 
 
-STATE_DIR = os.environ.get(
-    "TEST_SERV_DIR",
-    f"/tmp/test_serv-{os.getenv('USER', 'anon')}",
-)
+STATE_DIR = paths.state_dir()
 STATUS = os.path.join(STATE_DIR, "status")
 RELEASE = os.path.join(STATE_DIR, "release")
 SWEEP = os.path.join(STATE_DIR, "sweep")
@@ -48,7 +46,9 @@ def _write_atomic(path, data):
         f.write(data)
         f.flush()
         os.fsync(f.fileno())
-    os.rename(tmp, path)
+    # os.replace is atomic on POSIX and overwrites-if-exists on Windows
+    # (unlike os.rename, which raises FileExistsError on Windows).
+    os.replace(tmp, path)
 
 
 def _publish_status(registry, plugins_by_name):
@@ -114,9 +114,13 @@ def _print_device_table(verify_map, registry):
         ok = v.get("ok")
         mark = "OK   " if ok else ("FAIL " if ok is False else "?    ")
         lat = f"{v.get('latency_ms', 0):7.1f} ms" if v else "       --"
-        tail = (v.get("err") if v and v.get("err")
-                else (v.get("ok") and "identity verified")
-                or "(not yet verified)")
+        if v and v.get("err"):
+            tail = v["err"]
+        elif v and v.get("ok"):
+            tail = ("identity verified" if v.get("verified")
+                    else "open ok (plugin has no identity handshake)")
+        else:
+            tail = "(not yet verified)"
         print(f"  [{mark}] {r['id']:<{w_id}}  {lat}  {tail}")
 
 

@@ -142,7 +142,19 @@ class Mp135Plugin(DevicePlugin):
         return out
 
     def open(self, spec):
-        return Mp135Handle(port=spec["serial_port"], baud=spec["baudrate"])
+        h = Mp135Handle(port=spec["serial_port"], baud=spec["baudrate"])
+        # Claim the port briefly to verify the OS lets us have it, then
+        # release. Catches "another process already holds this port" at
+        # open-time rather than on first uart_open. No handshake byte on
+        # the wire -- a Linux boot console has no prompt we can rely on.
+        try:
+            import serial
+            ser = serial.Serial(h.port, baudrate=h.baud, timeout=0.1)
+            ser.close()
+        except Exception as e:
+            raise RuntimeError(
+                f"mp135: cannot claim {h.port}: {e}")
+        return h
 
     def close(self, handle):
         handle.uart_close()

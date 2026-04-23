@@ -146,6 +146,7 @@ class ScopePlugin(DevicePlugin):
                     f"scope identity mismatch: expected {expected!r} in "
                     f"*IDN?, got {idn!r}"
                 )
+            h._identity_verified = True
         return h
 
     def close(self, handle):

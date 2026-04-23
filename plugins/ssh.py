@@ -132,6 +132,7 @@ class SshPlugin(DevicePlugin):
                 raise RuntimeError(
                     f"ssh identity mismatch: expected {expected!r} in "
                     f"`uname -a`, got {uname!r}")
+            h._identity_verified = True
         return h
 
     def close(self, handle):

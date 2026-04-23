@@ -10,7 +10,7 @@ from . import _usb
 
 
 READ_WINDOW_S = 0.5
-EXPECTED_IDENTITY = b"SRS BENCH MCU"   # override per-instance in config.json
+EXPECTED_IDENTITY = b"STM32F405"   # override per-instance in config.json
 
 
 def _lazy_serial():
@@ -127,6 +127,7 @@ class BenchMcuPlugin(DevicePlugin):
                 f"bench_mcu identity mismatch on {handle.port}: "
                 f"expected {handle.expected_identity!r}, got {reply!r}"
             )
+        handle._identity_verified = True
         return handle
 
     def close(self, handle):

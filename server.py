@@ -10,10 +10,9 @@ import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 
-STATE_DIR = os.environ.get(
-    "TEST_SERV_DIR",
-    f"/tmp/test_serv-{os.getenv('USER', 'anon')}",
-)
+import paths
+
+STATE_DIR = paths.state_dir()
 INPUTS = os.path.join(STATE_DIR, "inputs")
 OUTPUTS = os.path.join(STATE_DIR, "outputs")
 DONE = os.path.join(STATE_DIR, "done")

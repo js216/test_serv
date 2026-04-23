@@ -5,14 +5,12 @@
 import json
 import os
 
+import paths
+
 
 DEFAULT_PATHS = [
     os.environ.get("TEST_SERV_CONFIG"),
-    os.path.join(
-        os.environ.get("TEST_SERV_DIR",
-                       f"/tmp/test_serv-{os.getenv('USER', 'anon')}"),
-        "config.json",
-    ),
+    os.path.join(paths.state_dir(), "config.json"),
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"),
 ]
 

@@ -27,7 +27,7 @@
         "id": "0",
         "serial_port": "COM39",
         "baudrate": 115200,
-        "expected_identity": "SRS BENCH MCU",
+        "expected_identity": "STM32F405",
         "autodetect": { "vid": "0x0483", "pid_any": ["0x5740", "0x374B", "0x5710"] }
       }
     ]
