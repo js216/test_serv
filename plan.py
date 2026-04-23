@@ -68,6 +68,7 @@ class Op:
 class Plan:
     ops: list
     blobs: dict             # name -> bytes
+    text: str = ""          # the original plan.txt, preserved verbatim
 
 
 def _parse_value(tok):
@@ -211,7 +212,7 @@ def load_tar(data):
 
     ops = parse_text(plan_text)
     _check_blob_refs(ops, set(blobs))
-    return Plan(ops=ops, blobs=blobs)
+    return Plan(ops=ops, blobs=blobs, text=plan_text)
 
 
 def _check_blob_refs(ops, available):

@@ -244,19 +244,40 @@ class DfuPlugin(DevicePlugin):
         cubeprog = section.get("cubeprog_exe", CUBEPROG_EXE_DEFAULT)
         if not os.path.exists(cubeprog):
             return []
+
+        # pyusb/libusb cannot see WinUSB-bound STM32 DFU devices without
+        # an extra filter driver, so pyusb-based presence checks have
+        # too many false negatives to be useful. Instead ask cubeprog
+        # itself which DFU devices are currently enumerated -- that is
+        # the single authoritative source, takes ~1 s, and is
+        # side-effect-free (pure USB listing).
+        try:
+            result = _run_cubeprog(cubeprog, ["-l", "usb"], LIST_TIMEOUT_S)
+        except Exception:
+            return []
+        if result.returncode != 0:
+            return []
+        enumerated = _parse_list_output(result.stdout or b"")
+        serials = [d.get("serial", "") for d in enumerated]
+
         out = []
         for i, inst in enumerate(section.get("instances", []) or []):
-            vid = inst.get("usb_vid")
-            pid = inst.get("usb_pid")
-            serial = inst.get("usb_serial")
-            present = _usb.winusb_device_present(vid, pid, serial)
-            if present is False:
+            expect_serial = inst.get("usb_serial")
+            # When the config pins an iSerial, filter by it -- catches
+            # "two MP135 boards plugged in" and also "DFU mode not
+            # entered yet, no device enumerated" in one check.
+            # When no iSerial is pinned, match any DFU device (useful
+            # during first bring-up before the exact serial is known).
+            if expect_serial:
+                if not any(expect_serial in s for s in serials):
+                    continue
+            elif not enumerated:
                 continue
             out.append({
                 "id": inst.get("id", f"{i}"),
                 "cubeprog_exe": cubeprog,
                 "usb_index": inst.get("usb_index", "usb1"),
-                "usb_serial": serial,
+                "usb_serial": expect_serial,
             })
         return out
 

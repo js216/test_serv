@@ -299,6 +299,10 @@ def pack_artefact(session):
         _add(tf, "timeline.log", render_timeline(session).encode())
         ops_body = "\n".join(json.dumps(r) for r in session.ops_log) + "\n"
         _add(tf, "ops.jsonl", ops_body.encode())
+        # Echo the plan back so a client can diff against what it sent
+        # and confirm the poller executed the same text it received.
+        plan_text = getattr(session.plan, "text", "") or ""
+        _add(tf, "plan.txt", plan_text.encode())
         if session.errors:
             _add(tf, "errors.log",
                  ("\n\n".join(session.errors) + "\n").encode())
