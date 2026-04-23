@@ -95,11 +95,15 @@ def _op_uart_write(session, h, args):
 def _op_uart_expect(session, h, args):
     sentinel = decode_escapes(args["sentinel"])
     timeout_ms = args["timeout_ms"]
+    end_session = bool(args.get("end_session"))
     stream = session.stream("mp135.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
         if sentinel in stream.snapshot_bytes():
-            session.signal_early_done(f"mp135.uart saw {sentinel!r}")
+            session.log_event("EXPECT", "mp135:uart_expect",
+                              f"HIT {sentinel!r}")
+            if end_session:
+                session.signal_early_done(f"mp135.uart saw {sentinel!r}")
             return
         time.sleep(0.01)
     raise TimeoutError(
@@ -124,10 +128,13 @@ class Mp135Plugin(DevicePlugin):
                          doc=("Write to console. Python-style escapes "
                               "decoded: \\r \\n \\t \\0 \\xNN etc."),
                          run=_op_uart_write),
-        "uart_expect": Op(args={"sentinel": "str", "timeout_ms": "int"},
-                          doc="Block until sentinel in mp135.uart; sets "
-                              "early_done.",
-                          run=_op_uart_expect),
+        "uart_expect": Op(
+            args={"sentinel": "str", "timeout_ms": "int"},
+            optional_args={"end_session": "bool"},
+            doc=("Block until sentinel appears in mp135.uart, then "
+                 "continue.  Pass end_session=true to short-circuit "
+                 "the rest of the plan (old wait_uart semantics)."),
+            run=_op_uart_expect),
     }
 
     def probe(self):

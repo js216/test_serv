@@ -243,11 +243,15 @@ def _op_uart_close(session, h, args):
 def _op_uart_expect(session, h, args):
     sentinel = decode_escapes(args["sentinel"])
     timeout_ms = args["timeout_ms"]
+    end_session = bool(args.get("end_session"))
     stream = session.stream("fpga.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
         if sentinel in stream.snapshot_bytes():
-            session.signal_early_done(f"fpga.uart saw {sentinel!r}")
+            session.log_event("EXPECT", "fpga:uart_expect",
+                              f"HIT {sentinel!r}")
+            if end_session:
+                session.signal_early_done(f"fpga.uart saw {sentinel!r}")
             return
         time.sleep(0.01)
     raise TimeoutError(
@@ -266,9 +270,12 @@ class FpgaPlugin(DevicePlugin):
                         run=_op_uart_open),
         "uart_close": Op(args={}, doc="Stop FPGA UART capture.",
                          run=_op_uart_close),
-        "uart_expect": Op(args={"sentinel": "str", "timeout_ms": "int"},
-                          doc="Block until sentinel in fpga.uart stream.",
-                          run=_op_uart_expect),
+        "uart_expect": Op(
+            args={"sentinel": "str", "timeout_ms": "int"},
+            optional_args={"end_session": "bool"},
+            doc=("Block until sentinel in fpga.uart, then continue. "
+                 "Pass end_session=true to short-circuit the plan."),
+            run=_op_uart_expect),
     }
 
     def probe(self):
