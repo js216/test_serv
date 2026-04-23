@@ -240,15 +240,30 @@ def _op_uart_expect(session, h, args):
 
 CHUNK = 16384
 
+# FT4222 MultiReadWrite is atomic per call: one CS-low window, then
+# CS goes high. Unlike SingleWrite it has no "keep CS asserted" flag,
+# so chunking a multi-lane transfer across several calls makes the
+# slave see several independent transactions rather than one stream.
+# PRBS sequences lose alignment at every chunk boundary in that case,
+# so we refuse to chunk in multi-lane mode and raise instead. Empirical
+# pyft4222 cap is around 64 KiB per call; bench firmware that needs
+# more must split the test into several ops.
+MULTI_MAX_BYTES = 65536
+
 
 def _master_write(dev, data, mode):
     """Write ``data`` over FT4222 master; dispatches by init mode.
 
-    mode=1 (SINGLE): stream over MOSI via SingleWrite, CS held across
-    chunks. mode=2/4 (DUAL/QUAD): use MultiReadWrite so the bits
-    actually spread across D0..D1 / D0..D3. SingleWrite unconditionally
-    uses lane 0 regardless of init mode -- that was the silent
-    single-laning of the multi-lane plans.
+    mode=1 (SINGLE): stream over MOSI via SingleWrite; CS held low
+    across chunks via the ``last`` flag so the slave sees one
+    continuous transaction.
+
+    mode=2/4 (DUAL/QUAD): one MultiReadWrite call carries the whole
+    buffer; no chunking (see MULTI_MAX_BYTES note). ``single_buf`` is
+    empty -- this op emits no cmd/addr phase, so the slave test
+    firmware must be written to accept pure data on the multi-IO
+    lanes. Flash-protocol tests that need a cmd prefix should grow a
+    separate op with an explicit ``cmd`` arg.
     """
     raw = bytes(data)
     if mode == 1:
@@ -256,21 +271,31 @@ def _master_write(dev, data, mode):
             last = (off + CHUNK) >= len(raw)
             dev.spiMaster_SingleWrite(raw[off:off+CHUNK], last)
     else:
-        # MultiReadWrite(single_buf, multi_write_buf, nread).
-        # Empty single phase; all bytes go through the multi-lane
-        # write phase; nread=0.
-        for off in range(0, len(raw), CHUNK):
-            dev.spiMaster_MultiReadWrite(b"", raw[off:off+CHUNK], 0)
+        if len(raw) > MULTI_MAX_BYTES:
+            raise ValueError(
+                f"multi-lane write of {len(raw)} B exceeds "
+                f"{MULTI_MAX_BYTES} B per-call cap; CS deasserts "
+                f"between calls, so splitting would break a "
+                f"continuous-stream test. Lower n, or rework the "
+                f"slave test firmware to accept multiple "
+                f"transactions.")
+        dev.spiMaster_MultiReadWrite(b"", raw, 0)
 
 
 def _master_read(dev, n, mode):
+    """Read ``n`` bytes; dispatches by init mode.
+
+    Same CS-continuity caveat as _master_write applies -- multi-lane
+    reads larger than MULTI_MAX_BYTES would require multiple
+    transactions to the slave.
+    """
     if mode == 1:
         return bytes(dev.spiMaster_SingleRead(n, True))
-    out = bytearray()
-    while len(out) < n:
-        want = min(CHUNK, n - len(out))
-        out += bytes(dev.spiMaster_MultiReadWrite(b"", b"", want))
-    return bytes(out)
+    if n > MULTI_MAX_BYTES:
+        raise ValueError(
+            f"multi-lane read of {n} B exceeds {MULTI_MAX_BYTES} B "
+            f"per-call cap")
+    return bytes(dev.spiMaster_MultiReadWrite(b"", b"", n))
 
 
 def _op_qspi_write(session, h, args):
