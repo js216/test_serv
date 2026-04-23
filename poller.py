@@ -303,7 +303,7 @@ class QspiTest:
             )
         setter(rate_enum)
 
-    def run(self, payload, ser=None):
+    def run(self, payload, ser=None, uart_buf=None):
         if payload[:4] != b"QSPI":
             raise ValueError("bad magic")
         ver = payload[4]
@@ -325,6 +325,7 @@ class QspiTest:
 
         read_bin = bytearray()
         log = []
+        early_done = False
         log.append(
             f"init role={'slave' if role else 'master'} "
             f"sys_clk={sys_clk} clk_div={clk} mode={mode} "
@@ -486,6 +487,48 @@ class QspiTest:
                         ser.flush()
                         time.sleep(0.05)
                     log.append(f"[{op_idx}] uart_tx {len(body)}B")
+                elif tag == 0x0B:   # mark <label>
+                    # Emit a checkpoint in the log with elapsed time
+                    # from session start.  Useful for timing phases
+                    # that span multiple ops.
+                    label = bytes(body).decode(errors="replace")
+                    elapsed = time.time() - t0
+                    log.append(
+                        f"[{op_idx}] mark '{label}'  t={elapsed*1e3:.2f} ms"
+                    )
+                elif tag == 0x0C:   # wait_uart(timeout_ms, sentinel...)
+                    # Block until the UART reader has observed the
+                    # sentinel byte sequence in its buffer, or the
+                    # timeout expires.  Hitting the sentinel sets
+                    # early_done so the caller can skip the trailing
+                    # runtime-hold sleep.  uart_buf is the shared
+                    # list the reader thread appends to.
+                    tmo = struct.unpack("<I", body[:4])[0]
+                    sentinel = bytes(body[4:])
+                    if uart_buf is None:
+                        raise RuntimeError(
+                            "wait_uart opcode requires uart_buf "
+                            "(JobHandler session)"
+                        )
+                    deadline = time.time() + (tmo / 1000.0)
+                    hit = False
+                    while time.time() < deadline:
+                        if sentinel in b"".join(uart_buf):
+                            hit = True
+                            break
+                        time.sleep(0.01)
+                    dt = time.time() - top
+                    if hit:
+                        early_done = True
+                        log.append(
+                            f"[{op_idx}] wait_uart {sentinel!r} HIT  "
+                            f"{dt*1e3:.2f} ms"
+                        )
+                    else:
+                        log.append(
+                            f"[{op_idx}] wait_uart {sentinel!r} TIMEOUT "
+                            f"({tmo} ms)  {dt*1e3:.2f} ms"
+                        )
                 elif tag == 0x20:   # slave_write
                     # Queue bytes for FT4222 slave TX FIFO. The DSP master
                     # clocks them out of MISO at its own pace.
@@ -544,10 +587,11 @@ class QspiTest:
 
         total = time.time() - t0
         log.append(f"done: {op_idx} ops, {total*1e3:.2f} ms total, "
-                   f"{len(read_bin)} bytes read")
+                   f"{len(read_bin)} bytes read"
+                   + ("  early_done" if early_done else ""))
         if read_bin:
             log.append(f"read sha256={hashlib.sha256(read_bin).hexdigest()}")
-        return bytes(read_bin), "\n".join(log) + "\n"
+        return bytes(read_bin), "\n".join(log) + "\n", early_done
 
 
 class ScopeDriver:
@@ -912,10 +956,11 @@ class DspHandler(JobHandler):
 
             self.qspi.accept_ldr(ldr_payload)
 
+            qspi_early_done = False
             if qspi_payload is not None:
                 try:
-                    qspi_bin, qspi_log = QspiTest().run(qspi_payload,
-                                                        ser=ser)
+                    qspi_bin, qspi_log, qspi_early_done = QspiTest().run(
+                        qspi_payload, ser=ser, uart_buf=uart_buf)
                 except Exception:
                     qspi_err = ("qspi executor raised:\n"
                                 + traceback.format_exc())
@@ -923,8 +968,12 @@ class DspHandler(JobHandler):
             duration = float(headers.get("X-Test-Runtime", self.rx_duration_s))
             # Hold the session open for the full runtime so the reader
             # keeps draining any trailing prints the firmware emits
-            # after the qspi ops finish.
-            time.sleep(duration)
+            # after the qspi ops finish.  A wait_uart TLV that matched
+            # its sentinel (qspi_early_done) short-circuits the hold
+            # -- the firmware has already signalled it is done and
+            # further sleep is pure wall-clock waste.
+            if not qspi_early_done:
+                time.sleep(duration)
         finally:
             if reader is not None:
                 stop_evt.set()
@@ -1091,7 +1140,8 @@ class QspiHandler(JobHandler):
                     reader = None
 
             try:
-                read_bin, log = self.qspi_test.run(payload, ser=ser)
+                read_bin, log, _early = self.qspi_test.run(
+                    payload, ser=ser, uart_buf=uart_buf)
             except Exception:
                 # Capture whatever log the executor had built up before
                 # blowing up, so the user can see where it got to.

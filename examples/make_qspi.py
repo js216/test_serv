@@ -63,6 +63,23 @@ def read_verify_prbs(seed, n):return _tlv(0x08, struct.pack("<II", seed, n))
 def xfer_prbs(seed, n):       return _tlv(0x09, struct.pack("<II", seed, n))
 def uart_tx(data):            return _tlv(0x0A, bytes(data))
 
+# Timing checkpoint.  Emits "[op] mark '<label>'  t=XX ms" with
+# elapsed time from session start; no wire effect.  Useful when
+# you want to time a phase whose individual op logs don't line up.
+def mark(label):
+    return _tlv(0x0B,
+                label.encode() if isinstance(label, str) else bytes(label))
+
+# Early-exit.  Poller blocks until ``sentinel`` appears in the UART
+# reader buffer or ``timeout_ms`` elapses.  On hit, sets the
+# session's ``early_done`` flag so JobHandler skips the trailing
+# X-Test-Runtime sleep hold.  Typical use: DSP firmware prints
+# "TEST_SUCCESS\r\n" once its test loop passes; put
+# ``wait_uart(b"TEST_SUCCESS\r\n", 10000)`` at the end of the
+# script and the job returns as soon as the DSP says so.
+def wait_uart(sentinel, timeout_ms):
+    return _tlv(0x0C, struct.pack("<I", timeout_ms) + bytes(sentinel))
+
 
 def write_prbs_multi(seed, n):
     """PRBS write that goes over the multi-IO lanes.
