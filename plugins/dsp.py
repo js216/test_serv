@@ -238,64 +238,93 @@ def _op_uart_expect(session, h, args):
         f"dsp.uart did not contain {sentinel!r} within {timeout_ms} ms")
 
 
-CHUNK = 16384
-
-# FT4222 MultiReadWrite is atomic per call: one CS-low window, then
-# CS goes high. Unlike SingleWrite it has no "keep CS asserted" flag,
-# so chunking a multi-lane transfer across several calls makes the
-# slave see several independent transactions rather than one stream.
-# PRBS sequences lose alignment at every chunk boundary in that case,
-# so we refuse to chunk in multi-lane mode and raise instead. Empirical
-# pyft4222 cap is around 64 KiB per call; bench firmware that needs
-# more must split the test into several ops.
-MULTI_MAX_BYTES = 65536
+# FT4222 per-call length limits (empirical pyft4222 + FT4222 datasheet).
+# SingleWrite/SingleRead: u16 length field, ~65535 bytes per call.
+# MultiReadWrite: multiWriteBytes is u16 but library rejects >=65532
+# with FAILED_TO_WRITE_DEVICE, so 65528 is the safe ceiling.
+CHUNK_ABS_MAX      = 262143   # 256 KiB - 1, sanity cap
+CHUNK_MAX_SINGLE   = 65535
+CHUNK_MAX_MULTI    = 65528
 
 
-def _master_write(dev, data, mode):
-    """Write ``data`` over FT4222 master; dispatches by init mode.
+def _validate_chunk_size(mode, chunk_size):
+    if not (1 <= chunk_size <= CHUNK_ABS_MAX):
+        raise ValueError(
+            f"qspi: chunk_size {chunk_size} out of range [1, "
+            f"{CHUNK_ABS_MAX}]")
+    if mode == 1 and chunk_size > CHUNK_MAX_SINGLE:
+        raise ValueError(
+            f"qspi: chunk_size {chunk_size} > {CHUNK_MAX_SINGLE} not "
+            f"supported in single-lane mode (FT4222 SingleWrite "
+            f"u16 limit)")
+    if mode != 1 and chunk_size > CHUNK_MAX_MULTI:
+        raise ValueError(
+            f"qspi: chunk_size {chunk_size} > {CHUNK_MAX_MULTI} not "
+            f"supported in multi-lane mode (FT4222 MultiReadWrite "
+            f"u16 limit)")
 
-    mode=1 (SINGLE): stream over MOSI via SingleWrite; CS held low
-    across chunks via the ``last`` flag so the slave sees one
-    continuous transaction.
 
-    mode=2/4 (DUAL/QUAD): one MultiReadWrite call carries the whole
-    buffer; no chunking (see MULTI_MAX_BYTES note). ``single_buf`` is
-    empty -- this op emits no cmd/addr phase, so the slave test
-    firmware must be written to accept pure data on the multi-IO
-    lanes. Flash-protocol tests that need a cmd prefix should grow a
-    separate op with an explicit ``cmd`` arg.
+def _master_write(dev, data, mode, chunk_size):
+    """Write ``data`` in ``chunk_size``-byte CS frames.
+
+    mode=1 (SINGLE): chunks are stitched into one CS-low window via
+    SingleWrite's ``last`` flag -- the slave sees one continuous
+    transaction regardless of chunk_size.
+
+    mode=2/4 (DUAL/QUAD): every chunk is its own CS pulse because
+    MultiReadWrite has no "keep CS asserted" flag. The caller is
+    responsible for framing (per-frame PRBS alignment, cksum, FT4222
+    first-byte hazard workaround, ...) -- the plugin just honours
+    the requested chunk_size.  single_buf is always empty; this op
+    emits no cmd/addr prefix.
     """
+    _validate_chunk_size(mode, chunk_size)
     raw = bytes(data)
     if mode == 1:
-        for off in range(0, len(raw), CHUNK):
-            last = (off + CHUNK) >= len(raw)
-            dev.spiMaster_SingleWrite(raw[off:off+CHUNK], last)
+        for off in range(0, len(raw), chunk_size):
+            last = (off + chunk_size) >= len(raw)
+            dev.spiMaster_SingleWrite(raw[off:off+chunk_size], last)
     else:
-        if len(raw) > MULTI_MAX_BYTES:
-            raise ValueError(
-                f"multi-lane write of {len(raw)} B exceeds "
-                f"{MULTI_MAX_BYTES} B per-call cap; CS deasserts "
-                f"between calls, so splitting would break a "
-                f"continuous-stream test. Lower n, or rework the "
-                f"slave test firmware to accept multiple "
-                f"transactions.")
-        dev.spiMaster_MultiReadWrite(b"", raw, 0)
+        for off in range(0, len(raw), chunk_size):
+            dev.spiMaster_MultiReadWrite(
+                b"", raw[off:off+chunk_size], 0)
 
 
-def _master_read(dev, n, mode):
-    """Read ``n`` bytes; dispatches by init mode.
+def _master_read(dev, n, mode, chunk_size):
+    """Read ``n`` bytes in ``chunk_size``-byte CS frames.
 
-    Same CS-continuity caveat as _master_write applies -- multi-lane
-    reads larger than MULTI_MAX_BYTES would require multiple
-    transactions to the slave.
+    Same CS-continuity semantics as _master_write.
     """
+    _validate_chunk_size(mode, chunk_size)
     if mode == 1:
-        return bytes(dev.spiMaster_SingleRead(n, True))
-    if n > MULTI_MAX_BYTES:
+        out = bytearray()
+        while len(out) < n:
+            want = min(chunk_size, n - len(out))
+            last = (len(out) + want) >= n
+            out += bytes(dev.spiMaster_SingleRead(want, last))
+        return bytes(out)
+    out = bytearray()
+    while len(out) < n:
+        want = min(chunk_size, n - len(out))
+        out += bytes(dev.spiMaster_MultiReadWrite(b"", b"", want))
+    return bytes(out)
+
+
+def _master_xfer(dev, data, mode, chunk_size):
+    """Full-duplex ``data`` exchange; single-lane only on FT4222."""
+    if mode != 1:
         raise ValueError(
-            f"multi-lane read of {n} B exceeds {MULTI_MAX_BYTES} B "
-            f"per-call cap")
-    return bytes(dev.spiMaster_MultiReadWrite(b"", b"", n))
+            "qspi_xfer requires mode=1; SingleReadWrite is not "
+            "implemented for multi-lane on FT4222 and full-duplex "
+            "is not a valid QSPI concept in multi-lane phases")
+    _validate_chunk_size(mode, chunk_size)
+    raw = bytes(data)
+    out = bytearray()
+    for off in range(0, len(raw), chunk_size):
+        last = (off + chunk_size) >= len(raw)
+        out += bytes(dev.spiMaster_SingleReadWrite(
+            raw[off:off+chunk_size], last))
+    return bytes(out)
 
 
 def _op_qspi_write(session, h, args):
@@ -304,7 +333,7 @@ def _op_qspi_write(session, h, args):
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        _master_write(dev, data, mode)
+        _master_write(dev, data, mode, args["chunk_size"])
     finally:
         dev.close()
 
@@ -315,7 +344,7 @@ def _op_qspi_read(session, h, args):
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        got = _master_read(dev, n, mode)
+        got = _master_read(dev, n, mode, args["chunk_size"])
     finally:
         dev.close()
     session.stream("dsp.qspi_read").append(got)
@@ -329,7 +358,7 @@ def _op_qspi_write_prbs(session, h, args):
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        _master_write(dev, buf, mode)
+        _master_write(dev, buf, mode, args["chunk_size"])
     finally:
         dev.close()
 
@@ -342,7 +371,7 @@ def _op_qspi_read_verify_prbs(session, h, args):
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        got = _master_read(dev, n, mode)
+        got = _master_read(dev, n, mode, args["chunk_size"])
     finally:
         dev.close()
     if got == expected:
@@ -366,18 +395,11 @@ def _op_qspi_xfer_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
     mode = args["mode"]
-    # SingleReadWrite is only implemented for SINGLE-lane on FT4222;
-    # full-duplex xfer in dual/quad is not a valid QSPI concept
-    # (the lanes are unidirectional during a multi-IO phase).
-    if mode != 1:
-        raise ValueError(
-            "dsp:qspi_xfer_prbs requires mode=1; use "
-            "qspi_write_prbs + qspi_read_verify_prbs for dual/quad")
     buf = prbs_xorshift32(seed, n)
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        got = bytes(dev.spiMaster_SingleReadWrite(buf, True))
+        got = _master_xfer(dev, buf, mode, args["chunk_size"])
     finally:
         dev.close()
     session.stream("dsp.qspi_xfer").append(got)
@@ -408,27 +430,37 @@ class DspPlugin(DevicePlugin):
                           doc="Block until sentinel appears in dsp.uart; "
                               "sets early_done.",
                           run=_op_uart_expect),
-        "qspi_write": Op(args={"data": "blob", "clk_div": "int", "mode": "int"},
-                         doc="Raw QSPI master write of a blob.",
-                         run=_op_qspi_write),
-        "qspi_read": Op(args={"n": "int", "clk_div": "int", "mode": "int"},
-                        doc="Raw QSPI master read; result appended to "
-                            "stream dsp.qspi_read.",
-                        run=_op_qspi_read),
+        "qspi_write": Op(
+            args={"data": "blob", "clk_div": "int", "mode": "int",
+                  "chunk_size": "int"},
+            doc=("Raw QSPI master write of a blob. Data split into "
+                 "chunk_size-byte CS frames; single-lane mode keeps CS "
+                 "low across frames, multi-lane mode pulses CS per "
+                 "frame (caller owns framing)."),
+            run=_op_qspi_write),
+        "qspi_read": Op(
+            args={"n": "int", "clk_div": "int", "mode": "int",
+                  "chunk_size": "int"},
+            doc=("Raw QSPI master read; result appended to stream "
+                 "dsp.qspi_read. Same chunk semantics as qspi_write."),
+            run=_op_qspi_read),
         "qspi_write_prbs": Op(
             args={"seed": "int", "n": "int",
-                  "clk_div": "int", "mode": "int"},
+                  "clk_div": "int", "mode": "int",
+                  "chunk_size": "int"},
             doc="Write n bytes of xorshift32(seed) over QSPI.",
             run=_op_qspi_write_prbs),
         "qspi_read_verify_prbs": Op(
             args={"seed": "int", "n": "int",
-                  "clk_div": "int", "mode": "int"},
+                  "clk_div": "int", "mode": "int",
+                  "chunk_size": "int"},
             doc="Read n bytes, compare to xorshift32(seed); fails op on "
                 "mismatch.",
             run=_op_qspi_read_verify_prbs),
         "qspi_xfer_prbs": Op(
             args={"seed": "int", "n": "int",
-                  "clk_div": "int", "mode": "int"},
+                  "clk_div": "int", "mode": "int",
+                  "chunk_size": "int"},
             doc="Full-duplex xfer of xorshift32(seed); MISO goes into "
                 "stream dsp.qspi_xfer.",
             run=_op_qspi_xfer_prbs),

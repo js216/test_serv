@@ -182,10 +182,10 @@ def _op_flash(session, h, args):
         tmp.close()
 
         argv = ["-c", f"port={h.usb_index}",
-                "-d", tmp.name, f"0x{address:08x}", "-v"]
+                "-w", tmp.name, f"0x{address:08x}", "-v"]
         session.log_event(
             "DFU", "dfu:flash",
-            f"cubeprog -c port={h.usb_index} -d <{len(image)}B> "
+            f"cubeprog -c port={h.usb_index} -w <{len(image)}B> "
             f"0x{address:08x}")
         result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
         if result.stdout:
