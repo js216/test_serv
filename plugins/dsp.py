@@ -374,13 +374,46 @@ class DspPlugin(DevicePlugin):
                 "serial_port": inst.get("serial_port"),
                 "baudrate": int(inst.get("baudrate", 115200)),
                 "ft4222_desc": ft_desc,
+                "ft4222_serial": inst.get("ft4222_serial"),
             })
         return out
 
     def open(self, spec):
-        return DspHandle(serial_port=spec["serial_port"],
-                         baud=spec["baudrate"],
-                         ft4222_desc=spec["ft4222_desc"])
+        # Identity handshake: walk the FTDI device info list and confirm
+        # an entry matches both the expected description and (if pinned)
+        # serial.  Catches the case where Windows kept the same
+        # "FT4222 A" label but the hardware behind it changed, which is
+        # the failure mode bare-descriptor-matching can't see.
+        desc = spec["ft4222_desc"]
+        expected_serial = spec.get("ft4222_serial")
+        try:
+            import ft4222 as ft_mod
+        except ImportError:
+            raise RuntimeError("pyft4222 not installed")
+        matched = None
+        for i in range(ft_mod.createDeviceInfoList()):
+            info = ft_mod.getDeviceInfoDetail(i, False)
+            d = info.get("description", b"")
+            s = info.get("serial", b"")
+            if isinstance(d, bytes):
+                d = d.decode(errors="replace")
+            if isinstance(s, bytes):
+                s = s.decode(errors="replace")
+            if d != desc:
+                continue
+            if expected_serial and s != expected_serial:
+                continue
+            matched = (d, s, info.get("type"), info.get("id"))
+            break
+        if matched is None:
+            raise RuntimeError(
+                f"dsp: no FTDI device matches desc={desc!r} "
+                f"serial={expected_serial!r}")
+        handle = DspHandle(serial_port=spec["serial_port"],
+                           baud=spec["baudrate"],
+                           ft4222_desc=spec["ft4222_desc"])
+        handle._identity_verified = True
+        return handle
 
     def close(self, handle):
         handle.uart_close()

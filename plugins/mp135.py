@@ -138,15 +138,63 @@ class Mp135Plugin(DevicePlugin):
                 "id": inst.get("id", "0"),
                 "serial_port": port,
                 "baudrate": int(inst.get("baudrate", 115200)),
+                "expected_usb_vid": inst.get("expected_usb_vid"),
+                "expected_usb_pid": inst.get("expected_usb_pid"),
+                "expected_usb_serial": inst.get("expected_usb_serial"),
+                "expected_usb_interface": inst.get("expected_usb_interface"),
             })
         return out
 
     def open(self, spec):
         h = Mp135Handle(port=spec["serial_port"], baud=spec["baudrate"])
-        # Claim the port briefly to verify the OS lets us have it, then
-        # release. Catches "another process already holds this port" at
-        # open-time rather than on first uart_open. No handshake byte on
-        # the wire -- a Linux boot console has no prompt we can rely on.
+
+        # Identity check: look up the USB properties backing this COMxx.
+        # Linux boot console emits no stable prompt, so on-wire handshake
+        # isn't reliable. Instead verify that the COM port is really an
+        # STLink VCP (matching VID/PID/iSerial) -- the STM32F405 and any
+        # generic USB-UART share a port namespace but have different USB
+        # identities.
+        info = _usb.com_port_info(h.port)
+        if info is None:
+            raise RuntimeError(f"mp135: {h.port} not in OS port list")
+
+        exp_vid = spec.get("expected_usb_vid")
+        exp_pid = spec.get("expected_usb_pid")
+        exp_ser = spec.get("expected_usb_serial")
+        exp_if  = spec.get("expected_usb_interface")
+        verified = False
+        if exp_vid is not None:
+            if info.vid != config.as_int(exp_vid):
+                raise RuntimeError(
+                    f"mp135 USB VID mismatch on {h.port}: "
+                    f"expected 0x{config.as_int(exp_vid):04x}, "
+                    f"got 0x{info.vid or 0:04x}")
+            verified = True
+        if exp_pid is not None:
+            if info.pid != config.as_int(exp_pid):
+                raise RuntimeError(
+                    f"mp135 USB PID mismatch on {h.port}: "
+                    f"expected 0x{config.as_int(exp_pid):04x}, "
+                    f"got 0x{info.pid or 0:04x}")
+            verified = True
+        if exp_ser is not None:
+            got = info.serial_number or ""
+            if exp_ser not in got:
+                raise RuntimeError(
+                    f"mp135 USB iSerial mismatch on {h.port}: "
+                    f"expected {exp_ser!r} substring, got {got!r}")
+            verified = True
+        if exp_if is not None:
+            loc = (info.location or "") + " " + (info.hwid or "")
+            needle_a = f"MI_{int(exp_if):02d}"
+            needle_b = f":1.{int(exp_if)}"
+            if needle_a not in loc and needle_b not in loc:
+                raise RuntimeError(
+                    f"mp135 USB interface mismatch on {h.port}: "
+                    f"expected MI_{int(exp_if):02d}, got {loc!r}")
+            verified = True
+
+        # Claim the port briefly so contention (PuTTY etc.) fails now.
         try:
             import serial
             ser = serial.Serial(h.port, baudrate=h.baud, timeout=0.1)
@@ -154,6 +202,9 @@ class Mp135Plugin(DevicePlugin):
         except Exception as e:
             raise RuntimeError(
                 f"mp135: cannot claim {h.port}: {e}")
+
+        if verified:
+            h._identity_verified = True
         return h
 
     def close(self, handle):

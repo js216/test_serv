@@ -52,6 +52,19 @@ def com_port_present(name):
     return any(p.device == name for p in list_com_ports())
 
 
+def com_port_info(name):
+    """Return the ``ListPortInfo`` for ``name``, or ``None``.
+
+    Callers can then check ``.vid``, ``.pid``, ``.serial_number``,
+    ``.manufacturer``, ``.location`` to verify the identity of the USB
+    device backing a given COMxx slot.
+    """
+    for p in list_com_ports():
+        if p.device == name:
+            return p
+    return None
+
+
 def ftd2xx_descriptors():
     """Return the set of FTDI descriptor strings currently enumerated,
     or ``None`` if the driver is unavailable (non-FTDI host, etc.).

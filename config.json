@@ -4,6 +4,7 @@
       {
         "id": "A",
         "ft4222_desc": "FT4222 A",
+        "ft4222_serial": "A",
         "serial_port": "COM31",
         "baudrate": 115200
       }
@@ -39,7 +40,12 @@
         "id": "0",
         "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1 },
         "serial_port": "COM15",
-        "baudrate": 115200
+        "baudrate": 115200,
+
+        "expected_usb_vid":       "0x0483",
+        "expected_usb_pid":       "0x3753",
+        "expected_usb_interface": 1,
+        "expected_usb_serial":    null
       }
     ]
   },
@@ -60,7 +66,8 @@
     "instances": [
       {
         "id": "0",
-        "resource": "USB0::0xF4EC::0x1011::SDS2PDDX6R1848::INSTR"
+        "resource": "USB0::0xF4EC::0x1011::SDS2PDDX6R1848::INSTR",
+        "expected_idn": "Siglent Technologies,SDS2504X Plus"
       }
     ]
   },

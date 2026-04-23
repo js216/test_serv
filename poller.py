@@ -102,14 +102,33 @@ def _drain_sweep_markers(registry, plugins_by_name):
             pass
 
 
+_SPEC_LOCATOR_KEYS = (
+    "serial_port", "resource", "ft4222_desc", "ft2232h_desc",
+    "ip", "usb_serial",
+)
+
+
+def _describe_spec(spec):
+    """Render the spec's most user-visible identifier (COM port, VISA
+    resource, FTDI descriptor, IP, ...).  Empty string if none found.
+    """
+    for k in _SPEC_LOCATOR_KEYS:
+        v = spec.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
 def _print_device_table(verify_map, registry):
-    """Pretty-print: plugin.id   status   latency   identity/error."""
+    """Pretty-print: plugin.id   location   latency   status/identity."""
     rows = registry.list_devices()
     if not rows:
         print("  (no devices present)")
         return
     w_id = max(len(r["id"]) for r in rows)
-    for r in rows:
+    locs = [_describe_spec(r["spec"]) for r in rows]
+    w_loc = max([len(x) for x in locs] + [0])
+    for r, loc in zip(rows, locs):
         v = r.get("verify") or {}
         ok = v.get("ok")
         mark = "OK   " if ok else ("FAIL " if ok is False else "?    ")
@@ -121,7 +140,8 @@ def _print_device_table(verify_map, registry):
                     else "open ok (plugin has no identity handshake)")
         else:
             tail = "(not yet verified)"
-        print(f"  [{mark}] {r['id']:<{w_id}}  {lat}  {tail}")
+        print(f"  [{mark}] {r['id']:<{w_id}}  {loc:<{w_loc}}  "
+              f"{lat}  {tail}")
 
 
 def _dispatch(payload, headers, registry, plugins_by_name):
