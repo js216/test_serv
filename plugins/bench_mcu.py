@@ -7,6 +7,7 @@ import time
 import config
 from plugin import DevicePlugin, Op
 from . import _usb
+from ._text import decode_escapes
 
 
 READ_WINDOW_S = 0.5
@@ -66,6 +67,27 @@ def _op_reset_dut(session, h, args):
         session.stream("bench_mcu.reset_dut").append(reply)
 
 
+def _op_send(session, h, args):
+    """Send arbitrary bytes, drain reply into bench_mcu.send.
+
+    Python-style escapes in ``data`` are decoded, same as uart_write
+    on the other UART plugins. Lets plans issue short commands like
+    ``data="h"`` (help listing) or ``data="v"`` without the plugin
+    needing a new named op per command.
+    """
+    payload = decode_escapes(args["data"])
+    serial = _lazy_serial()
+    ser = serial.Serial(h.port, baudrate=h.baud, timeout=0.1)
+    try:
+        ser.reset_input_buffer()
+        ser.write(payload)
+        ser.flush()
+        reply = _drain(ser, READ_WINDOW_S)
+    finally:
+        ser.close()
+    session.stream("bench_mcu.send").append(reply)
+
+
 # --- plugin ---
 
 class BenchMcuHandle:
@@ -91,6 +113,12 @@ class BenchMcuPlugin(DevicePlugin):
         "reset_dut": Op(args={},
                         doc="Send 'r' to assert D13 reset on the DUT.",
                         run=_op_reset_dut),
+        "send": Op(args={"data": "str"},
+                   doc=("Send arbitrary bytes (escapes decoded: "
+                        "\\r \\n \\0 \\xNN), drain reply into stream "
+                        "bench_mcu.send.  Use for help ('h'), version "
+                        "('v'), any one-shot bench-MCU command."),
+                   run=_op_send),
     }
 
     def probe(self):

@@ -238,38 +238,73 @@ def _op_uart_expect(session, h, args):
         f"dsp.uart did not contain {sentinel!r} within {timeout_ms} ms")
 
 
+CHUNK = 16384
+
+
+def _master_write(dev, data, mode):
+    """Write ``data`` over FT4222 master; dispatches by init mode.
+
+    mode=1 (SINGLE): stream over MOSI via SingleWrite, CS held across
+    chunks. mode=2/4 (DUAL/QUAD): use MultiReadWrite so the bits
+    actually spread across D0..D1 / D0..D3. SingleWrite unconditionally
+    uses lane 0 regardless of init mode -- that was the silent
+    single-laning of the multi-lane plans.
+    """
+    raw = bytes(data)
+    if mode == 1:
+        for off in range(0, len(raw), CHUNK):
+            last = (off + CHUNK) >= len(raw)
+            dev.spiMaster_SingleWrite(raw[off:off+CHUNK], last)
+    else:
+        # MultiReadWrite(single_buf, multi_write_buf, nread).
+        # Empty single phase; all bytes go through the multi-lane
+        # write phase; nread=0.
+        for off in range(0, len(raw), CHUNK):
+            dev.spiMaster_MultiReadWrite(b"", raw[off:off+CHUNK], 0)
+
+
+def _master_read(dev, n, mode):
+    if mode == 1:
+        return bytes(dev.spiMaster_SingleRead(n, True))
+    out = bytearray()
+    while len(out) < n:
+        want = min(CHUNK, n - len(out))
+        out += bytes(dev.spiMaster_MultiReadWrite(b"", b"", want))
+    return bytes(out)
+
+
 def _op_qspi_write(session, h, args):
     data = args["data"]
-    dev = _open_master(clk_div=args["clk_div"], mode=args["mode"], flags=0)
+    mode = args["mode"]
+    dev = _open_master(h.ft4222_desc,
+                       clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        CHUNK = 16384
-        for off in range(0, len(data), CHUNK):
-            last = (off + CHUNK) >= len(data)
-            dev.spiMaster_SingleWrite(bytes(data[off:off+CHUNK]), last)
+        _master_write(dev, data, mode)
     finally:
         dev.close()
 
 
 def _op_qspi_read(session, h, args):
     n = args["n"]
-    dev = _open_master(clk_div=args["clk_div"], mode=args["mode"], flags=0)
+    mode = args["mode"]
+    dev = _open_master(h.ft4222_desc,
+                       clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        got = dev.spiMaster_SingleRead(n, True)
+        got = _master_read(dev, n, mode)
     finally:
         dev.close()
-    session.stream("dsp.qspi_read").append(bytes(got))
+    session.stream("dsp.qspi_read").append(got)
 
 
 def _op_qspi_write_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
+    mode = args["mode"]
     buf = prbs_xorshift32(seed, n)
-    dev = _open_master(clk_div=args["clk_div"], mode=args["mode"], flags=0)
+    dev = _open_master(h.ft4222_desc,
+                       clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        CHUNK = 16384
-        for off in range(0, len(buf), CHUNK):
-            last = (off + CHUNK) >= len(buf)
-            dev.spiMaster_SingleWrite(bytes(buf[off:off+CHUNK]), last)
+        _master_write(dev, buf, mode)
     finally:
         dev.close()
 
@@ -277,10 +312,12 @@ def _op_qspi_write_prbs(session, h, args):
 def _op_qspi_read_verify_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
+    mode = args["mode"]
     expected = prbs_xorshift32(seed, n)
-    dev = _open_master(clk_div=args["clk_div"], mode=args["mode"], flags=0)
+    dev = _open_master(h.ft4222_desc,
+                       clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        got = bytes(dev.spiMaster_SingleRead(n, True))
+        got = _master_read(dev, n, mode)
     finally:
         dev.close()
     if got == expected:
@@ -303,8 +340,17 @@ def _op_qspi_read_verify_prbs(session, h, args):
 def _op_qspi_xfer_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
+    mode = args["mode"]
+    # SingleReadWrite is only implemented for SINGLE-lane on FT4222;
+    # full-duplex xfer in dual/quad is not a valid QSPI concept
+    # (the lanes are unidirectional during a multi-IO phase).
+    if mode != 1:
+        raise ValueError(
+            "dsp:qspi_xfer_prbs requires mode=1; use "
+            "qspi_write_prbs + qspi_read_verify_prbs for dual/quad")
     buf = prbs_xorshift32(seed, n)
-    dev = _open_master(clk_div=args["clk_div"], mode=args["mode"], flags=0)
+    dev = _open_master(h.ft4222_desc,
+                       clk_div=args["clk_div"], mode=mode, flags=0)
     try:
         got = bytes(dev.spiMaster_SingleReadWrite(buf, True))
     finally:
