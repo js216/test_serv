@@ -260,7 +260,24 @@ def main():
 
     last_refresh = time.monotonic()
     base = f"http://localhost:{HTTP_PORT}"
-    workers = []      # live threads; reaped opportunistically
+
+    # Useful concurrency is bounded by the number of distinct devices
+    # we have -- any two jobs competing for the same device serialize
+    # on the registry's per-device lock anyway. Gate pick-up with a
+    # semaphore sized to that ceiling so we never spawn threads that
+    # can only sit on locks. Jobs beyond the cap stay queued on disk
+    # in inputs/.
+    max_active = max(1, len(plugins_by_name))
+    worker_slot = threading.Semaphore(max_active)
+    print(datetime.now(),
+          f"dispatch: at most {max_active} job(s) active "
+          f"(= number of plugins)")
+
+    def _worker(body, headers):
+        try:
+            _dispatch(body, headers, registry, plugins_by_name)
+        finally:
+            worker_slot.release()
 
     try:
         while True:
@@ -272,35 +289,29 @@ def main():
                 _publish_status(registry, plugins_by_name)
                 last_refresh = time.monotonic()
 
-            # Prune dead worker threads so the list doesn't grow
-            # without bound over a long session.
-            workers[:] = [t for t in workers if t.is_alive()]
-
+            # Block until a worker slot opens so we don't hold the job
+            # payload in memory unread, and so disk-queued jobs don't
+            # accumulate live Python threads all blocked on locks.
+            worker_slot.acquire()
             try:
                 status, body, headers = _get(f"{base}/plan")
             except Exception:
                 print(datetime.now(), "GET /plan failed")
+                worker_slot.release()
                 time.sleep(POLL_INTERVAL_S)
                 continue
 
             if status == 204 or not body:
+                worker_slot.release()
                 time.sleep(POLL_INTERVAL_S)
                 continue
 
-            # One thread per job. Conflicting device access serializes
-            # on the registry's per-device lock, so unbounded workers
-            # are safe -- extra threads just sleep on an acquire.
-            t = threading.Thread(
-                target=_dispatch,
-                args=(body, headers, registry, plugins_by_name),
-                daemon=True)
+            t = threading.Thread(target=_worker, args=(body, headers),
+                                 daemon=True)
             t.start()
-            workers.append(t)
     except KeyboardInterrupt:
         pass
     finally:
-        for t in workers:
-            t.join(timeout=5)
         registry.stop()
         registry.close_all()
 
