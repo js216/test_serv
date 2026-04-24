@@ -97,6 +97,35 @@ class Session:
 
     def run_all(self, plugins):
         deadline = self.t0 + MAX_SESSION_S
+        # Job-atomic device locking: grab every device the plan
+        # references up front and hold the locks for the whole session.
+        # A job that needs {dsp, fpga} therefore pauses any other job
+        # that touches dsp or fpga until it finishes -- no surprise
+        # interleaving between a multi-device test's individual ops.
+        # Keys are sorted for a consistent global acquisition order so
+        # two jobs sharing a subset of devices cannot deadlock each
+        # other.
+        from plan import required_devices
+        needed = sorted(required_devices(self.plan))
+        keys = []
+        for name in needed:
+            try:
+                keys.append(self.registry.resolve(name))
+            except LookupError as e:
+                self.errors.append(f"job-lock: {e}")
+                self.log_event("ERROR", "session", f"job-lock: {e}")
+                for s in self.streams.values():
+                    s.close()
+                return
+        with self.registry.lock:
+            locks = [self.registry.per_dev_lock.setdefault(
+                        k, threading.RLock())
+                     for k in keys]
+        self.log_event("LOCK", "session",
+                       f"acquiring {keys}" if keys else "(no devices)")
+        for lk in locks:
+            lk.acquire()
+        self.log_event("LOCK", "session", "acquired; running ops")
         try:
             self._run_block(self.plan.ops, plugins, deadline)
         except Exception:
@@ -114,6 +143,9 @@ class Session:
             # Close every stream so writers stop appending to frozen data.
             for s in self.streams.values():
                 s.close()
+            for lk in reversed(locks):
+                lk.release()
+            self.log_event("LOCK", "session", "released")
 
     def _run_block(self, ops, plugins, deadline):
         for op in ops:
