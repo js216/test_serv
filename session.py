@@ -105,25 +105,40 @@ class Session:
         # Keys are sorted for a consistent global acquisition order so
         # two jobs sharing a subset of devices cannot deadlock each
         # other.
+        #
+        # Some devices may not yet be present at session start (e.g. a
+        # plan that resets MP135 into DFU *then* talks to dfu). For
+        # each needed plugin we do a targeted probe; devices that
+        # resolve now get locked here, devices that don't become
+        # "deferred" and get locked lazily the first time an op for
+        # them runs (_run_device_op handles that path). Deferred locks
+        # are held for the rest of the session, same as eager ones --
+        # so the overall semantics is still job-atomic once the
+        # device shows up.
         from plan import required_devices
         needed = sorted(required_devices(self.plan))
-        keys = []
+        for name in needed:
+            self.registry.refresh_plugin(name)
+
+        eager_keys = []
+        self._deferred_names = set()
         for name in needed:
             try:
-                keys.append(self.registry.resolve(name))
-            except LookupError as e:
-                self.errors.append(f"job-lock: {e}")
-                self.log_event("ERROR", "session", f"job-lock: {e}")
-                for s in self.streams.values():
-                    s.close()
-                return
+                eager_keys.append(self.registry.resolve(name))
+            except LookupError:
+                self._deferred_names.add(name)
         with self.registry.lock:
-            locks = [self.registry.per_dev_lock.setdefault(
-                        k, threading.RLock())
-                     for k in keys]
-        self.log_event("LOCK", "session",
-                       f"acquiring {keys}" if keys else "(no devices)")
-        for lk in locks:
+            eager_locks = [
+                self.registry.per_dev_lock.setdefault(k, threading.RLock())
+                for k in eager_keys]
+        self._deferred_locks = []     # filled by _run_device_op
+
+        self.log_event(
+            "LOCK", "session",
+            f"acquire now={eager_keys}  "
+            f"deferred={sorted(self._deferred_names)}"
+            if eager_keys or self._deferred_names else "(no devices)")
+        for lk in eager_locks:
             lk.acquire()
         self.log_event("LOCK", "session", "acquired; running ops")
         try:
@@ -133,17 +148,19 @@ class Session:
             self.log_event("ERROR", "session",
                            f"top-level: {self.errors[-1].splitlines()[-1]}")
         finally:
-            # Release any pinned handles that outlive their ops.
             for key, cm in list(self.pinned.items()):
                 try:
                     cm.__exit__(None, None, None)
                 except Exception:
                     pass
             self.pinned.clear()
-            # Close every stream so writers stop appending to frozen data.
             for s in self.streams.values():
                 s.close()
-            for lk in reversed(locks):
+            # Release deferred locks (acquired mid-session) first, then
+            # eager locks. Reverse of acquisition order in both lists.
+            for lk in reversed(self._deferred_locks):
+                lk.release()
+            for lk in reversed(eager_locks):
                 lk.release()
             self.log_event("LOCK", "session", "released")
 
@@ -184,13 +201,40 @@ class Session:
 
     # --- device ops ---
 
+    def _resolve_device(self, plugin_name):
+        """Resolve with one targeted re-probe on miss.
+
+        Lets plans whose earlier ops caused a device to appear (DUT
+        reset into DFU, board coming online, ...) find it at op time
+        without waiting for the background refresh tick.  If the
+        device is in the session's deferred set, this also promotes
+        it to 'locked for the remainder of the session' so subsequent
+        ops on the same device keep the job-atomic guarantee.
+        """
+        try:
+            key = self.registry.resolve(plugin_name)
+        except LookupError:
+            self.registry.refresh_plugin(plugin_name)
+            key = self.registry.resolve(plugin_name)
+
+        if plugin_name in getattr(self, "_deferred_names", set()):
+            with self.registry.lock:
+                lk = self.registry.per_dev_lock.setdefault(
+                    key, threading.RLock())
+            lk.acquire()
+            self._deferred_locks.append(lk)
+            self._deferred_names.discard(plugin_name)
+            self.log_event("LOCK", "session",
+                           f"deferred acquire {key}")
+        return key
+
     def _run_device_op(self, op, plugins):
         if op.device not in plugins:
             raise PlanError(f"unknown device {op.device!r}")
         plugin = plugins[op.device]
 
         if op.verb in ("open", "close"):
-            key = self.registry.resolve(op.device)
+            key = self._resolve_device(op.device)
             if op.verb == "open":
                 if key in self.pinned:
                     return
@@ -210,7 +254,7 @@ class Session:
         schema = plugin.ops[op.verb]
         decoded = decode_args(schema, op.args, self.plan.blobs)
 
-        key = self.registry.resolve(op.device)
+        key = self._resolve_device(op.device)
         if key in self.pinned:
             # Pinned: use the existing handle; don't open/close.
             handle = self.pinned[key].handle

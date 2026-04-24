@@ -179,7 +179,17 @@ def _dispatch(payload, headers, registry, plugins_by_name):
 
 
 def _validate_against_plugins(parsed, plugins_by_name, registry):
-    """Reject jobs referencing unknown devices/ops before any hardware ran."""
+    """Reject jobs with unknown plugins or op names before running.
+
+    Device *instance* presence is NOT checked here: the registry's
+    view of which devices are plugged in refreshes only every
+    DEVICE_REFRESH_S seconds, so a plan whose earlier ops switch the
+    board into a new mode (e.g. bench_mcu:send data="r" puts MP135 in
+    DFU) would unfairly fail validation if instance presence were
+    required up front. Missing instances surface as op-time errors
+    via session._run_device_op, which does a targeted re-probe of the
+    relevant plugin before giving up.
+    """
     def walk(ops):
         for op in ops:
             if op.device is not None:
@@ -188,15 +198,10 @@ def _validate_against_plugins(parsed, plugins_by_name, registry):
                                      f"{op.device!r}")
                 pl = plugins_by_name[op.device]
                 if op.verb in ("open", "close"):
-                    pass    # synthesized; needs a probed instance
+                    pass
                 elif op.verb not in pl.ops:
                     raise ValueError(f"line {op.lineno}: {op.device!r} has "
                                      f"no op {op.verb!r}")
-                # Check that the device has a present instance at all.
-                try:
-                    registry.resolve(op.device)
-                except LookupError as e:
-                    raise ValueError(f"line {op.lineno}: {e}")
             walk(op.body)
     walk(parsed.ops)
 

@@ -65,6 +65,45 @@ class DeviceRegistry:
                 self.specs[key] = val
                 self.per_dev_lock.setdefault(key, threading.RLock())
 
+    def refresh_plugin(self, name):
+        """Targeted re-probe of a single plugin.
+
+        Cheaper than a full refresh and safe to call mid-session.
+        Lets rapidly-changing presence (e.g. MP135 flipping into DFU
+        mode after a bench_mcu:reset_dut) become visible to later ops
+        without waiting for the background 15 s refresh tick.
+        """
+        pl = self.plugins.get(name)
+        if pl is None:
+            return
+        try:
+            specs = pl.probe() or []
+        except Exception:
+            traceback.print_exc()
+            specs = []
+        found = {}
+        for spec in specs:
+            did = spec.get("id")
+            if did is None:
+                continue
+            key = f"{name}.{did}"
+            found[key] = (name, spec)
+        with self.lock:
+            # Drop vanished instances for this plugin only, and only
+            # when nobody is holding them.
+            for key in list(self.specs):
+                plugin_name, _ = self.specs[key]
+                if plugin_name != name:
+                    continue
+                if key not in found:
+                    entry = self.cache.get(key)
+                    if entry is None or entry[3] == 0:
+                        self.specs.pop(key, None)
+                        self._close_if_cached_locked(key)
+            for key, val in found.items():
+                self.specs[key] = val
+                self.per_dev_lock.setdefault(key, threading.RLock())
+
     def resolve(self, plugin_name, spec_id=None):
         """Return the full device key ``"plugin.id"`` for a job reference.
 
