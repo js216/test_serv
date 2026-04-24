@@ -267,7 +267,7 @@ def _validate_chunk_size(mode, chunk_size):
             f"u16 limit)")
 
 
-def _master_write(dev, data, mode, chunk_size, prefix=b""):
+def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None):
     """Write ``data`` in ``chunk_size``-byte CS frames.
 
     mode=1 (SINGLE): chunks are stitched into one CS-low window via
@@ -285,6 +285,10 @@ def _master_write(dev, data, mode, chunk_size, prefix=b""):
     b"\\x00" byte to sidestep the hazard where frames whose first
     byte matches ``(B & 0x11) == 0x01`` corrupt subsequent bytes.
     single_buf is always empty; no cmd/addr prefix is emitted.
+
+    ``on_chunk`` (optional): callable invoked as
+    ``on_chunk(off, data_len, frame_len)`` after each CS frame so
+    the op can log actual wire volume instead of guessing from args.
     """
     _validate_chunk_size(mode, chunk_size)
     raw = bytes(data)
@@ -292,11 +296,17 @@ def _master_write(dev, data, mode, chunk_size, prefix=b""):
     if mode == 1:
         for off in range(0, len(raw), chunk_size):
             last = (off + chunk_size) >= len(raw)
-            dev.spiMaster_SingleWrite(raw[off:off+chunk_size], last)
+            slice_ = raw[off:off+chunk_size]
+            dev.spiMaster_SingleWrite(slice_, last)
+            if on_chunk is not None:
+                on_chunk(off, len(slice_), len(slice_))
     else:
         for off in range(0, len(raw), chunk_size):
             chunk = raw[off:off+chunk_size]
-            dev.spiMaster_MultiReadWrite(b"", pfx + chunk, 0)
+            frame = pfx + chunk
+            dev.spiMaster_MultiReadWrite(b"", frame, 0)
+            if on_chunk is not None:
+                on_chunk(off, len(chunk), len(frame))
 
 
 def _master_read(dev, n, mode, chunk_size):
@@ -341,6 +351,25 @@ def _master_xfer(dev, data, mode, chunk_size, prefix=b""):
     return bytes(out)
 
 
+def _qspi_chunk_logger(session, source):
+    """Return an on_chunk callback that records per-frame accounting
+    to the dsp.qspi_chunks stream and a cumulative total; the caller
+    logs the total as a single timeline event so 1024-chunk runs
+    don't spam the main log while the raw bytes-on-wire remain
+    auditable from the artefact.
+    """
+    state = {"frames": 0, "data": 0, "wire": 0}
+    stream = session.stream("dsp.qspi_chunks")
+    def _cb(off, data_len, frame_len):
+        state["frames"] += 1
+        state["data"] += data_len
+        state["wire"] += frame_len
+        stream.append(
+            f"{source} off={off} data={data_len} frame={frame_len}\n"
+            .encode())
+    return state, _cb
+
+
 def _op_qspi_write(session, h, args):
     data = args["data"]
     mode = args["mode"]
@@ -349,12 +378,17 @@ def _op_qspi_write(session, h, args):
         "QSPI", "dsp:qspi_write",
         f"n={len(data)} mode={mode} chunk_size={args['chunk_size']} "
         f"prefix={len(prefix)}B")
+    state, cb = _qspi_chunk_logger(session, "dsp:qspi_write")
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        _master_write(dev, data, mode, args["chunk_size"], prefix)
+        _master_write(dev, data, mode, args["chunk_size"], prefix, cb)
     finally:
         dev.close()
+    session.log_event(
+        "QSPI", "dsp:qspi_write",
+        f"wire: frames={state['frames']} data={state['data']}B "
+        f"wire={state['wire']}B")
 
 
 def _op_qspi_read(session, h, args):
@@ -378,13 +412,18 @@ def _op_qspi_write_prbs(session, h, args):
         "QSPI", "dsp:qspi_write_prbs",
         f"seed=0x{seed:08x} n={n} mode={mode} "
         f"chunk_size={args['chunk_size']} prefix={len(prefix)}B")
+    state, cb = _qspi_chunk_logger(session, "dsp:qspi_write_prbs")
     buf = prbs_xorshift32(seed, n)
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        _master_write(dev, buf, mode, args["chunk_size"], prefix)
+        _master_write(dev, buf, mode, args["chunk_size"], prefix, cb)
     finally:
         dev.close()
+    session.log_event(
+        "QSPI", "dsp:qspi_write_prbs",
+        f"wire: frames={state['frames']} data={state['data']}B "
+        f"wire={state['wire']}B")
 
 
 def _op_qspi_read_verify_prbs(session, h, args):
