@@ -394,30 +394,54 @@ def _op_qspi_write_prbs(session, h, args):
         f"seed=0x{seed:08x} n={n} mode={mode} "
         f"chunk_size={args['chunk_size']} prefix={len(prefix)}B")
     state, cb = _qspi_chunk_logger(session, "dsp:qspi_write_prbs")
+
+    t0 = time.monotonic()
     buf = prbs_xorshift32(seed, n)
+    t_gen = time.monotonic()
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
+    t_open = time.monotonic()
     try:
         _master_write(dev, buf, mode, args["chunk_size"], prefix, cb)
     finally:
         dev.close()
+    t_wire = time.monotonic()
+
+    gen_ms = (t_gen - t0) * 1e3
+    open_ms = (t_open - t_gen) * 1e3
+    wire_ms = (t_wire - t_open) * 1e3
+    mbps = (state['wire'] * 8 / 1e6) / max(1e-6, (t_wire - t_open))
     session.log_event(
         "QSPI", "dsp:qspi_write_prbs",
-        f"wire: frames={state['frames']} data={state['data']}B "
-        f"wire={state['wire']}B")
+        f"frames={state['frames']} data={state['data']}B "
+        f"wire={state['wire']}B  gen={gen_ms:.1f}ms "
+        f"open={open_ms:.1f}ms wire_t={wire_ms:.1f}ms  "
+        f"rate={mbps:.2f} Mbps")
 
 
 def _op_qspi_read_verify_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
     mode = args["mode"]
+
+    t0 = time.monotonic()
     expected = prbs_xorshift32(seed, n)
+    t_gen = time.monotonic()
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
+    t_open = time.monotonic()
     try:
         got = _master_read(dev, n, mode, args["chunk_size"])
     finally:
         dev.close()
+    t_wire = time.monotonic()
+
+    mbps = (n * 8 / 1e6) / max(1e-6, (t_wire - t_open))
+    session.log_event(
+        "QSPI", "dsp:qspi_read_verify_prbs",
+        f"n={n}B  gen={(t_gen-t0)*1e3:.1f}ms "
+        f"open={(t_open-t_gen)*1e3:.1f}ms "
+        f"wire_t={(t_wire-t_open)*1e3:.1f}ms  rate={mbps:.2f} Mbps")
     if got == expected:
         session.log_event("VERIFY", "dsp:qspi_read_verify_prbs",
                           f"OK {n}B seed=0x{seed:08x}")
@@ -492,13 +516,25 @@ def _op_qspi_xfer_prbs(session, h, args):
         "QSPI", "dsp:qspi_xfer_prbs",
         f"seed=0x{seed:08x} n={n} mode={mode} "
         f"chunk_size={args['chunk_size']} prefix={len(prefix)}B")
+
+    t0 = time.monotonic()
     buf = prbs_xorshift32(seed, n)
+    t_gen = time.monotonic()
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
+    t_open = time.monotonic()
     try:
         got = _master_xfer(dev, buf, mode, args["chunk_size"], prefix)
     finally:
         dev.close()
+    t_wire = time.monotonic()
+
+    mbps = (n * 8 / 1e6) / max(1e-6, (t_wire - t_open))
+    session.log_event(
+        "QSPI", "dsp:qspi_xfer_prbs",
+        f"n={n}B  gen={(t_gen-t0)*1e3:.1f}ms "
+        f"open={(t_open-t_gen)*1e3:.1f}ms "
+        f"wire_t={(t_wire-t_open)*1e3:.1f}ms  rate={mbps:.2f} Mbps")
     session.stream("dsp.qspi_xfer").append(got)
 
 
