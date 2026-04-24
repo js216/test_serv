@@ -435,6 +435,54 @@ def _op_qspi_read_verify_prbs(session, h, args):
         f"PRBS verify failed: {mism} mismatches, first at {first}")
 
 
+def _op_qspi_max_transfer_size(session, h, args):
+    """Query FT4222_GetMaxTransferSize() for the current init.
+
+    Per AN329 the value depends on bus speed, chip mode, and the
+    active function (master vs slave, SPI lane width). Open the
+    master with the requested clk_div/mode/flags, ask the library,
+    log the result, close.
+    """
+    clk_div = args["clk_div"]
+    mode = args["mode"]
+    flags = int(args.get("flags") or 0)
+    dev = _open_master(h.ft4222_desc,
+                       clk_div=clk_div, mode=mode, flags=flags)
+    n = None
+    err = None
+    try:
+        # pyft4222 binding name has varied across releases; try the
+        # common spellings before giving up, same defensive pattern
+        # we already use for setClock.
+        getter = None
+        for attr in ("getMaxTransferSize",
+                     "get_max_transfer_size",
+                     "maxTransferSize"):
+            fn = getattr(dev, attr, None)
+            if callable(fn):
+                getter = fn
+                break
+        if getter is None:
+            err = ("pyft4222 does not expose GetMaxTransferSize; "
+                   "available dev attrs matching *ax*ransfer*: "
+                   + repr([a for a in dir(dev)
+                           if "ax" in a.lower()
+                           and "ransfer" in a.lower()]))
+        else:
+            n = int(getter())
+    finally:
+        dev.close()
+    if err is not None:
+        session.log_event("QSPI", "dsp:qspi_max_transfer_size", err)
+        raise RuntimeError(err)
+    session.log_event(
+        "QSPI", "dsp:qspi_max_transfer_size",
+        f"clk_div={clk_div} mode={mode} flags=0x{flags:02x} -> {n} B")
+    session.stream("dsp.qspi_max_transfer").append(
+        f"clk_div={clk_div} mode={mode} flags=0x{flags:02x} {n}\n"
+        .encode())
+
+
 def _op_qspi_xfer_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
@@ -517,6 +565,14 @@ class DspPlugin(DevicePlugin):
             doc="Read n bytes, compare to xorshift32(seed); fails op on "
                 "mismatch.",
             run=_op_qspi_read_verify_prbs),
+        "qspi_max_transfer_size": Op(
+            args={"clk_div": "int", "mode": "int"},
+            optional_args={"flags": "int"},
+            doc=("Open master with these settings, query "
+                 "FT4222_GetMaxTransferSize(), log + stream the "
+                 "result. AN329: the value depends on bus speed, "
+                 "chip mode, and active function."),
+            run=_op_qspi_max_transfer_size),
         "qspi_xfer_prbs": Op(
             args={"seed": "int", "n": "int",
                   "clk_div": "int", "mode": "int",
