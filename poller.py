@@ -158,6 +158,10 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         _post_artefacts(job_id, tar, txt)
         return
 
+    needed = sorted(plan.required_devices(parsed))
+    print(datetime.now(), tag, "devices:",
+          ", ".join(needed) if needed else "(none)")
+
     try:
         _validate_against_plugins(parsed, plugins_by_name, registry)
     except Exception as e:
