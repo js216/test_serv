@@ -67,6 +67,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._list_examples()
         if path.startswith("examples/"):
             return self._fetch_example(path[len("examples/"):])
+        if path == "scope/signals":
+            return self._scope_signals()
         # job pickup: GET /<ext>
         return self._pickup(path)
 
@@ -165,6 +167,26 @@ class Handler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             entries = []
         return self._send_json(json.dumps(entries).encode())
+
+    def _scope_signals(self):
+        """Expose scope.signals from config.json so agents know which
+        channel carries which bench signal and what active threshold
+        applies. Served straight from the config file at request time
+        so operator edits show up without server restart.
+        """
+        # Read config.json inline: server.py has no config.py import
+        # chain to avoid binding to the poller process.
+        cfg_path = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "config.json")
+        try:
+            with open(cfg_path) as f:
+                cfg = json.load(f)
+        except FileNotFoundError:
+            cfg = {}
+        except Exception:
+            return self._send_json(b"{}")
+        signals = (cfg.get("scope") or {}).get("signals") or {}
+        return self._send_json(json.dumps(signals, indent=2).encode())
 
     def _fetch_example(self, name):
         if not name.endswith(".plan") or not SAFE_NAME_RE.match(name):

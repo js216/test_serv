@@ -161,10 +161,17 @@ class ScopePlugin(DevicePlugin):
     doc = "Oscilloscope (VISA): trigger + capture a set of channels."
 
     ops = {
-        "capture": Op(args={"chans": "str"},
-                      doc="Capture listed channels (e.g. chans=\"C1,C2\") "
-                          "as CSV into scope.csv stream.",
-                      run=_op_capture),
+        "capture": Op(
+            args={"chans": "str"},
+            doc=("Capture listed channels (e.g. chans=\"C1,C2\") as "
+                 "CSV into scope.csv stream. If config.json has a "
+                 "scope.signals table mapping channel -> {name, "
+                 "active_below}, scope:capture also logs per-channel "
+                 "transition counts + active duty in timeline.log "
+                 "(e.g. C2 DSP_FAULT: went_active=0 ...) and writes "
+                 "the full summary as JSON to the scope.summary "
+                 "stream. GET /scope/signals returns the current map."),
+            run=_op_capture),
     }
 
     def probe(self):

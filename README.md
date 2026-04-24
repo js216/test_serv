@@ -37,6 +37,7 @@ curl http://localhost:8080/devices        # present hardware, per plugin, + iden
 curl http://localhost:8080/ops            # every op, args and one-line doc
 curl http://localhost:8080/examples       # starter plan names
 curl http://localhost:8080/examples/NAME  # fetch one
+curl http://localhost:8080/scope/signals  # channel -> {name, active_below} map
 curl -X POST http://localhost:8080/sweep  # re-probe + re-verify every device
 ```
 
