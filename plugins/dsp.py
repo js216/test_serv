@@ -267,30 +267,36 @@ def _validate_chunk_size(mode, chunk_size):
             f"u16 limit)")
 
 
-def _master_write(dev, data, mode, chunk_size):
+def _master_write(dev, data, mode, chunk_size, prefix=b""):
     """Write ``data`` in ``chunk_size``-byte CS frames.
 
     mode=1 (SINGLE): chunks are stitched into one CS-low window via
     SingleWrite's ``last`` flag -- the slave sees one continuous
-    transaction regardless of chunk_size.
+    transaction regardless of chunk_size.  ``prefix`` is ignored in
+    single-lane mode (single-lane has no first-byte hazard and the
+    grammar only exposes prefix for symmetry).
 
     mode=2/4 (DUAL/QUAD): every chunk is its own CS pulse because
     MultiReadWrite has no "keep CS asserted" flag. The caller is
-    responsible for framing (per-frame PRBS alignment, cksum, FT4222
-    first-byte hazard workaround, ...) -- the plugin just honours
-    the requested chunk_size.  single_buf is always empty; this op
-    emits no cmd/addr prefix.
+    responsible for framing (per-frame PRBS alignment, cksum,
+    FT4222 first-byte hazard workaround, ...) -- the plugin just
+    honours the requested chunk_size.  ``prefix`` bytes are
+    prepended to every multi-lane chunk; typical use is a single
+    b"\\x00" byte to sidestep the hazard where frames whose first
+    byte matches ``(B & 0x11) == 0x01`` corrupt subsequent bytes.
+    single_buf is always empty; no cmd/addr prefix is emitted.
     """
     _validate_chunk_size(mode, chunk_size)
     raw = bytes(data)
+    pfx = bytes(prefix or b"")
     if mode == 1:
         for off in range(0, len(raw), chunk_size):
             last = (off + chunk_size) >= len(raw)
             dev.spiMaster_SingleWrite(raw[off:off+chunk_size], last)
     else:
         for off in range(0, len(raw), chunk_size):
-            dev.spiMaster_MultiReadWrite(
-                b"", raw[off:off+chunk_size], 0)
+            chunk = raw[off:off+chunk_size]
+            dev.spiMaster_MultiReadWrite(b"", pfx + chunk, 0)
 
 
 def _master_read(dev, n, mode, chunk_size):
@@ -313,8 +319,13 @@ def _master_read(dev, n, mode, chunk_size):
     return bytes(out)
 
 
-def _master_xfer(dev, data, mode, chunk_size):
-    """Full-duplex ``data`` exchange; single-lane only on FT4222."""
+def _master_xfer(dev, data, mode, chunk_size, prefix=b""):
+    """Full-duplex ``data`` exchange; single-lane only on FT4222.
+
+    ``prefix`` is accepted for schema symmetry with _master_write but
+    is a no-op: single-lane xfer has no hazard, and multi-lane xfer
+    is not supported on FT4222.
+    """
     if mode != 1:
         raise ValueError(
             "qspi_xfer requires mode=1; SingleReadWrite is not "
@@ -333,10 +344,11 @@ def _master_xfer(dev, data, mode, chunk_size):
 def _op_qspi_write(session, h, args):
     data = args["data"]
     mode = args["mode"]
+    prefix = args.get("prefix") or b""
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        _master_write(dev, data, mode, args["chunk_size"])
+        _master_write(dev, data, mode, args["chunk_size"], prefix)
     finally:
         dev.close()
 
@@ -357,11 +369,12 @@ def _op_qspi_write_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
     mode = args["mode"]
+    prefix = args.get("prefix") or b""
     buf = prbs_xorshift32(seed, n)
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        _master_write(dev, buf, mode, args["chunk_size"])
+        _master_write(dev, buf, mode, args["chunk_size"], prefix)
     finally:
         dev.close()
 
@@ -398,11 +411,12 @@ def _op_qspi_xfer_prbs(session, h, args):
     seed = args["seed"]
     n = args["n"]
     mode = args["mode"]
+    prefix = args.get("prefix") or b""
     buf = prbs_xorshift32(seed, n)
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        got = _master_xfer(dev, buf, mode, args["chunk_size"])
+        got = _master_xfer(dev, buf, mode, args["chunk_size"], prefix)
     finally:
         dev.close()
     session.stream("dsp.qspi_xfer").append(got)
@@ -439,10 +453,16 @@ class DspPlugin(DevicePlugin):
         "qspi_write": Op(
             args={"data": "blob", "clk_div": "int", "mode": "int",
                   "chunk_size": "int"},
+            optional_args={"prefix": "blob"},
             doc=("Raw QSPI master write of a blob. Data split into "
                  "chunk_size-byte CS frames; single-lane mode keeps CS "
                  "low across frames, multi-lane mode pulses CS per "
-                 "frame (caller owns framing)."),
+                 "frame (caller owns framing). Optional prefix blob "
+                 "prepended to every multi-lane chunk; typical use is "
+                 "a single 0x00 byte to sidestep the FT4222 first-byte "
+                 "hazard (frames whose first byte has (B & 0x11) == "
+                 "0x01 corrupt subsequent bytes). Ignored in "
+                 "single-lane mode."),
             run=_op_qspi_write),
         "qspi_read": Op(
             args={"n": "int", "clk_div": "int", "mode": "int",
@@ -454,7 +474,9 @@ class DspPlugin(DevicePlugin):
             args={"seed": "int", "n": "int",
                   "clk_div": "int", "mode": "int",
                   "chunk_size": "int"},
-            doc="Write n bytes of xorshift32(seed) over QSPI.",
+            optional_args={"prefix": "blob"},
+            doc=("Write n bytes of xorshift32(seed) over QSPI. "
+                 "Same prefix semantics as qspi_write."),
             run=_op_qspi_write_prbs),
         "qspi_read_verify_prbs": Op(
             args={"seed": "int", "n": "int",
@@ -467,8 +489,11 @@ class DspPlugin(DevicePlugin):
             args={"seed": "int", "n": "int",
                   "clk_div": "int", "mode": "int",
                   "chunk_size": "int"},
-            doc="Full-duplex xfer of xorshift32(seed); MISO goes into "
-                "stream dsp.qspi_xfer.",
+            optional_args={"prefix": "blob"},
+            doc=("Full-duplex xfer of xorshift32(seed); MISO goes into "
+                 "stream dsp.qspi_xfer. Single-lane only (mode=1). "
+                 "prefix is accepted for grammar symmetry but has no "
+                 "effect in single-lane."),
             run=_op_qspi_xfer_prbs),
     }
 
