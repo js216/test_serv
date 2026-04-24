@@ -150,17 +150,19 @@ def _print_device_table(verify_map, registry):
 def _dispatch(payload, headers, registry, plugins_by_name):
     job_id = hashlib.sha256(payload).hexdigest()
     tag = f"[{job_id[:8]}]"
-    print(datetime.now(), tag, "pickup", f"{len(payload)} B")
     try:
         parsed = plan.load_tar(payload)
     except plan.PlanError as e:
+        print(datetime.now(), tag,
+              f"pickup {len(payload)} B  devices=?  parse failed: {e}")
         tar, txt = _failure_artefact(job_id, f"plan parse failed: {e}")
         _post_artefacts(job_id, tar, txt)
         return
 
     needed = sorted(plan.required_devices(parsed))
-    print(datetime.now(), tag, "devices:",
-          ", ".join(needed) if needed else "(none)")
+    devs = ",".join(needed) if needed else "(none)"
+    print(datetime.now(), tag,
+          f"pickup {len(payload)} B  devices={devs}")
 
     try:
         _validate_against_plugins(parsed, plugins_by_name, registry)
