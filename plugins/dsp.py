@@ -241,13 +241,7 @@ def _op_uart_expect(session, h, args):
         f"dsp.uart did not contain {sentinel!r} within {timeout_ms} ms")
 
 
-# FT4222 per-call length limits (empirical pyft4222 + FT4222 datasheet).
-# SingleWrite/SingleRead: u16 length field, ~65535 bytes per call.
-# MultiReadWrite: multiWriteBytes is u16 but library rejects >=65532
-# with FAILED_TO_WRITE_DEVICE, so 65528 is the safe ceiling.
-CHUNK_ABS_MAX      = 262143   # 256 KiB - 1, sanity cap
-CHUNK_MAX_SINGLE   = 65535
-CHUNK_MAX_MULTI    = 65528
+CHUNK_ABS_MAX = 262144   # 256 KiB, exact binary power
 
 
 def _validate_chunk_size(mode, chunk_size):
@@ -255,16 +249,6 @@ def _validate_chunk_size(mode, chunk_size):
         raise ValueError(
             f"qspi: chunk_size {chunk_size} out of range [1, "
             f"{CHUNK_ABS_MAX}]")
-    if mode == 1 and chunk_size > CHUNK_MAX_SINGLE:
-        raise ValueError(
-            f"qspi: chunk_size {chunk_size} > {CHUNK_MAX_SINGLE} not "
-            f"supported in single-lane mode (FT4222 SingleWrite "
-            f"u16 limit)")
-    if mode != 1 and chunk_size > CHUNK_MAX_MULTI:
-        raise ValueError(
-            f"qspi: chunk_size {chunk_size} > {CHUNK_MAX_MULTI} not "
-            f"supported in multi-lane mode (FT4222 MultiReadWrite "
-            f"u16 limit)")
 
 
 def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None):
@@ -310,10 +294,7 @@ def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None):
 
 
 def _master_read(dev, n, mode, chunk_size):
-    """Read ``n`` bytes in ``chunk_size``-byte CS frames.
-
-    Same CS-continuity semantics as _master_write.
-    """
+    """Read ``n`` bytes in ``chunk_size``-byte CS frames."""
     _validate_chunk_size(mode, chunk_size)
     if mode == 1:
         out = bytearray()
