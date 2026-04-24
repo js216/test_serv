@@ -70,7 +70,13 @@
         "resource": "USB0::0xF4EC::0x1011::SDS2PDDX6R1848::INSTR",
         "expected_idn": "Siglent Technologies,SDS2504X Plus"
       }
-    ]
+    ],
+    "signals": {
+      "C1": { "name": "DSP_LED",   "active_below": 68  },
+      "C2": { "name": "DSP_FAULT", "active_below": 150 },
+      "C3": { "name": "DSP_SIG_1", "active_below": 150 },
+      "C4": { "name": "DSP_SIG_2", "active_below": 150 }
+    }
   },
 
   "ssh": {

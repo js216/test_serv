@@ -80,6 +80,49 @@ class ScopeHandle:
         self._rm = None
 
 
+def _summarize_traces(traces, signal_cfg):
+    """For each channel that has a config entry, count active-going
+    and inactive-going transitions and compute active-duty fraction.
+
+    signal_cfg is {channel: {name, active_below}}. A sample is
+    'active' when its voltage is below active_below. Returns a list
+    of dicts ready for logging.
+    """
+    out = []
+    for ch, cfg in sorted(signal_cfg.items()):
+        if ch not in traces:
+            continue
+        _t, v = traces[ch]
+        thresh = float(cfg["active_below"])
+        name = cfg.get("name", ch)
+        n_total = 0
+        n_active = 0
+        enter = 0
+        leave = 0
+        prev = None
+        for sample in v:
+            active = float(sample) < thresh
+            if prev is not None and active != prev:
+                if active:
+                    enter += 1
+                else:
+                    leave += 1
+            prev = active
+            n_total += 1
+            if active:
+                n_active += 1
+        duty = (100.0 * n_active / n_total) if n_total else 0.0
+        out.append({
+            "chan": ch,
+            "name": name,
+            "went_active": enter,
+            "went_inactive": leave,
+            "duty_pct": duty,
+            "samples": n_total,
+        })
+    return out
+
+
 def _op_capture(session, h, args):
     chans_raw = args["chans"]
     chans = tuple(c for c in chans_raw.split(",") if c)
@@ -94,6 +137,23 @@ def _op_capture(session, h, args):
     h._inst.write("TRIG:MODE AUTO")
     csv_text = _traces_to_csv(traces)
     session.stream("scope.csv").append(csv_text.encode())
+
+    # Signal-level analysis per config.json scope.signals table.
+    signal_cfg = config.section("scope").get("signals") or {}
+    if signal_cfg:
+        summary = _summarize_traces(traces, signal_cfg)
+        for row in summary:
+            session.log_event(
+                "SCOPE", "scope:capture",
+                f"{row['chan']} {row['name']}: "
+                f"went_active={row['went_active']} "
+                f"went_inactive={row['went_inactive']}  "
+                f"duty={row['duty_pct']:5.1f}% "
+                f"samples={row['samples']}")
+        # Machine-readable copy in a stream for offline analysis.
+        import json
+        session.stream("scope.summary").append(
+            (json.dumps(summary, indent=2) + "\n").encode())
 
 
 class ScopePlugin(DevicePlugin):
