@@ -114,6 +114,20 @@ class DeviceRegistry:
         with self.lock:
             keys = sorted(self.specs.keys())
         for key in keys:
+            # Skip devices currently held by a running session; the
+            # sweep's open+close would either block for the duration of
+            # that session (stalling the sweep) or race with its
+            # in-flight ops. Report the in-use status verbatim.
+            with self.lock:
+                entry = self.cache.get(key)
+                in_use = entry is not None and entry[3] > 0
+            if in_use:
+                with self.lock:
+                    self.verify_results[key] = {
+                        "t": time.time(), "ok": None,
+                        "verified": False, "err": "(in use by running job)",
+                        "latency_ms": 0.0}
+                continue
             t0 = time.monotonic()
             entry = {"t": time.time(), "ok": False, "verified": False,
                      "err": None, "latency_ms": 0.0}

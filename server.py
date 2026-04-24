@@ -7,7 +7,7 @@ import json
 import os
 import random
 import re
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
 import paths
@@ -198,7 +198,7 @@ def main():
     args = ap.parse_args()
     for d in (INPUTS, OUTPUTS, DONE, STATUS, RELEASE, SWEEP):
         os.makedirs(d, mode=0o700, exist_ok=True)
-    HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

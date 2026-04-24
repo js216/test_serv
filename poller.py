@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import signal
+import threading
 import time
 import traceback
 import urllib.request
@@ -148,7 +149,8 @@ def _print_device_table(verify_map, registry):
 
 def _dispatch(payload, headers, registry, plugins_by_name):
     job_id = hashlib.sha256(payload).hexdigest()
-    print(datetime.now(), "pickup", job_id[:12], f"{len(payload)} B")
+    tag = f"[{job_id[:8]}]"
+    print(datetime.now(), tag, "pickup", f"{len(payload)} B")
     try:
         parsed = plan.load_tar(payload)
     except plan.PlanError as e:
@@ -258,6 +260,7 @@ def main():
 
     last_refresh = time.monotonic()
     base = f"http://localhost:{HTTP_PORT}"
+    workers = []      # live threads; reaped opportunistically
 
     try:
         while True:
@@ -268,6 +271,10 @@ def main():
                 registry.refresh()
                 _publish_status(registry, plugins_by_name)
                 last_refresh = time.monotonic()
+
+            # Prune dead worker threads so the list doesn't grow
+            # without bound over a long session.
+            workers[:] = [t for t in workers if t.is_alive()]
 
             try:
                 status, body, headers = _get(f"{base}/plan")
@@ -280,10 +287,20 @@ def main():
                 time.sleep(POLL_INTERVAL_S)
                 continue
 
-            _dispatch(body, headers, registry, plugins_by_name)
+            # One thread per job. Conflicting device access serializes
+            # on the registry's per-device lock, so unbounded workers
+            # are safe -- extra threads just sleep on an acquire.
+            t = threading.Thread(
+                target=_dispatch,
+                args=(body, headers, registry, plugins_by_name),
+                daemon=True)
+            t.start()
+            workers.append(t)
     except KeyboardInterrupt:
         pass
     finally:
+        for t in workers:
+            t.join(timeout=5)
         registry.stop()
         registry.close_all()
 

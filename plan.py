@@ -227,6 +227,21 @@ def _check_blob_refs(ops, available):
     walk(ops)
 
 
+def required_devices(plan):
+    """Return the set of plugin names referenced by any op in the plan
+    (including fork bodies). Used by the poller for parallelization:
+    jobs whose device sets are disjoint can run concurrently.
+    """
+    out = set()
+    def walk(ops):
+        for op in ops:
+            if op.device is not None:
+                out.add(op.device)
+            walk(op.body)
+    walk(plan.ops)
+    return out
+
+
 def pack_tar(plan_text, blobs):
     """Build a .plan tar bytes: plan.txt + blobs dict {name: bytes}."""
     buf = io.BytesIO()

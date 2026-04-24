@@ -284,6 +284,7 @@ def render_timeline(session, bytes_budget_per_stream=8192):
 def pack_artefact(session):
     """Build the .tar artefact. Returns (tar_bytes, manifest_text)."""
     buf = io.BytesIO()
+    from plan import required_devices as _req_devs
     manifest = {
         "t0_monotonic": session.t0,
         "runtime_s": time.monotonic() - session.t0,
@@ -291,6 +292,7 @@ def pack_artefact(session):
         "n_ops": len(session.ops_log),
         "n_errors": len(session.errors),
         "early_done": session.early_done,
+        "required_devices": sorted(_req_devs(session.plan)),
     }
     manifest_text = json.dumps(manifest, indent=2) + "\n"
 
