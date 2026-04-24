@@ -213,6 +213,13 @@ class FpgaHandle:
         self._ser = None
         self._thread = None
 
+    def uart_write(self, data):
+        if self._ser is None:
+            raise RuntimeError(
+                "fpga uart not open (call fpga:uart_open first)")
+        self._ser.write(data)
+        self._ser.flush()
+
     def _drain(self):
         try:
             while not self._stop.is_set():
@@ -238,6 +245,10 @@ def _op_uart_open(session, h, args):
 
 def _op_uart_close(session, h, args):
     h.uart_close()
+
+
+def _op_uart_write(session, h, args):
+    h.uart_write(decode_escapes(args["data"]))
 
 
 def _op_uart_expect(session, h, args):
@@ -270,6 +281,11 @@ class FpgaPlugin(DevicePlugin):
                         run=_op_uart_open),
         "uart_close": Op(args={}, doc="Stop FPGA UART capture.",
                          run=_op_uart_close),
+        "uart_write": Op(args={"data": "str"},
+                         doc=("Send bytes to FPGA UART (escapes "
+                              "decoded: \\r \\n \\t \\0 \\xNN). "
+                              "Requires uart_open first."),
+                         run=_op_uart_write),
         "uart_expect": Op(
             args={"sentinel": "str", "timeout_ms": "int"},
             optional_args={"end_session": "bool"},

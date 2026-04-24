@@ -345,6 +345,10 @@ def _op_qspi_write(session, h, args):
     data = args["data"]
     mode = args["mode"]
     prefix = args.get("prefix") or b""
+    session.log_event(
+        "QSPI", "dsp:qspi_write",
+        f"n={len(data)} mode={mode} chunk_size={args['chunk_size']} "
+        f"prefix={len(prefix)}B")
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
@@ -370,6 +374,10 @@ def _op_qspi_write_prbs(session, h, args):
     n = args["n"]
     mode = args["mode"]
     prefix = args.get("prefix") or b""
+    session.log_event(
+        "QSPI", "dsp:qspi_write_prbs",
+        f"seed=0x{seed:08x} n={n} mode={mode} "
+        f"chunk_size={args['chunk_size']} prefix={len(prefix)}B")
     buf = prbs_xorshift32(seed, n)
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
@@ -412,6 +420,10 @@ def _op_qspi_xfer_prbs(session, h, args):
     n = args["n"]
     mode = args["mode"]
     prefix = args.get("prefix") or b""
+    session.log_event(
+        "QSPI", "dsp:qspi_xfer_prbs",
+        f"seed=0x{seed:08x} n={n} mode={mode} "
+        f"chunk_size={args['chunk_size']} prefix={len(prefix)}B")
     buf = prbs_xorshift32(seed, n)
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
