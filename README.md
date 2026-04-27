@@ -7,15 +7,59 @@ picks it up, walks the plan against a plugin registry, drives hardware,
 and posts a single `.tar` artefact back carrying a merged timeline, raw
 streams, and a JSON manifest.
 
-### running
+### deployment topology (read this first)
+
+Two roles, usually on two different machines:
+
+- **Bench host.** Has the actual hardware (FT4222, STM32, scope, ...).
+  Runs `server.py` AND `poller.py`, both pointed at the same
+  `$TEST_SERV_DIR`. **Operated by humans only — agents never log in
+  here.** Safety constraint, not negotiable.
+
+- **Client host(s).** Where humans and agents submit plans and read
+  artefacts. May be the same machine as the bench, or a different one
+  that mounts `$TEST_SERV_DIR` over a shared filesystem
+  (NFS, SMB, syncthing, rsync sidecar, ...).
+
+Both ends communicate via **files** in `$TEST_SERV_DIR/{inputs,
+outputs, done, status, sweep, release}`, not via HTTP. The HTTP
+server is only used for introspection (`/ops`, `/devices`,
+`/examples`, `/sweep`, `/scope/signals`) and for the poller posting
+artefacts back into `outputs/`. It binds `127.0.0.1` — no
+cross-machine networking.
+
+Practical consequences for **client-side agents**:
+
+- `submit.py` writes `inputs/<digest>.plan` and reads
+  `outputs/<digest>.{tar,txt}`. **Filesystem only, no HTTP.** Works
+  from any host that mounts the shared `$TEST_SERV_DIR`. SSH tunnels
+  are irrelevant to submit.
+- `curl http://localhost:8080/devices` reaches whatever `server.py`
+  is bound to `localhost:8080` on the *client* host. If the client
+  host has its own `server.py` running (typical for an agent
+  sandbox), that server reads `$TEST_SERV_DIR/status/` which the
+  *client-side* has no poller for → `/devices` returns `[]`. **This
+  is expected on the agent side and does not mean the bench is
+  broken.**
+- To inspect the bench's actual hardware view: `ssh -L
+  8080:localhost:8080 bench-host`, then `curl localhost:8080/devices`
+  through the tunnel. Same hosts as before, but now the request
+  reaches the bench's server, which reads the bench's `status/`,
+  which the bench's poller wrote.
+
+There is no agent → bench code-execution path. Agents only emit the
+typed plan grammar (this file's "plan grammar" section); the
+bench-side poller validates and executes.
+
+### running on the bench
 
 ```
 python3 server.py [--port 8080]        # job broker + introspection
 python3 poller.py                      # hardware driver loop
 ```
 
-Server listens on `127.0.0.1`. Both must share `$TEST_SERV_DIR`
-(default: `tempfile.gettempdir() + /test_serv-<USER>`, i.e.
+Both processes share `$TEST_SERV_DIR` (default:
+`tempfile.gettempdir() + "/test_serv-<USER>"` —
 `/tmp/test_serv-USER` on Linux, `%LOCALAPPDATA%\Temp\test_serv-USER`
 on Windows).
 
@@ -43,9 +87,17 @@ curl http://localhost:8080/scope/signals  # channel -> {name, active_below} map
 curl -X POST http://localhost:8080/sweep  # re-probe + re-verify every device
 ```
 
-`/ops` and `/devices` are the generated manual -- per-device ops live
+`/ops` and `/devices` are the generated manual — per-device ops live
 in plugin source, not in this README. Both update live when a plugin
 is added or hardware is plugged/unplugged.
+
+**Important for agents on a client host**: `curl /devices` returns
+`[]` on a client-side `server.py` because that server has no poller
+publishing into its `status/` dir. That is **not** a sign the bench
+is down. Submit anyway — `submit.py` writes via the shared filesystem
+and the bench's poller will process it. Use the SSH tunnel if you
+need to verify the bench's actual hardware state via REST; otherwise
+trust the artefact that comes back.
 
 ### device config
 
