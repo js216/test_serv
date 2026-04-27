@@ -15,7 +15,9 @@ python3 poller.py                      # hardware driver loop
 ```
 
 Server listens on `127.0.0.1`. Both must share `$TEST_SERV_DIR`
-(default `/tmp/test_serv-$USER`).
+(default: `tempfile.gettempdir() + /test_serv-<USER>`, i.e.
+`/tmp/test_serv-USER` on Linux, `%LOCALAPPDATA%\Temp\test_serv-USER`
+on Windows).
 
 ### submit a job
 
