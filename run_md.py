@@ -11,15 +11,19 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import datetime as _dt
 
 from plan import pack_tar
 from submit import StaleOutputsError, _output_paths, _submit, _wait
 
 
-USAGE = ("usage: python3 run_md.py [--full] [--block N]   "
+USAGE = ("usage: python3 run_md.py [--full] [--fresh] [--block N] "
+         "[--ledger PATH --module NAME]   "
          "(reads ./TEST.md if present, else ./README.md in CWD; "
          "--full keeps running after a failed block; "
-         "--block N runs only the Nth fenced block, 0-indexed)")
+         "--fresh removes stale server artefacts before resubmitting; "
+         "--block N runs only the Nth fenced block, 0-indexed; "
+         "--ledger appends 'datetime module passed-checks')")
 TEST_MD = "TEST.md"
 README = "README.md"
 HEADING_RE = re.compile(r"^###[ \t]+Automated Test[ \t]*$", re.MULTILINE)
@@ -161,7 +165,18 @@ def _deliver(paths, out_dir):
     return sentinel
 
 
-def _run_block(plan_text, out_dir):
+def _remove_stale_outputs(digest):
+    removed = 0
+    for p in _output_paths(digest):
+        try:
+            os.remove(p)
+            removed += 1
+        except FileNotFoundError:
+            pass
+    return removed
+
+
+def _run_block(plan_text, out_dir, fresh=False):
     """Submit a plan, wait, deliver to out_dir. Returns sentinel bytes."""
     blobs = _collect_blobs(plan_text, ".")
     data = pack_tar(plan_text, blobs)
@@ -170,20 +185,65 @@ def _run_block(plan_text, out_dir):
         paths = _wait(digest, DEFAULT_WAIT)
     except StaleOutputsError as e:
         digest = str(e)
-        paths = _output_paths(digest)
+        if not fresh:
+            paths = _output_paths(digest)
+        else:
+            removed = _remove_stale_outputs(digest)
+            print(f"fresh: removed {removed} stale output files for {digest}")
+            digest = _submit(data, {})
+            paths = _wait(digest, DEFAULT_WAIT)
     if paths is None:
         raise RuntimeError(f"timeout waiting for {digest}")
     return _deliver(paths, out_dir)
 
 
+def _append_ledger(path, module, checks_pass):
+    run_id = _dt.datetime.now().isoformat(timespec="seconds")
+    row = f"{run_id} {module} {checks_pass}\n"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(row)
+    print(f"ledger: {row.strip()}")
+
+
 def main(argv):
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except AttributeError:
+            pass
+
     args = list(argv[1:])
     block_sel = None
+    fresh = False
+    ledger_path = None
+    module = None
     out = []
     i = 0
     while i < len(args):
         a = args[i]
         if a == "--full":
+            i += 1
+        elif a == "--fresh":
+            fresh = True
+            i += 1
+        elif a == "--ledger":
+            if i + 1 >= len(args):
+                print(USAGE, file=sys.stderr)
+                return 1
+            ledger_path = args[i + 1]
+            i += 2
+        elif a.startswith("--ledger="):
+            ledger_path = a.split("=", 1)[1]
+            i += 1
+        elif a == "--module":
+            if i + 1 >= len(args):
+                print(USAGE, file=sys.stderr)
+                return 1
+            module = args[i + 1]
+            i += 2
+        elif a.startswith("--module="):
+            module = a.split("=", 1)[1]
             i += 1
         elif a == "--block":
             if i + 1 >= len(args):
@@ -207,6 +267,10 @@ def main(argv):
             i += 1
     if out:
         print(USAGE, file=sys.stderr)
+        return 1
+    if (ledger_path is None) != (module is None):
+        print("error: --ledger and --module must be used together",
+              file=sys.stderr)
         return 1
 
     if os.path.isfile(TEST_MD):
@@ -247,6 +311,8 @@ def main(argv):
         if rc != 0:
             print(f"{RED}{BOLD}FAIL{RESET}: make exited {rc}",
                   file=sys.stderr)
+            if ledger_path is not None:
+                _append_ledger(ledger_path, module, 0)
             return 1
 
     verify_path = os.path.abspath(VERIFY)
@@ -264,6 +330,7 @@ def main(argv):
         json.dump(checks_map, f, indent=2)
 
     block_fails = 0
+    checks_pass = 0
     for plan_text, bullets in pairs:
         h = hashlib.sha256(plan_text.encode("utf-8")).hexdigest()[:16]
         out_dir = os.path.join(out_root, h)
@@ -271,7 +338,7 @@ def main(argv):
         block_ok = True
 
         try:
-            sentinel = _run_block(plan_text, out_dir)
+            sentinel = _run_block(plan_text, out_dir, fresh=fresh)
         except (FileNotFoundError, OSError, RuntimeError) as e:
             print(f"submission error: {e}", file=sys.stderr)
             block_ok = False
@@ -305,6 +372,8 @@ def main(argv):
                 print(f"[{tag}] {item}{suffix}")
                 if not ok:
                     block_ok = False
+                else:
+                    checks_pass += 1
 
         banner = (f"{GREEN}{BOLD}SUCCESS{RESET}" if block_ok
                   else f"{RED}{BOLD}FAIL{RESET}")
@@ -320,6 +389,8 @@ def main(argv):
                if block_fails == 0
                else f"{RED}{BOLD}{block_fails}/{total} {word} FAILED{RESET}")
     print(f"\n{summary}")
+    if ledger_path is not None:
+        _append_ledger(ledger_path, module, checks_pass)
     return 0 if block_fails == 0 else 1
 
 
