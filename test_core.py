@@ -66,16 +66,18 @@ def test_parse_basic():
     # comment
     fake:noop k=42
     fake:emit stream=fake.log data="hello"
+    inventory
     delay ms=1
     mark tag=done
     """
     ops = plan.parse_text(text)
-    assert len(ops) == 4, [o.verb for o in ops]
+    assert len(ops) == 5, [o.verb for o in ops]
     assert ops[0].device == "fake" and ops[0].verb == "noop"
     assert ops[0].args["k"].as_int() == 42
     assert ops[1].args["data"].as_str() == "hello"
-    assert ops[2].verb == "delay"
-    assert ops[3].verb == "mark"
+    assert ops[2].verb == "inventory"
+    assert ops[3].verb == "delay"
+    assert ops[4].verb == "mark"
 
 
 def test_blob_ref_missing_rejected():
@@ -184,6 +186,29 @@ def test_session_closes_touched_handles_at_job_end():
     reg.close_all()
 
 
+def test_inventory_returns_devices_and_ops_streams():
+    parsed = plan.load_tar(plan.pack_tar("inventory\n", {}))
+    fake = FakePlugin()
+    plugins = {"fake": fake}
+    reg = DeviceRegistry(plugins, ttl_s=0.1)
+    reg.refresh()
+
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+
+    devices = json.loads(session.streams["bench.devices.json"]
+                         .snapshot_bytes().decode())
+    ops = json.loads(session.streams["bench.ops.json"]
+                     .snapshot_bytes().decode())
+
+    assert devices[0]["id"] == "fake.0"
+    assert "fake" in ops
+    assert "emit" in ops["fake"]["ops"]
+
+    reg.stop()
+    reg.close_all()
+
+
 def test_lazy_handle_ttl_and_release():
     plugins = {"fake": FakePlugin()}
     reg = DeviceRegistry(plugins, ttl_s=0.05)
@@ -227,6 +252,7 @@ def main():
         test_pack_and_load_roundtrip,
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
+        test_inventory_returns_devices_and_ops_streams,
         test_lazy_handle_ttl_and_release,
         test_bounded_sizes,
     ]

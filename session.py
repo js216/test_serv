@@ -288,6 +288,8 @@ class Session:
             if ms is None:
                 raise PlanError("delay: missing ms=")
             time.sleep(max(0.0, ms.as_int() / 1000.0))
+        elif v == "inventory":
+            self._run_inventory(op, plugins)
         elif v == "fork":
             self._run_fork(op, plugins, deadline)
         elif v == "join":
@@ -295,6 +297,37 @@ class Session:
             pass
         else:
             raise PlanError(f"unknown control verb {v!r}")
+
+    def _run_inventory(self, op, plugins):
+        verify = op.args.get("verify")
+        refresh = op.args.get("refresh")
+        if refresh is None or refresh.as_bool():
+            self.registry.refresh()
+        if verify is not None and verify.as_bool():
+            self.registry.verify_sweep()
+
+        devices = self.registry.list_devices()
+        ops_map = {}
+        for name, pl in sorted(plugins.items()):
+            ops_map[name] = {
+                "doc": pl.doc,
+                "ops": {
+                    op_name: {
+                        "args": schema.args,
+                        "optional_args": schema.optional_args or {},
+                        "doc": schema.doc,
+                    }
+                    for op_name, schema in sorted(pl.ops.items())
+                },
+            }
+
+        self.stream("bench.devices.json").append(
+            (json.dumps(devices, indent=2, sort_keys=True) + "\n").encode())
+        self.stream("bench.ops.json").append(
+            (json.dumps(ops_map, indent=2, sort_keys=True) + "\n").encode())
+        self.log_event(
+            "INVENTORY", "ctrl",
+            f"devices={len(devices)} plugins={len(ops_map)}")
 
     def _run_fork(self, fork_op, plugins, deadline):
         """Run each child of the fork body in its own thread; join at end."""
