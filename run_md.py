@@ -18,12 +18,13 @@ from submit import StaleOutputsError, _output_paths, _submit, _wait
 
 
 USAGE = ("usage: python3 run_md.py [--full] [--fresh] [--block N] "
-         "[--ledger PATH --module NAME]   "
+         "[--ledger PATH --module NAME] [--log PATH]   "
          "(reads ./TEST.md if present, else ./README.md in CWD; "
          "--full keeps running after a failed block; "
          "--fresh removes stale server artefacts before resubmitting; "
          "--block N runs only the Nth fenced block, 0-indexed; "
-         "--ledger appends 'datetime module passed-checks')")
+         "--ledger appends 'datetime module passed-checks'; "
+         "--log tees stdout/stderr to a timestamped append log)")
 TEST_MD = "TEST.md"
 README = "README.md"
 HEADING_RE = re.compile(r"^###[ \t]+Automated Test[ \t]*$", re.MULTILINE)
@@ -206,6 +207,62 @@ def _append_ledger(path, module, checks_pass):
     print(f"ledger: {row.strip()}")
 
 
+def _ts():
+    return _dt.datetime.now().astimezone().isoformat(timespec="milliseconds")
+
+
+class _TeeStream:
+    def __init__(self, stream, log):
+        self.stream = stream
+        self.log = log
+        self._pending = ""
+
+    def write(self, text):
+        self.stream.write(text)
+        self.stream.flush()
+        self._pending += text
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            self.log.write(f"{_ts()} {line}\n")
+            self.log.flush()
+        return len(text)
+
+    def flush(self):
+        self.stream.flush()
+        if self._pending:
+            self.log.write(f"{_ts()} {self._pending}\n")
+            self.log.flush()
+            self._pending = ""
+
+    def isatty(self):
+        return self.stream.isatty()
+
+    @property
+    def encoding(self):
+        return self.stream.encoding
+
+
+def _install_log(path):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    log = open(path, "a", encoding="utf-8")
+    log.write(f"{_ts()} === run_md start ===\n")
+    log.flush()
+    sys.stdout = _TeeStream(sys.stdout, log)
+    sys.stderr = _TeeStream(sys.stderr, log)
+    return log
+
+
+def _run_make():
+    cmd = ["make", f"-j{os.cpu_count() or 1}"]
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, bufsize=1)
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        sys.stdout.write(line)
+    return proc.wait()
+
+
 def main(argv):
     for stream in (sys.stdout, sys.stderr):
         try:
@@ -217,6 +274,7 @@ def main(argv):
     block_sel = None
     fresh = False
     ledger_path = None
+    log_path = None
     module = None
     out = []
     i = 0
@@ -235,6 +293,15 @@ def main(argv):
             i += 2
         elif a.startswith("--ledger="):
             ledger_path = a.split("=", 1)[1]
+            i += 1
+        elif a == "--log":
+            if i + 1 >= len(args):
+                print(USAGE, file=sys.stderr)
+                return 1
+            log_path = args[i + 1]
+            i += 2
+        elif a.startswith("--log="):
+            log_path = a.split("=", 1)[1]
             i += 1
         elif a == "--module":
             if i + 1 >= len(args):
@@ -272,6 +339,7 @@ def main(argv):
         print("error: --ledger and --module must be used together",
               file=sys.stderr)
         return 1
+    log_handle = _install_log(log_path) if log_path is not None else None
 
     if os.path.isfile(TEST_MD):
         src = TEST_MD
@@ -307,7 +375,7 @@ def main(argv):
 
     if os.path.isfile("Makefile"):
         print("--- make ---")
-        rc = subprocess.call(["make", f"-j{os.cpu_count() or 1}"])
+        rc = _run_make()
         if rc != 0:
             print(f"{RED}{BOLD}FAIL{RESET}: make exited {rc}",
                   file=sys.stderr)
@@ -391,6 +459,12 @@ def main(argv):
     print(f"\n{summary}")
     if ledger_path is not None:
         _append_ledger(ledger_path, module, checks_pass)
+    if log_handle is not None:
+        print(f"log: {log_path}")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        log_handle.write(f"{_ts()} === run_md end rc={0 if block_fails == 0 else 1} ===\n")
+        log_handle.flush()
     return 0 if block_fails == 0 else 1
 
 
