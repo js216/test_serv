@@ -399,6 +399,8 @@ def main(argv):
 
     block_fails = 0
     checks_pass = 0
+    total_checks = sum(len(bullets) for _, bullets in pairs)
+    checks_seen = 0
     for plan_text, bullets in pairs:
         h = hashlib.sha256(plan_text.encode("utf-8")).hexdigest()[:16]
         out_dir = os.path.join(out_root, h)
@@ -437,7 +439,8 @@ def main(argv):
                 tag = (f"{GREEN}PASS{RESET}" if ok
                        else f"{RED}FAIL{RESET}")
                 suffix = f" ({info})" if info else ""
-                print(f"[{tag}] {item}{suffix}")
+                checks_seen += 1
+                print(f"[{checks_seen}/{total_checks} {tag}] {item}{suffix}")
                 if not ok:
                     block_ok = False
                 else:
