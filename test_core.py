@@ -202,6 +202,8 @@ def test_inventory_returns_devices_and_ops_streams():
                      .snapshot_bytes().decode())
 
     assert devices[0]["id"] == "fake.0"
+    assert "mark" in ops["_control"]["ops"]
+    assert "wall_time" in ops["_control"]["ops"]
     assert "fake" in ops
     assert "emit" in ops["fake"]["ops"]
 

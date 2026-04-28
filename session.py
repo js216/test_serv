@@ -321,7 +321,54 @@ class Session:
             self.registry.verify_sweep()
 
         devices = self.registry.list_devices()
-        ops_map = {}
+        ops_map = {
+            "_control": {
+                "doc": "Plan control verbs handled by the session runner.",
+                "ops": {
+                    "barrier": {
+                        "args": {},
+                        "optional_args": {"tag": "ident"},
+                        "doc": "Add a barrier checkpoint to timeline.log.",
+                    },
+                    "delay": {
+                        "args": {"ms": "int"},
+                        "optional_args": {},
+                        "doc": "Sleep for ms milliseconds.",
+                    },
+                    "fork": {
+                        "args": {"name": "ident"},
+                        "optional_args": {},
+                        "doc": "Start a fork block; terminated by end.",
+                    },
+                    "inventory": {
+                        "args": {},
+                        "optional_args": {
+                            "refresh": "bool",
+                            "verify": "bool",
+                        },
+                        "doc": (
+                            "Return bench.devices.json and bench.ops.json "
+                            "streams. Defaults: refresh=true verify=false."
+                        ),
+                    },
+                    "join": {
+                        "args": {},
+                        "optional_args": {},
+                        "doc": "No-op; fork blocks join at end.",
+                    },
+                    "mark": {
+                        "args": {},
+                        "optional_args": {"tag": "ident"},
+                        "doc": "Add a named checkpoint to timeline.log.",
+                    },
+                    "wall_time": {
+                        "args": {},
+                        "optional_args": {},
+                        "doc": "Return bench.time.json with poller wall time.",
+                    },
+                },
+            },
+        }
         for name, pl in sorted(plugins.items()):
             ops_map[name] = {
                 "doc": pl.doc,
