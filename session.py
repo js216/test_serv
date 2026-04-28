@@ -68,6 +68,7 @@ class Session:
         self.events = []       # list of dicts for timeline.log
         self.ops_log = []      # list of dicts for ops.jsonl
         self.pinned = {}       # device_key -> context manager (for open/close)
+        self.touched_keys = set()
         self.errors = []
         self.lock = threading.Lock()
         self.early_done = False
@@ -154,6 +155,12 @@ class Session:
                 except Exception:
                     pass
             self.pinned.clear()
+            for key in sorted(self.touched_keys):
+                try:
+                    if self.registry.release_now(key):
+                        self.log_event("CLOSE", "session", key)
+                except Exception:
+                    traceback.print_exc()
             for s in self.streams.values():
                 s.close()
             # Release deferred locks (acquired mid-session) first, then
@@ -226,6 +233,7 @@ class Session:
             self._deferred_names.discard(plugin_name)
             self.log_event("LOCK", "session",
                            f"deferred acquire {key}")
+        self.touched_keys.add(key)
         return key
 
     def _run_device_op(self, op, plugins):

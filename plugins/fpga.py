@@ -183,22 +183,34 @@ class FpgaHandle:
         self._stream = None
 
     def uart_open(self, session):
-        if self._ser is None and self.serial_port is not None:
-            serial = _lazy_serial()
-            self._ser = serial.Serial(
-                self.serial_port, baudrate=self.baud, timeout=0.1,
-                dsrdtr=False, rtscts=False, xonxoff=False,
-            )
-            try:
-                self._ser.setDTR(False)
-                self._ser.setRTS(False)
-            except Exception:
-                pass
-            self._ser.reset_input_buffer()
-            self._stream = session.stream("fpga.uart")
-            self._stop = threading.Event()
-            self._thread = threading.Thread(target=self._drain, daemon=True)
-            self._thread.start()
+        if self._ser is not None:
+            return
+        if self.serial_port is None:
+            raise RuntimeError(
+                "fpga:uart_open: no UART COM port resolved for the "
+                "iCEstick.  Channel B (FT2232H 'Dual RS232-HS B') was "
+                "not visible to the poller -- typically because some "
+                "other process held it (PuTTY, a stale serial reader) "
+                "or because uart_autodetect in config.json doesn't "
+                "match the cable. Check `python3 -c \"import serial."
+                "tools.list_ports as L; [print(p.device, p.vid, p.pid,"
+                " p.location) for p in L.comports()]\"` and update "
+                "fpga.uart_autodetect or set serial_port explicitly.")
+        serial = _lazy_serial()
+        self._ser = serial.Serial(
+            self.serial_port, baudrate=self.baud, timeout=0.1,
+            dsrdtr=False, rtscts=False, xonxoff=False,
+        )
+        try:
+            self._ser.setDTR(False)
+            self._ser.setRTS(False)
+        except Exception:
+            pass
+        self._ser.reset_input_buffer()
+        self._stream = session.stream("fpga.uart")
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._drain, daemon=True)
+        self._thread.start()
 
     def uart_close(self):
         if self._ser is None:

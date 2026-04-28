@@ -44,14 +44,19 @@ class FakePlugin(DevicePlugin):
                    run=_fail),
     }
 
+    def __init__(self):
+        self.opens = 0
+        self.closes = 0
+
     def probe(self):
         return [{"id": "0"}]
 
     def open(self, spec):
+        self.opens += 1
         return FakeHandle()
 
     def close(self, handle):
-        pass
+        self.closes += 1
 
 
 # --- tests ---------------------------------------------------------------
@@ -159,6 +164,26 @@ def test_session_runs_and_artefact_has_expected_shape():
     reg.close_all()
 
 
+def test_session_closes_touched_handles_at_job_end():
+    text = 'fake:emit stream=s data="hi"\n'
+    parsed = plan.load_tar(plan.pack_tar(text, {}))
+    fake = FakePlugin()
+    plugins = {"fake": fake}
+    reg = DeviceRegistry(plugins, ttl_s=60.0)
+    reg.refresh()
+    key = reg.resolve("fake")
+
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+
+    assert fake.opens == 1
+    assert fake.closes == 1
+    assert key not in reg.cache
+
+    reg.stop()
+    reg.close_all()
+
+
 def test_lazy_handle_ttl_and_release():
     plugins = {"fake": FakePlugin()}
     reg = DeviceRegistry(plugins, ttl_s=0.05)
@@ -201,6 +226,7 @@ def main():
         test_fork_join_nesting,
         test_pack_and_load_roundtrip,
         test_session_runs_and_artefact_has_expected_shape,
+        test_session_closes_touched_handles_at_job_end,
         test_lazy_handle_ttl_and_release,
         test_bounded_sizes,
     ]
