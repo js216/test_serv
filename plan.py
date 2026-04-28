@@ -20,7 +20,8 @@ MAX_OPS = 4096
 MAX_DEPTH = 2
 
 CONTROL_VERBS = {
-    "fork", "end", "join", "barrier", "mark", "delay", "inventory",
+    "fork", "end", "join", "barrier", "mark", "delay", "wall_time",
+    "inventory",
     "open", "close",
 }
 

@@ -8,6 +8,7 @@ import tarfile
 import threading
 import time
 import traceback
+from datetime import datetime
 
 from plan import PlanError
 from plugin import Op as OpSchema
@@ -288,6 +289,8 @@ class Session:
             if ms is None:
                 raise PlanError("delay: missing ms=")
             time.sleep(max(0.0, ms.as_int() / 1000.0))
+        elif v == "wall_time":
+            self._run_wall_time()
         elif v == "inventory":
             self._run_inventory(op, plugins)
         elif v == "fork":
@@ -297,6 +300,17 @@ class Session:
             pass
         else:
             raise PlanError(f"unknown control verb {v!r}")
+
+    def _run_wall_time(self):
+        now = datetime.now().astimezone()
+        rec = {
+            "iso": now.isoformat(timespec="microseconds"),
+            "unix_s": time.time(),
+            "tz": now.tzname(),
+        }
+        self.stream("bench.time.json").append(
+            (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode())
+        self.log_event("TIME", "ctrl", rec["iso"])
 
     def _run_inventory(self, op, plugins):
         verify = op.args.get("verify")

@@ -209,6 +209,25 @@ def test_inventory_returns_devices_and_ops_streams():
     reg.close_all()
 
 
+def test_wall_time_returns_bench_time_stream():
+    parsed = plan.load_tar(plan.pack_tar("wall_time\n", {}))
+    plugins = {"fake": FakePlugin()}
+    reg = DeviceRegistry(plugins, ttl_s=0.1)
+    reg.refresh()
+
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+
+    rec = json.loads(session.streams["bench.time.json"]
+                     .snapshot_bytes().decode())
+    assert "iso" in rec
+    assert "unix_s" in rec
+    assert "tz" in rec
+
+    reg.stop()
+    reg.close_all()
+
+
 def test_lazy_handle_ttl_and_release():
     plugins = {"fake": FakePlugin()}
     reg = DeviceRegistry(plugins, ttl_s=0.05)
@@ -253,6 +272,7 @@ def main():
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
+        test_wall_time_returns_bench_time_stream,
         test_lazy_handle_ttl_and_release,
         test_bounded_sizes,
     ]
