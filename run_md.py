@@ -16,8 +16,10 @@ from plan import pack_tar
 from submit import StaleOutputsError, _output_paths, _submit, _wait
 
 
-USAGE = ("usage: python3 run_md.py   "
-         "(reads ./TEST.md if present, else ./README.md in CWD)")
+USAGE = ("usage: python3 run_md.py [--full] [--block N]   "
+         "(reads ./TEST.md if present, else ./README.md in CWD; "
+         "--full keeps running after a failed block; "
+         "--block N runs only the Nth fenced block, 0-indexed)")
 TEST_MD = "TEST.md"
 README = "README.md"
 HEADING_RE = re.compile(r"^###[ \t]+Automated Test[ \t]*$", re.MULTILINE)
@@ -175,7 +177,35 @@ def _run_block(plan_text, out_dir):
 
 
 def main(argv):
-    if len(argv) != 1:
+    args = list(argv[1:])
+    block_sel = None
+    out = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--full":
+            i += 1
+        elif a == "--block":
+            if i + 1 >= len(args):
+                print(USAGE, file=sys.stderr)
+                return 1
+            try:
+                block_sel = int(args[i + 1])
+            except ValueError:
+                print(USAGE, file=sys.stderr)
+                return 1
+            i += 2
+        elif a.startswith("--block="):
+            try:
+                block_sel = int(a.split("=", 1)[1])
+            except ValueError:
+                print(USAGE, file=sys.stderr)
+                return 1
+            i += 1
+        else:
+            out.append(a)
+            i += 1
+    if out:
         print(USAGE, file=sys.stderr)
         return 1
 
@@ -202,6 +232,14 @@ def main(argv):
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
+
+    if block_sel is not None:
+        if block_sel < 0 or block_sel >= len(pairs):
+            print(f"error: --block {block_sel} out of range "
+                  f"(have {len(pairs)} blocks, 0-indexed)",
+                  file=sys.stderr)
+            return 1
+        pairs = [pairs[block_sel]]
 
     if os.path.isfile("Makefile"):
         print("--- make ---")
@@ -273,6 +311,8 @@ def main(argv):
         print(f"--- block {h}: {banner} ---")
         if not block_ok:
             block_fails += 1
+            if "--full" not in sys.argv and block_sel is None:
+                break
 
     total = len(pairs)
     word = "BLOCK" if total == 1 else "BLOCKS"
