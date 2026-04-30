@@ -45,6 +45,18 @@ python3 submit.py --fetch DIGEST --extract /tmp/out
 `http://localhost:8080`). Blobs are referenced from the plan as
 `@name` where `name` is the `NAME` side of `--blob NAME=PATH`.
 
+### run markdown tests
+
+`run_md.py` reads `TEST.md` if present, otherwise the `### Automated
+Test` section of `README.md`. Each fenced plan is submitted through the
+same REST API as `submit.py`; bullet checks run against extracted
+artefacts in `test_out/`.
+
+```
+python3 run_md.py --server http://localhost:8080
+python3 run_md.py --fresh --block 0
+```
+
 ### REST API
 
 Agents can use HTTP directly against the server base URL.
@@ -191,18 +203,19 @@ only when raw bytes are needed.
 
 ### security model
 
-The protocol is a finite-opcode TLV-style grammar; there is no code
-execution path. Attackers with submit access can only issue ops that
-a plugin has registered. Specifically:
+Agents can submit only typed plans and blobs. The poller rejects unknown
+devices, ops, args, and arg types before hardware is touched. There is
+no plan syntax for shell commands or filesystem paths.
 
-- Unknown ops / args / devices rejected at parse.
-- Payload, blob, op count bounded.
-- No filesystem paths in the grammar; all binary data travels inline.
-- SSH is exposed only as per-command ops (`ssh:run_<whitelisted>`)
-  with typed placeholders, a pinned key, a pinned `known_hosts`, and
-  a fixed target IP. Run the poller under a user whose outbound
-  firewall permits only that IP on port 22.
-- `server.py` binds `127.0.0.1`.
+Security-relevant server endpoints available to agents:
+
+- `POST /submit` queues a typed plan.
+- `POST /sweep` asks the poller to re-probe and verify devices.
+- `POST /devices/<device-id>/release` asks the poller to close an idle
+  cached handle.
+
+SSH access, when enabled, is exposed only as fixed plugin ops such as
+`ssh:run_uname`; there is no free-form SSH command op.
 
 ### adding a device
 
@@ -216,12 +229,11 @@ a plugin has registered. Specifically:
 
 ### releasing a device without restarting
 
-A running poller holds device handles only for the duration of an op,
-plus a 5 s TTL afterwards. To grab a port (e.g. open PuTTY on the DSP
-UART while the bench is idle):
+Use the device id from `inventory` or `bench.devices.json`:
 
 ```
 curl -X POST http://localhost:8080/devices/dsp.A/release
 ```
 
-The poller drops the cached handle immediately; the next job reopens.
+This closes the handle only if no job is currently using it. The next
+job reopens the device.

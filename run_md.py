@@ -14,15 +14,20 @@ import tarfile
 import datetime as _dt
 
 from plan import pack_tar
-from submit import StaleOutputsError, _output_paths, _submit, _wait
+from submit import (
+    DEFAULT_SERVER, StaleOutputsError, _delete_outputs, _get_output,
+    _submit, _wait,
+)
 
 
 USAGE = ("usage: python3 run_md.py [--full] [--fresh] [--block N] "
+         "[--server URL] "
          "[--ledger PATH --module NAME] [--log PATH]   "
          "(reads ./TEST.md if present, else ./README.md in CWD; "
          "--full keeps running after a failed block; "
          "--fresh removes stale server artefacts before resubmitting; "
          "--block N runs only the Nth fenced block, 0-indexed; "
+         "--server selects test_serv REST base URL; "
          "--ledger appends 'datetime module passed-checks'; "
          "--log tees stdout/stderr to a timestamped append log)")
 TEST_MD = "TEST.md"
@@ -140,62 +145,58 @@ def _collect_blobs(plan_text, md_dir):
     return blobs
 
 
-def _deliver(paths, out_dir):
-    """Move tar members + sentinel into out_dir. Drop original files."""
+def _deliver(outputs, digest, out_dir):
+    """Extract tar members + sentinel into out_dir."""
     os.makedirs(out_dir, exist_ok=True)
-    sentinel = None
-    for p in paths:
-        if p.endswith(".tar"):
-            with open(p, "rb") as f:
-                data = f.read()
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
-                for m in tf.getmembers():
-                    if ".." in m.name or m.name.startswith("/"):
-                        raise RuntimeError(f"unsafe member {m.name!r}")
-                try:
-                    tf.extractall(out_dir, filter="data")
-                except TypeError:
-                    tf.extractall(out_dir)
-            os.remove(p)
-        elif p.endswith(".txt"):
-            with open(p, "rb") as f:
-                sentinel = f.read()
-            with open(os.path.join(out_dir, "sentinel.txt"), "wb") as f:
-                f.write(sentinel)
-            os.remove(p)
+    sentinel = outputs.get("txt")
+    tar_body = outputs.get("tar")
+    if tar_body is not None:
+        with tarfile.open(fileobj=io.BytesIO(tar_body), mode="r:") as tf:
+            for m in tf.getmembers():
+                if ".." in m.name or m.name.startswith("/"):
+                    raise RuntimeError(f"unsafe member {m.name!r}")
+            try:
+                tf.extractall(out_dir, filter="data")
+            except TypeError:
+                tf.extractall(out_dir)
+        with open(os.path.join(out_dir, f"{digest}.tar"), "wb") as f:
+            f.write(tar_body)
+    if sentinel is not None:
+        with open(os.path.join(out_dir, "sentinel.txt"), "wb") as f:
+            f.write(sentinel)
     return sentinel
 
 
-def _remove_stale_outputs(digest):
-    removed = 0
-    for p in _output_paths(digest):
-        try:
-            os.remove(p)
-            removed += 1
-        except FileNotFoundError:
-            pass
-    return removed
+def _fetch_outputs(server, digest):
+    txt = _get_output(server, digest, "txt")
+    tar = _get_output(server, digest, "tar")
+    if txt is None and tar is None:
+        return None
+    return {"txt": txt, "tar": tar}
 
 
-def _run_block(plan_text, out_dir, fresh=False):
+def _run_block(plan_text, out_dir, fresh=False, server=DEFAULT_SERVER):
     """Submit a plan, wait, deliver to out_dir. Returns sentinel bytes."""
     blobs = _collect_blobs(plan_text, ".")
     data = pack_tar(plan_text, blobs)
     try:
-        digest = _submit(data, {})
-        paths = _wait(digest, DEFAULT_WAIT)
+        digest = _submit(data, {}, server)
+        outputs = _wait(server, digest, DEFAULT_WAIT)
     except StaleOutputsError as e:
         digest = str(e)
         if not fresh:
-            paths = _output_paths(digest)
+            outputs = _fetch_outputs(server, digest)
         else:
-            removed = _remove_stale_outputs(digest)
-            print(f"fresh: removed {removed} stale output files for {digest}")
-            digest = _submit(data, {})
-            paths = _wait(digest, DEFAULT_WAIT)
-    if paths is None:
+            _delete_outputs(server, digest)
+            print(f"fresh: removed stale outputs for {digest}")
+            digest = _submit(data, {}, server)
+            outputs = _wait(server, digest, DEFAULT_WAIT)
+    if outputs is None:
         raise RuntimeError(f"timeout waiting for {digest}")
-    return _deliver(paths, out_dir)
+    try:
+        return _deliver(outputs, digest, out_dir)
+    finally:
+        _delete_outputs(server, digest)
 
 
 def _append_ledger(path, module, checks_pass):
@@ -275,6 +276,7 @@ def main(argv):
     fresh = False
     ledger_path = None
     log_path = None
+    server = DEFAULT_SERVER
     module = None
     out = []
     i = 0
@@ -311,6 +313,15 @@ def main(argv):
             i += 2
         elif a.startswith("--module="):
             module = a.split("=", 1)[1]
+            i += 1
+        elif a == "--server":
+            if i + 1 >= len(args):
+                print(USAGE, file=sys.stderr)
+                return 1
+            server = args[i + 1]
+            i += 2
+        elif a.startswith("--server="):
+            server = a.split("=", 1)[1]
             i += 1
         elif a == "--block":
             if i + 1 >= len(args):
@@ -408,7 +419,8 @@ def main(argv):
         block_ok = True
 
         try:
-            sentinel = _run_block(plan_text, out_dir, fresh=fresh)
+            sentinel = _run_block(
+                plan_text, out_dir, fresh=fresh, server=server)
         except (FileNotFoundError, OSError, RuntimeError) as e:
             print(f"submission error: {e}", file=sys.stderr)
             block_ok = False
