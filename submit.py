@@ -3,14 +3,14 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import argparse
-import glob
-import hashlib
 import io
 import json
 import os
 import sys
 import tarfile
 import time
+import urllib.error
+import urllib.request
 
 from plan import pack_tar
 
@@ -19,22 +19,11 @@ GREEN = "\033[32m"
 RED = "\033[31m"
 RESET = "\033[0m"
 
-import paths
-
-STATE_DIR = paths.state_dir()
-INPUTS = os.path.join(STATE_DIR, "inputs")
-OUTPUTS = os.path.join(STATE_DIR, "outputs")
+DEFAULT_SERVER = os.environ.get("TEST_SERV_URL", "http://localhost:8080")
 
 
 class StaleOutputsError(Exception):
     pass
-
-
-def _output_paths(digest):
-    paths = sorted(glob.glob(os.path.join(OUTPUTS, f"{digest}.*")))
-    # Put .txt last so a reader can trust "last file is sentinel".
-    paths.sort(key=lambda p: p.endswith(".txt"))
-    return paths
 
 
 def _pack_from_plan(plan_path, blob_specs):
@@ -50,46 +39,71 @@ def _pack_from_plan(plan_path, blob_specs):
     return pack_tar(text, blobs)
 
 
-def _submit(data, meta):
-    digest = hashlib.sha256(data).hexdigest()
-    if _output_paths(digest):
-        raise StaleOutputsError(digest)
-    dst = os.path.join(INPUTS, f"{digest}.plan")
-    if os.path.exists(dst):
-        raise FileExistsError(digest)
-    meta_path = f"{dst}.meta"
+def _url(base, path):
+    return f"{base.rstrip('/')}/{path.lstrip('/')}"
+
+
+def _request(method, url, data=None, headers=None):
+    req = urllib.request.Request(
+        url, data=data, headers=headers or {}, method=method)
+    with urllib.request.urlopen(req) as r:
+        return r.status, r.read(), dict(r.headers)
+
+
+def _http_json(method, url, data=None, headers=None):
+    status, body, hdrs = _request(method, url, data, headers)
+    return status, json.loads(body.decode() or "{}"), hdrs
+
+
+def _submit(data, meta, server):
+    headers = {"Content-Type": "application/octet-stream"}
+    for k, v in meta.items():
+        headers[f"X-Test-{k}"] = v
     try:
-        os.remove(meta_path)
-    except FileNotFoundError:
+        _status, body, _hdrs = _http_json(
+            "POST", _url(server, "submit"), data=data, headers=headers)
+    except urllib.error.HTTPError as e:
+        err = json.loads(e.read().decode() or "{}")
+        digest = err.get("digest", "")
+        if e.code == 409 and err.get("status") == "stale_outputs":
+            raise StaleOutputsError(digest)
+        if e.code == 409 and err.get("status") == "duplicate":
+            raise FileExistsError(digest)
+        raise
+    return body["digest"]
+
+
+def _get_output(server, digest, ext):
+    try:
+        _status, body, _hdrs = _request(
+            "GET", _url(server, f"outputs/{digest}.{ext}"))
+        return body
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+
+def _delete_outputs(server, digest):
+    try:
+        _request("DELETE", _url(server, f"outputs/{digest}"))
+    except urllib.error.HTTPError:
         pass
-    if meta:
-        with open(meta_path, "w") as f:
-            f.write("".join(f"{k}={v}\n" for k, v in meta.items()))
-            f.flush()
-            os.fsync(f.fileno())
-    tmp = f"{dst}.inprogress"
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.rename(tmp, dst)
-    return digest
 
 
-def _wait(digest, timeout):
-    sentinel = os.path.join(OUTPUTS, f"{digest}.txt")
+def _wait(server, digest, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if os.path.exists(sentinel):
-            return _output_paths(digest)
+        txt = _get_output(server, digest, "txt")
+        if txt is not None:
+            tar = _get_output(server, digest, "tar")
+            return {"txt": txt, "tar": tar}
         time.sleep(0.05)
     return None
 
 
-def _summarize_tar(tar_path):
+def _summarize_tar(data):
     """Print the manifest and timeline from an artefact tarball."""
-    with open(tar_path, "rb") as f:
-        data = f.read()
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
         members = tf.getnames()
         manifest_m = tf.extractfile("manifest.json")
@@ -110,10 +124,8 @@ def _summarize_tar(tar_path):
             sys.stdout.buffer.write(f"  {n}\n".encode())
 
 
-def _extract(tar_path, out_dir):
+def _extract(data, out_dir):
     os.makedirs(out_dir, exist_ok=True)
-    with open(tar_path, "rb") as f:
-        data = f.read()
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
         for m in tf.getmembers():
             if ".." in m.name or m.name.startswith("/"):
@@ -125,34 +137,24 @@ def _extract(tar_path, out_dir):
             tf.extractall(out_dir)
 
 
-def _dump_and_cleanup(paths, extract_to):
-    tar_path = None
-    txt_bytes = None
-    for p in paths:
-        if p.endswith(".tar"):
-            tar_path = p
-        elif p.endswith(".txt"):
-            with open(p, "rb") as f:
-                txt_bytes = f.read()
-            sys.stdout.buffer.write(b"=== sentinel .txt ===\n")
-            sys.stdout.buffer.write(txt_bytes)
-            if not txt_bytes.endswith(b"\n"):
-                sys.stdout.buffer.write(b"\n")
-    if tar_path is not None:
-        _summarize_tar(tar_path)
+def _dump_outputs(outputs, digest, extract_to):
+    txt_bytes = outputs.get("txt")
+    tar_bytes = outputs.get("tar")
+    if txt_bytes is not None:
+        sys.stdout.buffer.write(b"=== sentinel .txt ===\n")
+        sys.stdout.buffer.write(txt_bytes)
+        if not txt_bytes.endswith(b"\n"):
+            sys.stdout.buffer.write(b"\n")
+    if tar_bytes is not None:
+        _summarize_tar(tar_bytes)
         if extract_to is not None:
-            _extract(tar_path, extract_to)
+            _extract(tar_bytes, extract_to)
+            tar_path = os.path.join(extract_to, f"{digest}.tar")
+            with open(tar_path, "wb") as f:
+                f.write(tar_bytes)
             sys.stdout.buffer.write(
                 f"\nextracted to {extract_to}\n".encode())
     sys.stdout.buffer.flush()
-    for p in paths:
-        if extract_to is not None and p.endswith(".tar"):
-            os.rename(p, os.path.join(extract_to, os.path.basename(p)))
-        else:
-            try:
-                os.remove(p)
-            except FileNotFoundError:
-                pass
     return txt_bytes
 
 
@@ -166,12 +168,14 @@ def _compare(txt_bytes, expected_path):
     return 1
 
 
-def _fetch(digest, expected_path, extract_to):
-    paths = _output_paths(digest)
-    if not paths:
+def _fetch(server, digest, expected_path, extract_to):
+    txt = _get_output(server, digest, "txt")
+    tar = _get_output(server, digest, "tar")
+    if txt is None and tar is None:
         print(f"no outputs for digest {digest}", file=sys.stderr)
         return 1
-    txt = _dump_and_cleanup(paths, extract_to)
+    txt = _dump_outputs({"txt": txt, "tar": tar}, digest, extract_to)
+    _delete_outputs(server, digest)
     if expected_path is not None:
         return _compare(txt, expected_path)
     return 0
@@ -197,6 +201,9 @@ def main():
                          "in plan. Repeatable.")
     ap.add_argument("--fetch", metavar="DIGEST",
                     help="fetch artefacts for a previously-submitted digest")
+    ap.add_argument("--server", default=DEFAULT_SERVER,
+                    help="test_serv HTTP base URL "
+                         f"(default: {DEFAULT_SERVER})")
     ap.add_argument("--wait", type=float,
                     help="block up to N seconds for artefacts")
     ap.add_argument("--expected", help="compare sentinel .txt against this")
@@ -214,7 +221,7 @@ def main():
         ap.error("either a plan file or --fetch DIGEST is required")
 
     if args.fetch:
-        return _fetch(args.fetch, args.expected, args.extract)
+        return _fetch(args.server, args.fetch, args.expected, args.extract)
 
     # .plan = already-packed tar, otherwise treat as plan.txt + blobs.
     if args.plan.endswith(".plan"):
@@ -228,7 +235,7 @@ def main():
         meta["runtime"] = str(args.runtime)
 
     try:
-        digest = _submit(data, meta)
+        digest = _submit(data, meta, args.server)
     except StaleOutputsError as e:
         print(f"output stale; run:\n    python3 submit.py --fetch {e}",
               file=sys.stderr)
@@ -241,12 +248,13 @@ def main():
         print(digest)
         return 0
 
-    paths = _wait(digest, args.wait)
-    if paths is None:
+    outputs = _wait(args.server, digest, args.wait)
+    if outputs is None:
         print(f"timeout waiting for {digest}", file=sys.stderr)
         return 1
 
-    txt = _dump_and_cleanup(paths, args.extract)
+    txt = _dump_outputs(outputs, digest, args.extract)
+    _delete_outputs(args.server, digest)
     if args.expected is not None:
         return _compare(txt, args.expected)
     return 0

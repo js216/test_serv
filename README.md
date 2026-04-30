@@ -9,13 +9,13 @@ streams, and a JSON manifest.
 
 ### agent workflow
 
-Agents run on the server/client host, not the bench. Use `submit.py`;
-do not assume local `curl /devices` or `curl /ops` reflects the bench.
+Use `submit.py --server URL` or set `TEST_SERV_URL`.
+
 Bench discovery is a normal job:
 
 ```
 printf 'inventory\n' > /tmp/inventory.txt
-python3 submit.py /tmp/inventory.txt --extract /tmp/test-serv-inventory --wait 30
+python3 submit.py --server http://localhost:8080 /tmp/inventory.txt --extract /tmp/test-serv-inventory --wait 30
 cat /tmp/test-serv-inventory/streams/bench.devices.json.bin
 cat /tmp/test-serv-inventory/streams/bench.ops.json.bin
 ```
@@ -41,10 +41,9 @@ python3 submit.py job.plan --extract /tmp/out --wait 30
 python3 submit.py --fetch DIGEST --extract /tmp/out
 ```
 
-The first form packs `plan.txt` + blobs into a tarball client-side.
-The second submits an already-packed `.plan` tarball. Blobs are
-referenced from the plan as `@name` where `name` is the `NAME` side of
-`--blob NAME=PATH`.
+`submit.py` talks to `TEST_SERV_URL` or `--server` (default
+`http://localhost:8080`). Blobs are referenced from the plan as
+`@name` where `name` is the `NAME` side of `--blob NAME=PATH`.
 
 ### discover what is available
 
