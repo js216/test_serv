@@ -45,6 +45,58 @@ python3 submit.py --fetch DIGEST --extract /tmp/out
 `http://localhost:8080`). Blobs are referenced from the plan as
 `@name` where `name` is the `NAME` side of `--blob NAME=PATH`.
 
+### REST API
+
+Agents can use HTTP directly against the server base URL.
+
+Submit a packed `.plan` tar:
+
+```
+POST /submit
+Content-Type: application/octet-stream
+
+<plan tar bytes>
+```
+
+Response:
+
+```
+201 {"status": "queued", "digest": "<sha256>"}
+409 {"status": "duplicate", "digest": "<sha256>"}
+409 {"status": "stale_outputs", "digest": "<sha256>"}
+```
+
+Optional request headers become job metadata for the poller:
+
+```
+X-Test-Runtime: 30
+X-Test-Anything: value
+```
+
+Fetch results:
+
+```
+GET /outputs/<digest>.txt    # manifest/completion sentinel
+GET /outputs/<digest>.tar    # full artefact
+```
+
+Both return `404` until the poller has posted that output. After a
+successful fetch, clean up server-held results:
+
+```
+DELETE /outputs/<digest>
+```
+
+Discovery helpers:
+
+```
+GET /examples
+GET /examples/<name>
+GET /scope/signals
+POST /sweep
+POST /devices/<device-id>/release
+```
+
 ### discover what is available
 
 For bench hardware and bench-supported ops, use the inventory job shown
