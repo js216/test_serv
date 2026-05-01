@@ -3,6 +3,7 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import hashlib
+import http.client
 import json
 import os
 import signal
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.parse
 import urllib.request
 from datetime import datetime
 
@@ -52,17 +54,114 @@ POLL_INTERVAL_S = 2.5
 DEVICE_REFRESH_S = 15.0
 DEFAULT_UPLOAD_S = 600.0
 MAX_UPLOAD_S = 3600.0
+# Show a dotted progress line on stdout for transfers >= this size, with
+# one dot per ``PROGRESS_BYTES_PER_DOT``. Tee'd into log.txt so even
+# headless runs keep a record of how long the big SD-card-image moves
+# actually took.
+PROGRESS_THRESHOLD = 1 << 20         # 1 MiB
+PROGRESS_BYTES_PER_DOT = 256 * 1024  # 256 KiB
+_HTTP_CHUNK = 64 * 1024              # send/recv granularity
+
+
+def _progress_dots(label, total, advance):
+    """Render a progress line incrementally. Call with ``advance=0`` for
+    the header, then with the byte count after each transfer chunk; call
+    once more with ``advance < 0`` to terminate the line. Single-line,
+    flushes after every dot so SSH-tunnelled tail -f stays live.
+    """
+    if advance == 0:
+        sys.stdout.write(
+            f"\n{datetime.now()} {label} {total >> 10} KiB ")
+        sys.stdout.flush()
+        return
+    if advance < 0:
+        sys.stdout.write(" done\n")
+        sys.stdout.flush()
+        return
+    while advance >= PROGRESS_BYTES_PER_DOT:
+        sys.stdout.write(".")
+        sys.stdout.flush()
+        advance -= PROGRESS_BYTES_PER_DOT
 
 
 def _get(url, timeout=30.0):
     with urllib.request.urlopen(url, timeout=timeout) as r:
-        return r.status, r.read(), dict(r.headers)
+        cl = r.getheader("Content-Length")
+        try:
+            cl_int = int(cl) if cl is not None else None
+        except ValueError:
+            cl_int = None
+        if cl_int is not None and cl_int >= PROGRESS_THRESHOLD:
+            buf = bytearray()
+            tally = 0
+            _progress_dots(f"GET {url}", cl_int, 0)
+            while len(buf) < cl_int:
+                chunk = r.read(min(_HTTP_CHUNK, cl_int - len(buf)))
+                if not chunk:
+                    break
+                buf += chunk
+                tally += len(chunk)
+                if tally >= PROGRESS_BYTES_PER_DOT:
+                    _progress_dots("", 0, tally)
+                    tally %= PROGRESS_BYTES_PER_DOT
+            _progress_dots("", 0, -1)
+            body = bytes(buf)
+        else:
+            body = r.read()
+        return r.status, body, dict(r.headers)
 
 
 def _post(url, data, timeout=DEFAULT_UPLOAD_S):
+    if len(data) >= PROGRESS_THRESHOLD:
+        return _post_streamed(url, data, timeout)
     req = urllib.request.Request(url, data=data, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status
+
+
+def _post_streamed(url, data, timeout):
+    """POST using http.client so we can send the body in chunks and
+    print a progress line. urllib's ``urlopen(data=bytes)`` writes the
+    whole body in one syscall with no hook for progress.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "http":
+        # Fall back rather than reimplement TLS; we only ever talk to
+        # localhost via the SSH tunnel today.
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path += "?" + parsed.query
+    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    try:
+        conn.connect()
+        conn.putrequest("POST", path)
+        conn.putheader("Content-Length", str(len(data)))
+        conn.putheader("Content-Type", "application/octet-stream")
+        conn.endheaders()
+        sent = 0
+        tally = 0
+        _progress_dots(f"POST {url}", len(data), 0)
+        mv = memoryview(data)
+        while sent < len(data):
+            n = min(_HTTP_CHUNK, len(data) - sent)
+            conn.send(mv[sent:sent + n])
+            sent += n
+            tally += n
+            if tally >= PROGRESS_BYTES_PER_DOT:
+                _progress_dots("", 0, tally)
+                tally %= PROGRESS_BYTES_PER_DOT
+        _progress_dots("", 0, -1)
+        resp = conn.getresponse()
+        # Drain so the connection can be reused / closed cleanly.
+        resp.read()
+        return resp.status
+    finally:
+        conn.close()
 
 
 def _meta_float(headers, key, default, hard_max):
