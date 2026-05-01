@@ -24,17 +24,47 @@ def _get_token(args, key="token"):
 
 
 def _resolve_device_arg(args, registry):
-    """Decode ``device=ident`` into a registry key. Accepts either
-    ``plugin.id`` directly (e.g. ``mp135.0``) or just ``plugin``
-    (delegated to ``registry.resolve`` to require uniqueness).
+    """Decode ``device=...`` into a registry key.
+
+    Accepts:
+      * a plain plugin name (e.g. ``mp135``)  -- must currently
+        resolve to a unique instance via registry.resolve; lease
+        applies to that resolved key.
+      * a fully-qualified ``plugin.id`` key (e.g. ``msc.mp135``) --
+        the *plugin* must be loaded but the instance does NOT need
+        to currently exist. The lease becomes "dormant": stored in
+        the registry's lease table, but with no immediate effect
+        until the device enumerates. When it does, foreign agents'
+        lock acquires are blocked.
+
+    Dormant claims are how an agent reserves a future-mode device
+    key for the same physical board across firmware swaps -- e.g.
+    pre-claim ``msc.mp135`` while the SoC is still in DFU, so no
+    one else can grab the freshly-appeared MSC drive between flash
+    and the agent's follow-up plan.
     """
     raw = args.get("device")
     if not raw:
         raise ValueError("missing device=...")
-    if "." in raw:
-        plugin_name, _, spec_id = raw.partition(".")
-        return registry.resolve(plugin_name, spec_id)
-    return registry.resolve(raw)
+    if "." not in raw:
+        return registry.resolve(raw)
+    plugin_name, _, spec_id = raw.partition(".")
+    if plugin_name not in registry.plugins:
+        raise ValueError(f"unknown plugin {plugin_name!r}")
+    if not spec_id:
+        raise ValueError(f"empty spec id in {raw!r}")
+    return raw
+
+
+def _publish_now(session):
+    """Best-effort: push fresh status to the server so the dashboard
+    reflects this op's effect without waiting for the 15 s tick."""
+    publish = getattr(session.registry, "publish_status", None)
+    if callable(publish):
+        try:
+            publish()
+        except Exception:
+            pass
 
 
 def _op_claim(session, h, args):
@@ -54,6 +84,7 @@ def _op_claim(session, h, args):
     }
     session.stream("lease.claim").append(
         (json.dumps(payload, indent=2) + "\n").encode())
+    _publish_now(session)
 
 
 def _op_resume(session, h, args):
@@ -83,6 +114,7 @@ def _op_release(session, h, args):
         (json.dumps({"token": token,
                      "freed_devices": sorted(devices)}, indent=2)
          + "\n").encode())
+    _publish_now(session)
 
 
 def _op_list(session, h, args):
@@ -98,24 +130,66 @@ class LeasePlugin(DevicePlugin):
     doc = (
         "Hold one or more devices across multiple plan submissions for "
         "extended debugging. Workflow: in plan A, run "
-        "`lease:claim device=plugin.id duration_s=N` (repeat per device "
-        "in the same plan to grow the lease set). The token is written "
-        "to stream `lease.claim` in the artefact tarball. In subsequent "
-        "plans B, C, ..., make `lease:resume token=<tok>` the FIRST op "
-        "to take ownership again -- the session's device-lock acquire "
-        "skips the lease gate and proceeds. When done, `lease:release "
-        "token=<tok>` drops the hold. Leases auto-expire at "
-        "min(duration_s, MAX_SESSION_S=3600s) regardless. Other agents "
-        "whose plans touch a leased device get a fast BusyError.")
+        "`lease:claim device=plugin.id duration_s=N` (repeat per "
+        "device in the same plan to grow the lease set). The token is "
+        "written to stream `lease.claim` in the artefact tarball. In "
+        "subsequent plans B, C, ..., make `lease:resume token=<tok>` "
+        "the FIRST op to take ownership again -- the session's "
+        "device-lock acquire skips the lease gate and proceeds. When "
+        "done, `lease:release token=<tok>` drops the hold. Leases "
+        "auto-expire at min(duration_s, MAX_SESSION_S=3600s) "
+        "regardless. Other agents whose plans touch a leased device "
+        "get a fast BusyError.\n"
+        "\n"
+        "DORMANT CLAIMS for devices that don't currently exist:\n"
+        "  When `device=plugin.id` is fully qualified (a dot is in the "
+        "value), the plugin must be loaded but the *instance* does NOT "
+        "need to be currently enumerated. The lease is recorded "
+        "anyway; the moment the device appears (e.g. after a firmware "
+        "swap or reset), the lease starts gating other agents'\n"
+        "acquisitions of that key.\n"
+        "\n"
+        "  This is how you reserve a future-mode key for the same "
+        "physical board across firmware changes. Example for the "
+        "STM32MP135 board, which presents different USB device keys "
+        "in different modes (`dfu.mp135`, `msc.mp135`, `mp135.0`, "
+        "`ssh.target`):\n"
+        "\n"
+        "    # Plan A: pre-claim every key the workflow will touch,\n"
+        "    # even ones that don't exist yet (board is in DFU now).\n"
+        "    lease:claim device=dfu.mp135  duration_s=1800\n"
+        "    lease:claim device=msc.mp135  duration_s=1800  # dormant\n"
+        "    lease:claim device=mp135.0    duration_s=1800\n"
+        "    lease:claim device=ssh.target duration_s=1800  # dormant\n"
+        "    dfu:flash_layout layout=@flash.tsv\n"
+        "    # Token T now covers all four keys.\n"
+        "\n"
+        "    # Plan B (same agent): bootloader is up, msc.mp135 is\n"
+        "    # enumerated -- our lease already covers it.\n"
+        "    lease:resume token=<T>\n"
+        "    msc:write data=@sdcard.img\n"
+        "\n"
+        "  Plain `device=plugin` (no dot) still requires the instance "
+        "to currently exist and be unique -- it resolves via the "
+        "registry exactly like a normal device op.")
 
     ops = {
         "claim": Op(
             args={"device": "ident", "duration_s": "int"},
-            doc=("Add `device` (plugin.id) to this session's lease for "
-                 "up to duration_s seconds (clamped to MAX_SESSION_S). "
-                 "First call mints the token; later calls in the same "
-                 "session add to the same token. The token is appended "
-                 "to stream `lease.claim` (JSON)."),
+            doc=("Add `device` (plugin or plugin.id) to this session's "
+                 "lease for up to duration_s seconds (clamped to "
+                 "MAX_SESSION_S). First call mints the token; later "
+                 "calls in the same session add to the same token. "
+                 "The token is appended to stream `lease.claim` "
+                 "(JSON).\n"
+                 "\n"
+                 "Plain `plugin` requires the instance to currently "
+                 "exist and be unique. Fully-qualified `plugin.id` "
+                 "(with a dot) records a DORMANT lease even when the "
+                 "instance is not currently enumerated -- gates "
+                 "future acquisitions the moment the device appears. "
+                 "Use this to reserve a key across firmware swaps "
+                 "(see plugin doc)."),
             run=_op_claim),
         "resume": Op(
             args={"token": "str"},
