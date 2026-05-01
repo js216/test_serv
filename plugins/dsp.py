@@ -630,9 +630,12 @@ class DspPlugin(DevicePlugin):
             ft_desc = inst.get("ft4222_desc")
             if not ft_desc or ft_desc not in descs:
                 continue
+            auto = inst.get("uart_autodetect") or {}
+            uart_port = (inst.get("serial_port")
+                         or (_usb.find_com_by_vid_pid(**auto) if auto else None))
             out.append({
                 "id": inst.get("id", "A"),
-                "serial_port": inst.get("serial_port"),
+                "serial_port": uart_port,
                 "baudrate": int(inst.get("baudrate", 115200)),
                 "ft4222_desc": ft_desc,
                 "ft4222_serial": inst.get("ft4222_serial"),

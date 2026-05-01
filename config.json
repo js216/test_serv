@@ -4,8 +4,7 @@
       {
         "id": "A",
         "ft4222_desc": "FT4222 A",
-        "ft4222_serial": "A",
-        "serial_port": "COM31",
+        "uart_autodetect": { "vid": "0x0403", "pid": "0x6001", "serial": "AU04G85S" },
         "baudrate": 115200
       }
     ]
@@ -26,10 +25,9 @@
     "instances": [
       {
         "id": "0",
-        "serial_port": "COM39",
         "baudrate": 115200,
         "expected_identity": "STM32F405",
-        "autodetect": { "vid": "0x0483", "pid_any": ["0x5740", "0x374B", "0x5710"] }
+        "autodetect": { "vid": "0x1b4f", "pid": "0x0028" }
       }
     ]
   },
@@ -39,7 +37,6 @@
       {
         "id": "0",
         "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1 },
-        "serial_port": "COM15",
         "baudrate": 115200,
 
         "expected_usb_vid":       "0x0483",
@@ -50,8 +47,20 @@
     ]
   },
 
+  "msc": {
+    "instances": [
+      {
+        "id": "mp135",
+        "usb_vid": "0x0483",
+        "usb_pid": "0x571d",
+        "usb_serial": "385836733232",
+        "block_size": 512
+      }
+    ]
+  },
+
   "dfu": {
-    "cubeprog_exe": "C:\\Program Files\\STMicroelectronics\\STM32Cube\\STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe",
+    "cubeprog_exe": "/home/jk/projects/prog/stm32cubeprog/bin/STM32_Programmer_CLI",
     "instances": [
       {
         "id": "mp135",
@@ -67,7 +76,7 @@
     "instances": [
       {
         "id": "0",
-        "resource": "USB0::0xF4EC::0x1011::SDS2PDDX6R1848::INSTR",
+        "resource": "USB0::62700::4113::SDS2PDDX6R1848::0::INSTR",
         "expected_idn": "Siglent Technologies,SDS2504X Plus"
       }
     ],
