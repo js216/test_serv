@@ -80,6 +80,11 @@ class Session:
         # gates session lock acquisition against the registry's lease registry
         # so other agents can't acquire devices we're holding across sessions.
         self.lease_token = None
+        # Set by signal_cancel(); checked by _run_block at op boundaries.
+        # A long-running subprocess op (e.g. dfu cubeprog flash) won't
+        # observe it until the op returns; v1 cancel is between-op only.
+        self.canceled = False
+        self.cancel_reason = ""
 
     # --- timeline recording ---
 
@@ -101,6 +106,15 @@ class Session:
     def signal_early_done(self, reason=""):
         self.early_done = True
         self.log_event("CTRL", "session", f"early_done: {reason}")
+
+    def signal_cancel(self, reason=""):
+        """Request the session abort at the next op boundary. Idempotent
+        and thread-safe. Called from poller's cancel-marker drain
+        when DELETE /jobs/<digest> arrives mid-flight.
+        """
+        self.canceled = True
+        self.cancel_reason = reason
+        self.log_event("CTRL", "session", f"cancel requested: {reason}")
 
     def _prescan_lease_resume(self):
         """If the plan starts with ``lease:resume token=...``, take over
@@ -257,6 +271,13 @@ class Session:
                                f"deadline")
                 return
             if self.early_done:
+                return
+            if self.canceled:
+                msg = (f"canceled at op {op.lineno} "
+                       f"({op.device or 'ctrl'}:{op.verb}): "
+                       f"{self.cancel_reason or 'no reason given'}")
+                self.log_event("ERROR", "session", msg)
+                self.errors.append(msg + "\n")
                 return
             self._run_one(op, plugins, deadline)
 
@@ -466,6 +487,43 @@ class Session:
                     },
                 },
             },
+        }
+        ops_map["_jobs"] = {
+            "doc": (
+                "Server-side job lifecycle. These are REST endpoints, "
+                "not plan ops -- the agent calls them via HTTP on the "
+                "test_serv host directly:\n"
+                "\n"
+                "  POST   /submit        binary plan-tar (existing).\n"
+                "  POST   /submit-text   plain plan.txt body, no blobs.\n"
+                "  GET    /jobs          list every job server-side\n"
+                "                        with status (queued, running,\n"
+                "                        done) and timestamps.\n"
+                "  DELETE /jobs/<digest> cancel a job. If still queued,\n"
+                "                        the server unlinks it before\n"
+                "                        the poller can pick it up\n"
+                "                        (returns canceled_queued).\n"
+                "                        If in-flight, the server drops\n"
+                "                        a marker; the poller signals\n"
+                "                        the running session to abort\n"
+                "                        at the next op boundary\n"
+                "                        (returns cancel_signaled), and\n"
+                "                        the artefact lands in OUTPUTS\n"
+                "                        with the cancel reason in\n"
+                "                        errors.log.\n"
+                "  GET    /outputs/<digest>.txt  sentinel manifest.\n"
+                "  GET    /outputs/<digest>.tar  full artefact tar.\n"
+                "  DELETE /outputs/<digest>      drop server-side\n"
+                "                                results when done.\n"
+                "\n"
+                "Use cancel to recover from a runaway plan -- e.g. an "
+                "agent that submitted X-Test-Runtime=3600 and a tight "
+                "loop -- without restarting the bench. Cancellation is "
+                "BETWEEN OPS only in v1; an op already in a long "
+                "subprocess (cubeprog flash, large MSC write) won't "
+                "abort until that op returns and the runner checks the "
+                "flag again."),
+            "ops": {},
         }
         for name, pl in sorted(plugins.items()):
             ops_map[name] = {

@@ -63,6 +63,7 @@ const state = {
   devices: [],
   leases: [],
   ops: {},
+  jobs: [],
   lastFetch: 0,
 };
 
@@ -76,14 +77,16 @@ async function jget(path) {
 
 async function refresh() {
   try {
-    const [devices, leases, ops] = await Promise.all([
+    const [devices, leases, ops, jobs] = await Promise.all([
       jget("/devices"),
       jget("/leases"),
       jget("/ops"),
+      jget("/jobs"),
     ]);
     state.devices = devices;
     state.leases = leases;
     state.ops = ops;
+    state.jobs = jobs;
     state.lastFetch = Date.now();
     renderAll();
     setPollStatus("ok");
@@ -109,7 +112,100 @@ function setPollStatus(kind, msg) {
 function renderAll() {
   renderDevices();
   renderLeases();
+  renderJobs();
   renderInventory();
+}
+
+function fmtAge(secondsAgo) {
+  if (secondsAgo < 0) return "—";
+  if (secondsAgo < 60) return `${Math.floor(secondsAgo)}s ago`;
+  const m = Math.floor(secondsAgo / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m ago`;
+}
+
+function fmtBytes(n) {
+  if (n == null) return "—";
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KiB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)}MiB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)}GiB`;
+}
+
+function renderJobs() {
+  const tbody = $("#jobs-table tbody");
+  tbody.innerHTML = "";
+  if (!state.jobs.length) {
+    $("#jobs-empty").classList.remove("hidden");
+    return;
+  }
+  $("#jobs-empty").classList.add("hidden");
+  const now = Date.now() / 1000;
+  for (const j of state.jobs) {
+    const ts = j.completed_at || j.picked_up_at || j.queued_at || 0;
+    const age = ts ? fmtAge(now - ts) : "—";
+    let statusEl;
+    if (j.status === "queued") {
+      statusEl = el("span", { class: "tag-warn" }, "queued");
+    } else if (j.status === "running") {
+      statusEl = el("span", { class: "tag-warn" },
+        j.cancel_pending ? "running (cancel pending)" : "running");
+    } else if (j.status === "done") {
+      statusEl = el("span", { class: "tag-ok" }, "done");
+    } else {
+      statusEl = el("span", { class: "tag-unset" }, j.status || "?");
+    }
+    const actions = el("span", {});
+    if (j.status === "queued" || j.status === "running") {
+      actions.appendChild(el("button", {
+        type: "button",
+        onclick: () => cancelJob(j.digest),
+      }, "cancel"));
+    }
+    if (j.status === "done") {
+      actions.appendChild(el("a", {
+        href: `/outputs/${j.digest}.tar`,
+        download: `${j.digest}.tar`,
+        class: "artefact-link",
+      }, "download"));
+      actions.appendChild(el("button", {
+        type: "button",
+        onclick: async () => {
+          if (!confirm(`Delete artefact ${j.digest.slice(0, 12)}…?`)) return;
+          await fetch(`/outputs/${j.digest}`, { method: "DELETE" });
+          refresh();
+        },
+      }, "delete"));
+    }
+    tbody.appendChild(el("tr", {},
+      el("td", { class: "mono", title: j.digest }, j.digest.slice(0, 12) + "…"),
+      el("td", {}, statusEl),
+      el("td", { class: "mono" }, age),
+      el("td", { class: "mono" }, fmtBytes(j.size_bytes)),
+      el("td", {}, actions),
+    ));
+  }
+}
+
+async function cancelJob(digest) {
+  if (!confirm(`Cancel job ${digest.slice(0, 12)}…?`)) return;
+  try {
+    const r = await fetch(`/jobs/${digest}`, { method: "DELETE" });
+    if (!r.ok) {
+      alert(`cancel failed: ${r.status}`);
+      return;
+    }
+    const data = await r.json();
+    // canceled_queued -> immediate; cancel_signaled -> poller will
+    // notice on its next /cancels pull and abort the running session
+    // at the next op boundary.
+    console.log("cancel:", data);
+  } catch (e) {
+    alert(`cancel error: ${e.message}`);
+  } finally {
+    refresh();
+  }
 }
 
 function renderDevices() {
