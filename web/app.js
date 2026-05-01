@@ -497,8 +497,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function releaseLease(token) {
   if (!confirm(`Release lease ${token}?`)) return;
-  await submitPlanText(`lease:release token="${token}"\n`,
-                       { Description: `dashboard: release lease ${token.slice(0, 12)}…` });
+  await submitPlanText(
+    `description "dashboard: release lease ${token.slice(0, 12)}…"\n` +
+    `lease:release token="${token}"\n`);
 }
 
 // --- form wiring -----------------------------------------------------
@@ -508,18 +509,18 @@ $("#claim-form").addEventListener("submit", async (e) => {
   const devs = $("#claim-devices").value.trim();
   const dur = Number($("#claim-duration").value || 600);
   if (!devs) return;
-  const lines = devs.split(",").map((s) => s.trim()).filter(Boolean)
-    .map((d) => `lease:claim device=${d} duration_s=${dur}`);
-  await submitPlanText(lines.join("\n") + "\n",
-                       { Description: `dashboard: claim ${devs} for ${dur}s` });
+  const lines = [
+    `description "dashboard: claim ${devs} for ${dur}s"`,
+    ...devs.split(",").map((s) => s.trim()).filter(Boolean)
+      .map((d) => `lease:claim device=${d} duration_s=${dur}`),
+  ];
+  await submitPlanText(lines.join("\n") + "\n");
 });
 
 $("#submit-plan-btn").addEventListener("click", async () => {
   const text = $("#plan-text").value;
   if (!text.trim()) return;
   const meta = {};
-  const desc = $("#meta-description").value.trim();
-  if (desc) meta.Description = desc;
   const rt = $("#meta-runtime").value;
   if (rt) meta.Runtime = rt;
   const ut = $("#meta-upload").value;
@@ -584,8 +585,9 @@ $("#run-inventory").addEventListener("click", async () => {
   // would short-circuit and we'd just re-fetch the previous artefact
   // instead of doing a fresh re-probe.
   const ts = new Date().toISOString();
-  await submitPlanText(`# inventory ${ts}\ninventory verify=true\n`,
-                       { Description: "dashboard: run inventory" }, btn);
+  await submitPlanText(
+    `description "dashboard: run inventory ${ts}"\n` +
+    `inventory verify=true\n`, {}, btn);
 });
 
 // --- boot ------------------------------------------------------------
