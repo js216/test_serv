@@ -320,14 +320,27 @@ class DeviceRegistry:
             return set(l["devices"])
 
     def lease_list(self):
-        """Snapshot of active leases, suitable for inclusion in artefacts."""
+        """Snapshot of active leases, suitable for inclusion in artefacts.
+
+        Includes ``expires_at_walltime`` (seconds since unix epoch) on
+        top of ``expires_in_s`` so a browser/UI can render a smooth
+        countdown without round-tripping the bench's monotonic clock.
+        """
         with self._lease_cv:
-            now = time.monotonic()
-            return [{
-                "token": t,
-                "devices": sorted(l["devices"]),
-                "expires_in_s": max(0.0, l["expires_at"] - now),
-            } for t, l in self.leases.items() if l["expires_at"] > now]
+            now_mono = time.monotonic()
+            now_wall = time.time()
+            out = []
+            for t, l in self.leases.items():
+                if l["expires_at"] <= now_mono:
+                    continue
+                rem = l["expires_at"] - now_mono
+                out.append({
+                    "token": t,
+                    "devices": sorted(l["devices"]),
+                    "expires_in_s": rem,
+                    "expires_at_walltime": now_wall + rem,
+                })
+            return out
 
 
 class _Acquire:

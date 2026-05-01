@@ -4,10 +4,12 @@
 
 import argparse
 import hashlib
+import io
 import json
 import os
 import random
 import re
+import tarfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
@@ -23,6 +25,20 @@ SWEEP = os.path.join(STATE_DIR, "sweep")
 
 # Examples dir is relative to this file -- bench-operator-owned starter plans.
 EXAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
+# Static UI lives next to server.py.
+WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+STATIC_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".js":   "application/javascript; charset=utf-8",
+    ".css":  "text/css; charset=utf-8",
+    ".json": "application/json",
+    ".svg":  "image/svg+xml",
+    ".ico":  "image/x-icon",
+    ".png":  "image/png",
+}
+# Names the poller is allowed to push into the STATUS dir. Anything
+# else is rejected so a foreign POST can't drop arbitrary files there.
+ALLOWED_STATUS_FILES = ("devices.json", "ops.json", "leases.json")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -124,6 +140,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "ops":
             return self._send_json(
                 _read_file(os.path.join(STATUS, "ops.json")) or b"{}")
+        if path == "leases":
+            return self._send_json(
+                _read_file(os.path.join(STATUS, "leases.json")) or b"[]")
         if path == "examples":
             return self._list_examples()
         if path.startswith("examples/"):
@@ -132,6 +151,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._fetch_output(path[len("outputs/"):])
         if path == "scope/signals":
             return self._scope_signals()
+        if path == "" or path == "index.html":
+            return self._serve_static("index.html")
+        if path.startswith("web/"):
+            return self._serve_static(path[len("web/"):])
         # job pickup: GET /<ext>
         return self._pickup(path)
 
@@ -139,6 +162,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.lstrip("/")
         if path == "submit":
             return self._submit_job()
+        if path == "submit-text":
+            return self._submit_text_job()
         # /devices/<id>/release
         m = re.match(r"^devices/([A-Za-z0-9._-]+)/release$", path)
         if m:
@@ -146,6 +171,10 @@ class Handler(BaseHTTPRequestHandler):
         # /sweep -- re-probe + re-verify all devices on the poller
         if path == "sweep":
             return self._mark_sweep()
+        # /status/<name>.json -- poller pushes a status snapshot
+        m = re.match(r"^status/([A-Za-z0-9._-]+\.json)$", path)
+        if m:
+            return self._receive_status(m.group(1))
         # artefact upload: /<digest>[.ext]
         return self._artefact(path)
 
@@ -184,6 +213,73 @@ class Handler(BaseHTTPRequestHandler):
                 "status": "queued",
                 "digest": digest,
             }).encode(), status=201)
+
+    # --- POST /submit-text -- pack a plain plan.txt body server-side.
+    # Convenience for the web UI and any agent that doesn't want to
+    # build a tar; no blobs supported. Equivalent to /submit with a
+    # `plan.txt`-only tarball.
+    def _submit_text_job(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        text = self.rfile.read(n) if n else b""
+        if not text:
+            return self._send_json(
+                json.dumps({"status": "empty"}).encode(), status=400)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as tf:
+            ti = tarfile.TarInfo("plan.txt")
+            ti.size = len(text)
+            tf.addfile(ti, io.BytesIO(text))
+        body = buf.getvalue()
+        meta = {}
+        for k, v in self.headers.items():
+            if k.lower().startswith("x-test-"):
+                meta[k[len("X-Test-"):].lower()] = v
+        digest, status = queue_job(body, meta)
+        if status == "stale_outputs":
+            return self._send_json(
+                json.dumps({"status": "stale_outputs",
+                            "digest": digest}).encode(), status=409)
+        if status == "duplicate":
+            return self._send_json(
+                json.dumps({"status": "duplicate",
+                            "digest": digest}).encode(), status=409)
+        return self._send_json(
+            json.dumps({"status": "queued",
+                        "digest": digest}).encode(), status=201)
+
+    # --- POST /status/<name>.json -- poller publishes its registry view ---
+
+    def _receive_status(self, name):
+        if name not in ALLOWED_STATUS_FILES:
+            self.send_response(400)
+            self.end_headers()
+            return
+        n = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(n) if n else b""
+        os.makedirs(STATUS, mode=0o700, exist_ok=True)
+        _write_atomic(os.path.join(STATUS, name), body)
+        self._send_json(b'{"status":"ok"}')
+
+    # --- GET / + GET /web/<file> -- static UI ---
+
+    def _serve_static(self, rel):
+        if not rel or "\x00" in rel:
+            self.send_response(400); self.end_headers(); return
+        # normpath + a startswith check is enough to prevent traversal --
+        # any "../" gets resolved before we compare against WEB_DIR.
+        path = os.path.normpath(os.path.join(WEB_DIR, rel))
+        if not (path == WEB_DIR or path.startswith(WEB_DIR + os.sep)):
+            self.send_response(400); self.end_headers(); return
+        body = _read_file(path)
+        if body is None:
+            self.send_response(404); self.end_headers(); return
+        ext = os.path.splitext(path)[1].lower()
+        ctype = STATIC_CONTENT_TYPES.get(ext, "application/octet-stream")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     # --- GET / pickup ---
 
