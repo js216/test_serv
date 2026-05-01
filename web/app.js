@@ -326,6 +326,13 @@ $("#submit-plan-btn").addEventListener("click", async () => {
 
 $("#refresh-now").addEventListener("click", refresh);
 
+$("#run-inventory").addEventListener("click", async () => {
+  const btn = $("#run-inventory");
+  await submitPlanText("inventory verify=true\n", {}, btn);
+  // submitPlanText already calls refresh() on success; the inventory op
+  // also re-publishes status so devices/ops/leases are fresh by then.
+});
+
 // --- boot ------------------------------------------------------------
 
 refresh();

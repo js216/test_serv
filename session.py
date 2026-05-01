@@ -397,6 +397,15 @@ class Session:
             self.registry.refresh()
         if verify is not None and verify.as_bool():
             self.registry.verify_sweep()
+        # Also push the freshly probed state to the server right away so
+        # an `inventory` op from the web UI updates the dashboard
+        # without waiting for the next 15 s tick.
+        publish = getattr(self.registry, "publish_status", None)
+        if callable(publish):
+            try:
+                publish()
+            except Exception:
+                traceback.print_exc()
 
         devices = self.registry.list_devices()
         ops_map = {

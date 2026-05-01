@@ -322,6 +322,11 @@ def main():
     print(datetime.now(), "plugins:", sorted(plugins_by_name.keys()))
 
     registry = DeviceRegistry(plugins_by_name)
+    # Wire the on-demand publisher: session._run_inventory and any other
+    # in-process caller can push fresh status to the server immediately
+    # without waiting for the periodic refresh tick.
+    registry.publish_status = lambda: _publish_status(
+        registry, plugins_by_name)
     registry.refresh()
     print(datetime.now(), "startup verify sweep:")
     registry.verify_sweep()
