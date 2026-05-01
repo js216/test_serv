@@ -510,17 +510,20 @@ def main():
     last_refresh = time.monotonic()
     base = f"http://localhost:{HTTP_PORT}"
 
-    # Useful concurrency is bounded by the number of distinct devices
-    # we have -- any two jobs competing for the same device serialize
-    # on the registry's per-device lock anyway. Gate pick-up with a
-    # semaphore sized to that ceiling so we never spawn threads that
-    # can only sit on locks. Jobs beyond the cap stay queued on disk
-    # in inputs/.
-    max_active = max(1, len(plugins_by_name))
+    # Useful concurrency is bounded by the number of distinct device
+    # instances -- any two jobs competing for the same device serialize
+    # on the registry's per-device lock anyway. Two jobs touching
+    # different *instances* of the same plugin (mp135.evb vs
+    # mp135.custom, dfu.evb vs dfu.custom, fpga.hx1k vs fpga.hx8k) can
+    # run in parallel; the cap is over the spec count, not the plugin
+    # count. Floor of 2 so a sparsely-populated bench still serves
+    # back-to-back submissions. Jobs beyond the cap stay queued on
+    # disk in inputs/.
+    max_active = max(2, len(registry.specs))
     worker_slot = threading.Semaphore(max_active)
     print(datetime.now(),
           f"dispatch: at most {max_active} job(s) active "
-          f"(= number of plugins)")
+          f"(= number of device instances)")
 
     def _worker(body, headers):
         try:
