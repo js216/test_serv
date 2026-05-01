@@ -10,7 +10,8 @@
     <h1>test_serv</h1>
     <div class="status">
       <span id="poll-status" class="poll-ok">poll: --</span>
-      <button id="refresh-now" type="button">refresh now</button>
+      <button id="refresh-now" type="button" title="Re-fetch /devices /leases /ops from the server">refresh now</button>
+      <button id="run-inventory" type="button" title="Submit `inventory verify=true` -- forces the poller to re-probe + re-verify all devices, then push fresh status. Use after plugging/unplugging or if status seems stale.">run inventory</button>
     </div>
   </header>
 
