@@ -64,7 +64,8 @@
   </section>
 
   <section id="jobs-section">
-    <h2>Jobs</h2>
+    <h2>Jobs <button id="prune-jobs" type="button" class="header-btn"
+                    title="Remove every 'running' entry whose artefact is no longer on the server. These are leftovers: the poller picked the job up, the agent fetched + deleted the artefact, but the bookkeeping record stayed.">clear stale</button></h2>
     <table id="jobs-table">
       <thead>
         <tr>
