@@ -35,7 +35,7 @@
   "mp135": {
     "instances": [
       {
-        "id": "0",
+        "id": "evb",
         "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1 },
         "baudrate": 115200,
 
@@ -43,6 +43,15 @@
         "expected_usb_pid":       "0x3753",
         "expected_usb_interface": 1,
         "expected_usb_serial":    "0044002F3132511838363431"
+      },
+      {
+        "id": "custom",
+        "autodetect": { "vid": "0x0403", "pid": "0x6001", "serial": "FTEKT7BP" },
+        "baudrate": 115200,
+
+        "expected_usb_vid":    "0x0403",
+        "expected_usb_pid":    "0x6001",
+        "expected_usb_serial": "FTEKT7BP"
       }
     ]
   },
