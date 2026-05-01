@@ -31,6 +31,12 @@ class DeviceRegistry:
         self.cache = {}        # "dsp.A" -> (handle, opened_at, last_used, refs)
         self.per_dev_lock = {} # "dsp.A" -> threading.RLock
         self.verify_results = {}  # "dsp.A" -> {t, ok, err, latency_ms}
+        # Lease registry: token -> {"devices": set, "expires_at": monotonic}.
+        # Persists across sessions so an agent can hold devices for an
+        # extended debug window. Reaper expires entries; lease_blocks_us()
+        # gates other agents at session start.
+        self.leases = {}
+        self._lease_cv = threading.Condition()
         self._stop = threading.Event()
         self._reaper = threading.Thread(target=self._reap, daemon=True)
         self._reaper.start()
@@ -240,6 +246,88 @@ class DeviceRegistry:
                     handle, opened_at, last_used, refs = self.cache[key]
                     if refs == 0 and (now - last_used) > self.ttl_s:
                         self._close_if_cached_locked(key)
+            self._evict_expired_leases()
+
+    # --- leases ---
+
+    def _evict_expired_leases(self):
+        """Drop expired lease entries and wake anyone waiting on a release."""
+        with self._lease_cv:
+            now = time.monotonic()
+            dead = [t for t, l in self.leases.items() if l["expires_at"] < now]
+            for t in dead:
+                del self.leases[t]
+            if dead:
+                self._lease_cv.notify_all()
+
+    def lease_blocks_us(self, key, my_token):
+        """Return the lease token currently holding ``key`` if it would
+        block a session whose ``my_token`` is ``my_token`` (or None for
+        non-lease sessions). Returns None if free or owned by us. Eagerly
+        evicts expired leases as a side-effect.
+        """
+        with self._lease_cv:
+            now = time.monotonic()
+            for t, l in list(self.leases.items()):
+                if l["expires_at"] < now:
+                    del self.leases[t]
+                    continue
+                if key in l["devices"]:
+                    return None if t == my_token else t
+            return None
+
+    def lease_add(self, token, key, duration_s):
+        """Add ``key`` to the lease identified by ``token`` (creating the
+        lease if absent). Caller must currently hold the per_dev_lock for
+        ``key`` -- enforced indirectly by the fact that ``lease:claim``
+        runs as a session op, and the session is already holding it.
+        ``duration_s`` is clamped to ``[1, MAX_LEASE_S]``.
+        """
+        from session import MAX_SESSION_S
+        duration_s = max(1.0, min(float(duration_s), MAX_SESSION_S))
+        with self._lease_cv:
+            now = time.monotonic()
+            for t, l in list(self.leases.items()):
+                if key in l["devices"] and l["expires_at"] > now and t != token:
+                    raise RuntimeError(
+                        f"{key!r} is already leased to {t!r}")
+            l = self.leases.setdefault(
+                token, {"devices": set(), "expires_at": 0.0})
+            l["devices"].add(key)
+            new_exp = now + duration_s
+            if new_exp > l["expires_at"]:
+                l["expires_at"] = new_exp
+            return l["expires_at"]
+
+    def lease_drop(self, token):
+        """Drop every entry held by ``token``. Returns the device set
+        that was held (empty set if the token was unknown/expired)."""
+        with self._lease_cv:
+            l = self.leases.pop(token, None)
+            self._lease_cv.notify_all()
+            return set(l["devices"]) if l else set()
+
+    def lease_resume(self, token):
+        """Validate that ``token`` has an active lease. Returns the
+        device-key set on success, or ``None`` if the token is unknown
+        or already expired.
+        """
+        with self._lease_cv:
+            l = self.leases.get(token)
+            now = time.monotonic()
+            if l is None or l["expires_at"] < now:
+                return None
+            return set(l["devices"])
+
+    def lease_list(self):
+        """Snapshot of active leases, suitable for inclusion in artefacts."""
+        with self._lease_cv:
+            now = time.monotonic()
+            return [{
+                "token": t,
+                "devices": sorted(l["devices"]),
+                "expires_in_s": max(0.0, l["expires_at"] - now),
+            } for t, l in self.leases.items() if l["expires_at"] > now]
 
 
 class _Acquire:

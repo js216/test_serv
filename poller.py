@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import signal
+import sys
 import threading
 import time
 import traceback
@@ -24,21 +25,63 @@ STATE_DIR = paths.state_dir()
 STATUS = os.path.join(STATE_DIR, "status")
 RELEASE = os.path.join(STATE_DIR, "release")
 SWEEP = os.path.join(STATE_DIR, "sweep")
+LOG = os.path.join(STATE_DIR, "log.txt")
+
+
+class _Tee:
+    def __init__(self, *streams):
+        self._streams = streams
+    def write(self, s):
+        for st in self._streams:
+            try:
+                st.write(s)
+                st.flush()
+            except Exception:
+                pass
+        return len(s)
+    def flush(self):
+        for st in self._streams:
+            try:
+                st.flush()
+            except Exception:
+                pass
 
 HTTP_PORT = int(os.environ.get("TEST_SERV_PORT", "8080"))
 POLL_INTERVAL_S = 2.5
 DEVICE_REFRESH_S = 15.0
+DEFAULT_UPLOAD_S = 600.0
+MAX_UPLOAD_S = 3600.0
 
 
-def _get(url):
-    with urllib.request.urlopen(url) as r:
+def _get(url, timeout=30.0):
+    with urllib.request.urlopen(url, timeout=timeout) as r:
         return r.status, r.read(), dict(r.headers)
 
 
-def _post(url, data):
+def _post(url, data, timeout=DEFAULT_UPLOAD_S):
     req = urllib.request.Request(url, data=data, method="POST")
-    with urllib.request.urlopen(req) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status
+
+
+def _meta_float(headers, key, default, hard_max):
+    """Pull X-Test-<Key> from response headers (case-insensitive),
+    parse as a float, clamp to ``[1.0, hard_max]``. Falls back to
+    ``default`` on missing/garbage values.
+    """
+    needle = f"x-test-{key.lower()}"
+    val = None
+    for k, v in headers.items():
+        if k.lower() == needle:
+            val = v
+            break
+    if val is None:
+        return default
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        return default
+    return max(1.0, min(n, hard_max))
 
 
 def _write_atomic(path, data):
@@ -150,13 +193,18 @@ def _print_device_table(verify_map, registry):
 def _dispatch(payload, headers, registry, plugins_by_name):
     job_id = hashlib.sha256(payload).hexdigest()
     tag = f"[{job_id[:8]}]"
+    from session import DEFAULT_SESSION_S, MAX_SESSION_S
+    runtime_s = _meta_float(headers, "Runtime",
+                            DEFAULT_SESSION_S, MAX_SESSION_S)
+    upload_s = _meta_float(headers, "Upload-Timeout",
+                           DEFAULT_UPLOAD_S, MAX_UPLOAD_S)
     try:
         parsed = plan.load_tar(payload)
     except plan.PlanError as e:
         print(datetime.now(), tag,
               f"pickup {len(payload)} B  devices=?  parse failed: {e}")
         tar, txt = _failure_artefact(job_id, f"plan parse failed: {e}")
-        _post_artefacts(job_id, tar, txt)
+        _post_artefacts(job_id, tar, txt, upload_s)
         return
 
     needed = sorted(plan.required_devices(parsed))
@@ -168,14 +216,14 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         _validate_against_plugins(parsed, plugins_by_name, registry)
     except Exception as e:
         tar, txt = _failure_artefact(job_id, f"validation: {e}")
-        _post_artefacts(job_id, tar, txt)
+        _post_artefacts(job_id, tar, txt, upload_s)
         return
 
-    session = Session(registry, parsed)
+    session = Session(registry, parsed, runtime_s=runtime_s)
     session.run_all(plugins_by_name)
 
     tar, manifest_text = pack_artefact(session)
-    _post_artefacts(job_id, tar, manifest_text.encode())
+    _post_artefacts(job_id, tar, manifest_text.encode(), upload_s)
 
 
 def _validate_against_plugins(parsed, plugins_by_name, registry):
@@ -227,19 +275,25 @@ def _failure_artefact(job_id, message):
     return buf.getvalue(), manifest_bytes
 
 
-def _post_artefacts(job_id, tar_bytes, sentinel_bytes):
+def _post_artefacts(job_id, tar_bytes, sentinel_bytes,
+                    timeout_s=DEFAULT_UPLOAD_S):
     base = f"http://localhost:{HTTP_PORT}"
     try:
-        _post(f"{base}/{job_id}.tar", tar_bytes)
+        _post(f"{base}/{job_id}.tar", tar_bytes, timeout=timeout_s)
     except Exception:
         print(datetime.now(), f"POST .tar failed:\n{traceback.format_exc()}")
     try:
-        _post(f"{base}/{job_id}.txt", sentinel_bytes)
+        _post(f"{base}/{job_id}.txt", sentinel_bytes, timeout=timeout_s)
     except Exception:
         print(datetime.now(), f"POST .txt failed:\n{traceback.format_exc()}")
 
 
 def main():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    log_f = open(LOG, "a", buffering=1, encoding="utf-8", errors="replace")
+    sys.stdout = _Tee(sys.__stdout__, log_f)
+    sys.stderr = _Tee(sys.__stderr__, log_f)
+    print(datetime.now(), f"logging to {LOG}")
     print(datetime.now(), "loading plugins...")
     plugins_by_name = plugins.load_all()
     print(datetime.now(), "plugins:", sorted(plugins_by_name.keys()))
