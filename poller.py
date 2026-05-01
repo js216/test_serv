@@ -95,11 +95,33 @@ def _write_atomic(path, data):
     os.replace(tmp, path)
 
 
+def _push_status(name, body):
+    """Push a status snapshot to the server. Best-effort -- the bench
+    keeps running if the server is unreachable; the local copy under
+    STATE_DIR/status/ is still authoritative for tail/inspection.
+    Short timeout: status pushes are tiny and a wedged tunnel
+    shouldn't block the refresh loop.
+    """
+    base = f"http://localhost:{HTTP_PORT}"
+    try:
+        _post(f"{base}/status/{name}", body, timeout=10.0)
+    except Exception:
+        # Don't traceback-spam the log on every refresh tick if the
+        # server is offline; one line is enough.
+        print(datetime.now(),
+              f"status/{name} push failed (server unreachable?)")
+
+
 def _publish_status(registry, plugins_by_name):
     os.makedirs(STATUS, mode=0o700, exist_ok=True)
-    devices = registry.list_devices()
-    _write_atomic(os.path.join(STATUS, "devices.json"),
-                  json.dumps(devices, indent=2).encode())
+    devices = json.dumps(registry.list_devices(), indent=2).encode()
+    _write_atomic(os.path.join(STATUS, "devices.json"), devices)
+    _push_status("devices.json", devices)
+
+    leases = json.dumps(registry.lease_list(), indent=2).encode()
+    _write_atomic(os.path.join(STATUS, "leases.json"), leases)
+    _push_status("leases.json", leases)
+
     ops_map = {}
     for name, pl in plugins_by_name.items():
         ops_map[name] = {
@@ -109,8 +131,9 @@ def _publish_status(registry, plugins_by_name):
                               "doc": op.doc}
                     for op_name, op in pl.ops.items()},
         }
-    _write_atomic(os.path.join(STATUS, "ops.json"),
-                  json.dumps(ops_map, indent=2).encode())
+    ops = json.dumps(ops_map, indent=2).encode()
+    _write_atomic(os.path.join(STATUS, "ops.json"), ops)
+    _push_status("ops.json", ops)
 
 
 def _drain_release_markers(registry):

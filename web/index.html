@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>test_serv</title>
+  <link rel="stylesheet" href="/web/style.css">
+</head>
+<body>
+  <header>
+    <h1>test_serv</h1>
+    <div class="status">
+      <span id="poll-status" class="poll-ok">poll: --</span>
+      <button id="refresh-now" type="button">refresh now</button>
+    </div>
+  </header>
+
+  <section id="devices-section">
+    <h2>Devices</h2>
+    <table id="devices-table">
+      <thead>
+        <tr>
+          <th>id</th>
+          <th>plugin</th>
+          <th>location</th>
+          <th>verify</th>
+          <th>latency</th>
+          <th>handle</th>
+          <th>lease</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div id="devices-empty" class="empty hidden">no devices reported</div>
+  </section>
+
+  <section id="leases-section">
+    <h2>Leases</h2>
+    <table id="leases-table">
+      <thead>
+        <tr>
+          <th>token</th>
+          <th>devices</th>
+          <th>remaining</th>
+          <th>actions</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <div id="leases-empty" class="empty">no active leases</div>
+
+    <details id="claim-form-wrap">
+      <summary>+ new lease</summary>
+      <form id="claim-form">
+        <label>devices (comma-separated, e.g. <code>mp135.0,msc.mp135</code>)
+          <input id="claim-devices" type="text" required>
+        </label>
+        <label>duration (seconds, max 3600)
+          <input id="claim-duration" type="number" min="1" max="3600" value="600">
+        </label>
+        <button type="submit">claim</button>
+      </form>
+    </details>
+  </section>
+
+  <section id="inventory-section">
+    <h2>Inventory</h2>
+    <div id="inventory"></div>
+  </section>
+
+  <section id="submit-section">
+    <h2>Submit a plan</h2>
+    <p class="hint">No-blob plans only. For blob attachments use submit.py / the REST API directly.</p>
+    <textarea id="plan-text" rows="8"
+              placeholder="lease:list&#10;# or any multi-op plan"></textarea>
+    <div class="row">
+      <label>X-Test-Runtime (s)
+        <input id="meta-runtime" type="number" min="1" max="3600" placeholder="default: 600">
+      </label>
+      <label>X-Test-Upload-Timeout (s)
+        <input id="meta-upload" type="number" min="1" max="3600" placeholder="default: 600">
+      </label>
+      <button id="submit-plan-btn" type="button">submit + wait</button>
+    </div>
+    <div id="submit-result"></div>
+  </section>
+
+  <script src="/web/app.js"></script>
+</body>
+</html>
