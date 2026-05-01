@@ -324,6 +324,7 @@ class FpgaPlugin(DevicePlugin):
                 "ft2232h_desc": ft_desc,
                 "serial_port": uart_port,
                 "baudrate": int(inst.get("baudrate", FPGA_BAUD_DEFAULT)),
+                "description": inst.get("description"),
             })
         return out
 

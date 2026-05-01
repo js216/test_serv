@@ -136,6 +136,7 @@ class BenchMcuPlugin(DevicePlugin):
                 "baudrate": int(inst.get("baudrate", 115200)),
                 "expected_identity": (inst.get("expected_identity")
                                       or EXPECTED_IDENTITY.decode()),
+                "description": inst.get("description"),
             })
         return out
 

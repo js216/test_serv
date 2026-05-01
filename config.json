@@ -36,6 +36,7 @@
     "instances": [
       {
         "id": "evb",
+        "description": "STM32MP135F-DK eval board. UART comes out on the on-board STLink-V3 VCP (interface 1). Paired with dfu.mp135 and msc.mp135.",
         "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1 },
         "baudrate": 115200,
 
@@ -46,6 +47,7 @@
       },
       {
         "id": "custom",
+        "description": "Custom STM32MP135 PCB. UART exposed via a USB-to-RS232 cable (FT232R, iSerial FTEKT7BP). No DFU/MSC instances configured for this board yet.",
         "autodetect": { "vid": "0x0403", "pid": "0x6001", "serial": "FTEKT7BP" },
         "baudrate": 115200,
 

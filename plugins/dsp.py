@@ -639,6 +639,7 @@ class DspPlugin(DevicePlugin):
                 "baudrate": int(inst.get("baudrate", 115200)),
                 "ft4222_desc": ft_desc,
                 "ft4222_serial": inst.get("ft4222_serial"),
+                "description": inst.get("description"),
             })
         return out
 
