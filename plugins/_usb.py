@@ -20,12 +20,16 @@ def list_com_ports():
     return list(serial.tools.list_ports.comports())
 
 
-def find_com_by_vid_pid(vid, pid=None, pid_any=None, interface=None):
+def find_com_by_vid_pid(vid, pid=None, pid_any=None, interface=None,
+                        serial=None):
     """Return the first COM port matching the VID/PID (and optional
-    interface number), or ``None``.
+    interface number / iSerial), or ``None``.
 
     ``interface`` matches the USB interface number -- Windows encodes it
     in the hwid string as ``MI_0N``, Linux as ``:1.N`` in the location.
+    ``serial`` matches ``ListPortInfo.serial_number`` exactly; pin this
+    when the bench has multiple instances of the same chip and only a
+    specific physical unit should be claimed.
     """
     vid_i = _int(vid)
     pid_i = _int(pid)
@@ -36,6 +40,8 @@ def find_com_by_vid_pid(vid, pid=None, pid_any=None, interface=None):
         if pid_i is not None and p.pid != pid_i:
             continue
         if pids_any and p.pid not in pids_any:
+            continue
+        if serial is not None and p.serial_number != serial:
             continue
         if interface is not None:
             loc = (p.location or "") + " " + (p.hwid or "")
