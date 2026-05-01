@@ -21,7 +21,7 @@ MAX_DEPTH = 2
 
 CONTROL_VERBS = {
     "fork", "end", "join", "barrier", "mark", "delay", "wall_time",
-    "inventory",
+    "inventory", "description",
     "open", "close",
 }
 
@@ -155,6 +155,18 @@ def parse_text(text):
                 raise PlanError(f"line {lineno}: 'end' without matching fork")
             stack.pop()
             depth -= 1
+        elif head == "description":
+            # Special-case: rest of line is free-form text. Accept the
+            # k=v form (`description text="..."`) too for grammar
+            # symmetry, but the canonical and recommended form is just
+            # `description "<short summary of what this plan does>"`.
+            if rest and "=" in rest[0]:
+                args = _parse_args(rest, lineno)
+            else:
+                args = {"text": Value("str", " ".join(rest))}
+            op = Op(lineno=lineno, device=None, verb="description",
+                    args=args)
+            stack[-1].append(op)
         elif head in CONTROL_VERBS:
             op = Op(lineno=lineno, device=None, verb=head,
                     args=_parse_args(rest, lineno))

@@ -417,6 +417,15 @@ class Session:
         elif v == "join":
             # join is a no-op: fork block already joins at its end.
             pass
+        elif v == "description":
+            # Op-time no-op: the server already extracted the text
+            # from the plan body at submit time and stuffed it into
+            # the job's meta dict. Logging it to the timeline keeps
+            # the artefact self-describing too.
+            text = op.args.get("text")
+            self.log_event(
+                "DESC", "ctrl",
+                text.raw if (text and hasattr(text, "raw")) else "")
         else:
             raise PlanError(f"unknown control verb {v!r}")
 
@@ -486,6 +495,23 @@ class Session:
                         "optional_args": {},
                         "doc": "Sleep for ms milliseconds.",
                     },
+                    "description": {
+                        "args": {},
+                        "optional_args": {"text": "str"},
+                        "doc": (
+                            "Tag this plan with a short, human-"
+                            "readable summary of what it does. "
+                            "Canonical form: `description \"flash "
+                            "custom rootfs and verify SSH login\"` "
+                            "(positional, free-form). The server "
+                            "extracts the first such line at submit "
+                            "time and exposes it in /jobs entries' "
+                            "meta dict; the dashboard renders it "
+                            "under the digest. Strongly recommended "
+                            "for any non-trivial plan -- agents who "
+                            "set this make their work easier to "
+                            "triage, cancel, and audit."),
+                    },
                     "fork": {
                         "args": {"name": "ident"},
                         "optional_args": {},
@@ -553,27 +579,29 @@ class Session:
                 "  DELETE /outputs/<digest>      drop server-side\n"
                 "                                results when done.\n"
                 "\n"
-                "Per-submission metadata (HTTP request headers on POST "
-                "/submit or /submit-text). Every header named\n"
-                "  X-Test-<Name>: <value>\n"
-                "is captured and stored alongside the plan. The server "
-                "round-trips it in the meta dict of GET /jobs entries, "
-                "so the dashboard and other agents can see context\n"
-                "without opening the artefact:\n"
+                "Per-submission metadata.\n"
                 "\n"
-                "  X-Test-Description     short human-readable summary "
-                "of what the plan does -- e.g. 'flash custom rootfs and "
-                "verify SSH login'. Shows up in the dashboard's Jobs\n"
-                "                         table. Strongly recommended "
-                "for any non-trivial plan; agents who set this make\n"
-                "                         their work easier to triage,\n"
-                "                         cancel, and audit.\n"
-                "  X-Test-Runtime         per-session deadline in\n"
-                "                         seconds; clamped to\n"
-                "                         [1, 3600], default 600.\n"
-                "  X-Test-Upload-Timeout  artefact-POST timeout in\n"
-                "                         seconds; clamped to\n"
-                "                         [1, 3600], default 600.\n"
+                "  In-plan: a top-level `description \"<short summary>\"` "
+                "line is the recommended way to label the job. The\n"
+                "  server pre-extracts that line at submit time and "
+                "exposes it in the meta dict of GET /jobs entries, so "
+                "the dashboard and other agents can triage the queue "
+                "without opening the artefact. The line is also a real "
+                "control verb -- it logs to timeline -- so the "
+                "artefact stays self-describing. Strongly recommended "
+                "for any non-trivial plan.\n"
+                "\n"
+                "  HTTP headers: every request header named\n"
+                "    X-Test-<Name>: <value>\n"
+                "  is captured and stored alongside the plan, exposed "
+                "as the meta dict on /jobs entries. Two are honoured "
+                "by the runner itself:\n"
+                "    X-Test-Runtime        per-session deadline in\n"
+                "                          seconds; clamped to\n"
+                "                          [1, 3600], default 600.\n"
+                "    X-Test-Upload-Timeout artefact-POST timeout in\n"
+                "                          seconds; clamped to\n"
+                "                          [1, 3600], default 600.\n"
                 "\n"
                 "Use cancel to recover from a runaway plan -- e.g. an "
                 "agent that submitted X-Test-Runtime=3600 and a tight "
