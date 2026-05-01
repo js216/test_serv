@@ -240,12 +240,9 @@ function renderDevices() {
       : el("span", { class: "tag-unset" }, "—");
 
     const desc = d.spec && d.spec.description;
-    const idCell = el("td", { class: "mono" }, d.id);
-    if (desc) {
-      idCell.appendChild(el("div", { class: "device-desc" }, desc));
-    }
-    tbody.appendChild(el("tr", {},
-      idCell,
+    const trAttrs = desc ? { title: desc, class: "has-tooltip" } : {};
+    tbody.appendChild(el("tr", trAttrs,
+      el("td", { class: "mono" }, d.id),
       el("td", {}, d.plugin),
       el("td", { class: "mono" }, describeLoc(d.spec)),
       el("td", {}, verifyCell(v)),
