@@ -54,17 +54,25 @@ def _op_identify(session, h, args):
 
 
 def _op_reset_dut(session, h, args):
+    _send_one(session, h, b"r", "bench_mcu.reset_dut")
+
+
+def _op_reset_dut2(session, h, args):
+    _send_one(session, h, b"R", "bench_mcu.reset_dut2")
+
+
+def _send_one(session, h, byte, stream_name):
     serial = _lazy_serial()
     ser = serial.Serial(h.port, baudrate=h.baud, timeout=0.1)
     try:
         ser.reset_input_buffer()
-        ser.write(b"r")
+        ser.write(byte)
         ser.flush()
         reply = _drain(ser, READ_WINDOW_S)
     finally:
         ser.close()
     if reply:
-        session.stream("bench_mcu.reset_dut").append(reply)
+        session.stream(stream_name).append(reply)
 
 
 def _op_send(session, h, args):
@@ -99,11 +107,15 @@ class BenchMcuHandle:
 
 class BenchMcuPlugin(DevicePlugin):
     name = "bench_mcu"
-    doc = ("Small bench-helper MCU (STM32F405 wired to COMxx). '?' replies "
-           "an identity string; 'r' pulses its D13 to reset whatever DUT "
-           "is wired there.  Port comes from config.json instances; an "
-           "autodetect VID/PID rule is honoured when the port field is "
-           "omitted.")
+    doc = ("Small bench-helper MCU (STM32F405 wired to a serial port). "
+           "Two reset lines, one per DUT:\n"
+           "  D13 -> EVB STM32MP135 reset (active LOW, idle HIGH).\n"
+           "        Triggered by 'r' (or the dedicated reset_dut op).\n"
+           "  D12 -> custom STM32MP135 PCB reset (active LOW, idle HIGH).\n"
+           "        Triggered by 'R' (or the dedicated reset_dut2 op).\n"
+           "Plus '?' = identity, 'h' = help, 'p' = monitored-pin "
+           "snapshot. Port comes from config.json instances; autodetect "
+           "VID/PID is honoured when serial_port is omitted.")
 
     ops = {
         "identify": Op(args={},
@@ -111,13 +123,19 @@ class BenchMcuPlugin(DevicePlugin):
                            "bench_mcu.identity.",
                        run=_op_identify),
         "reset_dut": Op(args={},
-                        doc="Send 'r' to assert D13 reset on the DUT.",
+                        doc="Send 'r' to pulse D13 LOW for 100 ms -- "
+                            "resets the EVB STM32MP135.",
                         run=_op_reset_dut),
+        "reset_dut2": Op(args={},
+                         doc="Send 'R' to pulse D12 LOW for 100 ms -- "
+                             "resets the custom STM32MP135 PCB.",
+                         run=_op_reset_dut2),
         "send": Op(args={"data": "str"},
                    doc=("Send arbitrary bytes (escapes decoded: "
                         "\\r \\n \\0 \\xNN), drain reply into stream "
                         "bench_mcu.send.  Use for help ('h'), version "
-                        "('v'), any one-shot bench-MCU command."),
+                        "('v'), or any other one-shot command the "
+                        "sketch supports."),
                    run=_op_send),
     }
 
