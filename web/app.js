@@ -523,7 +523,8 @@ $("#prune-jobs").addEventListener("click", async () => {
   const stale = state.jobs.filter(
     j => j.status === "running" && !j.completed_at).length;
   if (!confirm(
-    `Clear ${stale} 'running' job(s) with no artefact on the server?`)) {
+    `Clear ${stale} 'running' job(s) with no artefact on the server?\n` +
+    `(Queued and done jobs are NOT touched.)`)) {
     return;
   }
   try {
@@ -536,6 +537,31 @@ $("#prune-jobs").addEventListener("click", async () => {
     console.log("prune:", data);
   } catch (e) {
     alert(`prune error: ${e.message}`);
+  } finally {
+    refresh();
+  }
+});
+
+$("#wipe-jobs").addEventListener("click", async () => {
+  const total = state.jobs.length;
+  if (!confirm(
+    `WIPE ${total} job(s)? This drops every queued plan, every running\n` +
+    `record, and EVERY ARTEFACT on the server. Cannot be undone.\n\n` +
+    `(Currently-running sessions are not force-cancelled; they will\n` +
+    `still post their artefact when finished. Use per-job cancel for\n` +
+    `that.)`)) {
+    return;
+  }
+  try {
+    const r = await fetch("/jobs/all", { method: "DELETE" });
+    if (!r.ok) {
+      alert(`wipe failed: ${r.status}`);
+      return;
+    }
+    const data = await r.json();
+    console.log("wipe:", data);
+  } catch (e) {
+    alert(`wipe error: ${e.message}`);
   } finally {
     refresh();
   }

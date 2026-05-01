@@ -100,6 +100,11 @@ section h2 {
   font-weight: normal;
 }
 
+.header-btn-danger:hover {
+  border-color: var(--err);
+  color: var(--err);
+}
+
 table {
   width: 100%;
   border-collapse: collapse;

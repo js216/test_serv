@@ -227,6 +227,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._delete_outputs(path[len("outputs/"):])
         if path == "jobs":
             return self._prune_stale_jobs()
+        if path == "jobs/all":
+            return self._wipe_all_jobs()
         m = re.match(r"^jobs/([0-9a-f]{64})$", path)
         if m:
             return self._cancel_job(m.group(1))
@@ -656,6 +658,31 @@ class Handler(BaseHTTPRequestHandler):
             pass
         return self._send_json(
             json.dumps({"status": "ok", "removed": removed}).encode())
+
+    def _wipe_all_jobs(self):
+        """Nuke INPUTS, DONE, OUTPUTS, and CANCEL. Drops every job
+        record the server has -- queued, running, done. A poller
+        currently dispatching a job will still post the artefact
+        when its session ends; that re-introduces the digest as
+        a fresh `done` entry. This endpoint is just history reset,
+        NOT a force-cancel; use the per-job cancel button to
+        actually abort an in-flight session.
+        """
+        counts = {"inputs": 0, "done": 0, "outputs": 0, "cancel": 0}
+        for label, d in (("inputs", INPUTS), ("done", DONE),
+                         ("outputs", OUTPUTS), ("cancel", CANCEL)):
+            try:
+                names = list(os.listdir(d))
+            except FileNotFoundError:
+                continue
+            for n in names:
+                try:
+                    os.unlink(os.path.join(d, n))
+                    counts[label] += 1
+                except (FileNotFoundError, IsADirectoryError):
+                    pass
+        return self._send_json(
+            json.dumps({"status": "ok", **counts}).encode())
 
     def _pull_cancels(self):
         """Return the current set of cancel markers and remove them.
