@@ -233,8 +233,13 @@ function renderDevices() {
       ? el("span", { class: "tag-warn", title: leaseTok }, "leased")
       : el("span", { class: "tag-unset" }, "—");
 
+    const desc = d.spec && d.spec.description;
+    const idCell = el("td", { class: "mono" }, d.id);
+    if (desc) {
+      idCell.appendChild(el("div", { class: "device-desc" }, desc));
+    }
     tbody.appendChild(el("tr", {},
-      el("td", { class: "mono" }, d.id),
+      idCell,
       el("td", {}, d.plugin),
       el("td", { class: "mono" }, describeLoc(d.spec)),
       el("td", {}, verifyCell(v)),

@@ -1,4 +1,7 @@
-# Flash MP135 via DFU using a multi-partition TSV flashlayout.
+# Flash an MP135 via DFU using a multi-partition TSV flashlayout.
+# Targets the EVB by default; for the custom board, replace `.evb`
+# with `.custom` everywhere.
+#
 # Submit with:
 #   python3 submit.py mp135_flash_layout.plan \
 #     --blob flash.tsv=flash.tsv \
@@ -15,15 +18,15 @@
 #   -   0x03    ssbl-boot    Binary     none    0x0    @u-boot-nodtb.bin
 #   P   0x10    sdcard       RawImage   mmc0    0x0    @sdcard.img
 
-dfu:list
-dfu:flash_layout layout=@flash.tsv
+dfu.evb:list
+dfu.evb:flash_layout layout=@flash.tsv
 
 # After flashing, hold for the STLink console to show the signs of life.
 # (Assumes the board auto-boots from the freshly written partitions;
 # if your workflow needs a bench_mcu:reset_dut first, add it here.)
 bench_mcu:reset_dut
-mp135:uart_open
-mp135:uart_expect sentinel="Starting kernel" timeout_ms=60000
-mp135:uart_expect sentinel="login:"           timeout_ms=60000
-mp135:uart_close
+mp135.evb:uart_open
+mp135.evb:uart_expect sentinel="Starting kernel" timeout_ms=60000
+mp135.evb:uart_expect sentinel="login:"           timeout_ms=60000
+mp135.evb:uart_close
 mark tag=boot_done
