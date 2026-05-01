@@ -239,6 +239,103 @@ textarea {
 
 #submit-result:empty { display: none; }
 
+.artefact-header {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 8px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.artefact-digest {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.artefact-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 11px;
+  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border-radius: 3px;
+}
+
+.artefact-link:hover {
+  border-color: var(--accent);
+}
+
+.artefact-delete {
+  margin-left: auto;
+}
+
+#submit-result details {
+  margin: 6px 0;
+}
+
+#submit-result summary {
+  cursor: pointer;
+  color: var(--fg-dim);
+  font-size: 11px;
+  padding: 2px 0;
+  user-select: none;
+}
+
+.artefact-text {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  padding: 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  white-space: pre;
+  max-height: 360px;
+  overflow: auto;
+  margin: 4px 0;
+}
+
+.artefact-files {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+
+.artefact-file-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 2px 0;
+}
+
+.artefact-file-name {
+  color: var(--fg);
+  flex: 1;
+  font-size: 12px;
+}
+
+.artefact-file-size {
+  color: var(--fg-dim);
+  font-size: 11px;
+  min-width: 60px;
+  text-align: right;
+}
+
+.artefact-viewer {
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+
+.artefact-viewer-header {
+  display: flex;
+  justify-content: space-between;
+  font-size: 11px;
+  color: var(--fg-dim);
+  margin-bottom: 4px;
+}
+
 .hint {
   color: var(--fg-dim);
   font-size: 11px;
