@@ -89,6 +89,15 @@ section h2 {
   letter-spacing: 1px;
   color: var(--fg-dim);
   font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.header-btn {
+  text-transform: none;
+  letter-spacing: 0;
+  font-weight: normal;
 }
 
 table {

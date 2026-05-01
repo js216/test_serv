@@ -519,6 +519,28 @@ $("#submit-plan-btn").addEventListener("click", async () => {
 
 $("#refresh-now").addEventListener("click", refresh);
 
+$("#prune-jobs").addEventListener("click", async () => {
+  const stale = state.jobs.filter(
+    j => j.status === "running" && !j.completed_at).length;
+  if (!confirm(
+    `Clear ${stale} 'running' job(s) with no artefact on the server?`)) {
+    return;
+  }
+  try {
+    const r = await fetch("/jobs", { method: "DELETE" });
+    if (!r.ok) {
+      alert(`prune failed: ${r.status}`);
+      return;
+    }
+    const data = await r.json();
+    console.log("prune:", data);
+  } catch (e) {
+    alert(`prune error: ${e.message}`);
+  } finally {
+    refresh();
+  }
+});
+
 $("#run-inventory").addEventListener("click", async () => {
   const btn = $("#run-inventory");
   // Embed a timestamp in a comment so the plan body's SHA256 differs

@@ -139,6 +139,17 @@ def delete_outputs(digest, ext=""):
             removed += 1
         except FileNotFoundError:
             pass
+    # When the caller drops *all* outputs for a digest (no specific
+    # ext), also clear the DONE/<digest>.plan record. Otherwise the
+    # job sits in the listing as "running" forever -- the poller
+    # picked it up at some point and the .plan stayed in DONE even
+    # though everyone else has forgotten about it.
+    if not ext:
+        for tail in (".plan", ".plan.meta"):
+            try:
+                os.remove(os.path.join(DONE, f"{digest}{tail}"))
+            except FileNotFoundError:
+                pass
     return removed
 
 
@@ -214,6 +225,8 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.lstrip("/")
         if path.startswith("outputs/"):
             return self._delete_outputs(path[len("outputs/"):])
+        if path == "jobs":
+            return self._prune_stale_jobs()
         m = re.match(r"^jobs/([0-9a-f]{64})$", path)
         if m:
             return self._cancel_job(m.group(1))
@@ -600,6 +613,49 @@ class Handler(BaseHTTPRequestHandler):
         # cancel.
         self.send_response(404)
         self.end_headers()
+
+    def _prune_stale_jobs(self):
+        """Remove DONE/<digest>.plan files whose digests have no
+        OUTPUTS. These are the "running forever" entries -- the
+        poller picked the job up at some point but no artefact is
+        on the server (either the agent already DELETE'd it after
+        fetching, or the poller crashed / restarted before posting).
+        Currently-truly-running jobs have no OUTPUTS yet and would
+        also match; the brief blip of disappearing from the listing
+        until the artefact arrives is harmless -- the poller doesn't
+        reference DONE/.plan after pickup.
+        """
+        have_output = set()
+        try:
+            for n in os.listdir(OUTPUTS):
+                d, _ = os.path.splitext(n)
+                if SAFE_DIGEST_RE.match(d):
+                    have_output.add(d)
+        except FileNotFoundError:
+            pass
+        removed = 0
+        try:
+            for n in list(os.listdir(DONE)):
+                if not n.endswith(".plan"):
+                    continue
+                digest = n[:-5]
+                if not SAFE_DIGEST_RE.match(digest):
+                    continue
+                if digest in have_output:
+                    continue
+                try:
+                    os.unlink(os.path.join(DONE, n))
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                try:
+                    os.unlink(os.path.join(DONE, f"{digest}.plan.meta"))
+                except FileNotFoundError:
+                    pass
+        except FileNotFoundError:
+            pass
+        return self._send_json(
+            json.dumps({"status": "ok", "removed": removed}).encode())
 
     def _pull_cancels(self):
         """Return the current set of cancel markers and remove them.
