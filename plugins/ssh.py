@@ -200,6 +200,7 @@ class SshPlugin(DevicePlugin):
                 "key": key,
                 "known_hosts": known_hosts,
                 "expected_uname": inst.get("expected_uname"),
+                "description": inst.get("description"),
             })
         return out
 

@@ -383,6 +383,7 @@ class DfuPlugin(DevicePlugin):
                 "cubeprog_exe": cubeprog,
                 "usb_index": inst.get("usb_index", "usb1"),
                 "usb_serial": expect_serial,
+                "description": inst.get("description"),
             })
         return out
 

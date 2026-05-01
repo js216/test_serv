@@ -154,6 +154,7 @@ class Mp135Plugin(DevicePlugin):
                 "expected_usb_pid": inst.get("expected_usb_pid"),
                 "expected_usb_serial": inst.get("expected_usb_serial"),
                 "expected_usb_interface": inst.get("expected_usb_interface"),
+                "description": inst.get("description"),
             })
         return out
 

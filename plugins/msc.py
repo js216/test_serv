@@ -203,6 +203,7 @@ class MscPlugin(DevicePlugin):
                 "usb_vid": usb_vid,
                 "usb_pid": usb_pid,
                 "usb_serial": usb_serial,
+                "description": inst.get("description"),
             })
         return out
 

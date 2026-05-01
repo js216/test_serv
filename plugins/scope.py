@@ -192,6 +192,7 @@ class ScopePlugin(DevicePlugin):
                 "id": inst.get("id", "0"),
                 "resource": res,
                 "expected_idn": inst.get("expected_idn"),
+                "description": inst.get("description"),
             })
         return out
 
