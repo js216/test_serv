@@ -7,6 +7,7 @@ import json
 import os
 import signal
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -85,14 +86,28 @@ def _meta_float(headers, key, default, hard_max):
 
 
 def _write_atomic(path, data):
-    tmp = f"{path}.tmp"
-    with open(tmp, "wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    # os.replace is atomic on POSIX and overwrites-if-exists on Windows
-    # (unlike os.rename, which raises FileExistsError on Windows).
-    os.replace(tmp, path)
+    # Unique tempfile per call so concurrent writers (the periodic
+    # _publish_status from the main loop and on-demand calls from
+    # session worker threads) don't collide on a shared "<path>.tmp"
+    # name -- the second one would FileNotFoundError when its tmp got
+    # renamed away by the first.
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(
+        dir=d, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        # os.replace is atomic on POSIX and overwrites-if-exists on
+        # Windows (unlike os.rename, which raises FileExistsError).
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _push_status(name, body):

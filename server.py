@@ -10,6 +10,7 @@ import os
 import random
 import re
 import tarfile
+import tempfile
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
@@ -65,12 +66,25 @@ def _read_file(path):
 
 
 def _write_atomic(path, body):
-    tmp = f"{path}.inprogress"
-    with open(tmp, "wb") as f:
-        f.write(body)
-        f.flush()
-        os.fsync(f.fileno())
-    os.rename(tmp, path)
+    # Unique tempfile per call so concurrent writers don't collide on a
+    # shared "<path>.inprogress" name; ThreadingHTTPServer dispatches
+    # multiple POST /status/<...> in parallel, and the second would
+    # FileNotFoundError when its tmp got renamed away by the first.
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(
+        dir=d, prefix=os.path.basename(path) + ".", suffix=".inprogress")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def queue_job(body, meta=None):
