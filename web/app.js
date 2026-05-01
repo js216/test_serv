@@ -232,9 +232,7 @@ function renderInventory() {
 async function submitPlanText(text, meta = {}, btn) {
   if (btn) btn.disabled = true;
   const out = $("#submit-result");
-  if (out) {
-    out.textContent = "submitting...\n";
-  }
+  if (out) out.innerHTML = "<div class='hint'>submitting...</div>";
   try {
     const headers = { "Content-Type": "text/plain" };
     for (const [k, v] of Object.entries(meta)) {
@@ -249,42 +247,31 @@ async function submitPlanText(text, meta = {}, btn) {
     }
     const digest = data.digest;
     if (out) {
-      out.textContent = `submitted: ${digest}\nwaiting...\n`;
+      out.innerHTML =
+        `<div class='hint'>submitted ${digest.slice(0, 12)}… waiting…</div>`;
     }
     const result = await waitForArtefact(digest);
-    if (out) {
-      out.textContent =
-        `submitted: ${digest}\nstatus: ${result.status}\n\n` +
-        `--- sentinel ---\n${result.txt || "(none)"}\n` +
-        (result.tarSummary ? `\n--- tar ---\n${result.tarSummary}\n` : "");
-    }
+    await renderArtefact(digest, result);
     refresh();
     return { digest, ...result };
   } catch (e) {
-    if (out) out.textContent = `error: ${e.message}\n`;
+    if (out) out.innerHTML = `<div class='tag-err'>error: ${escapeHtml(e.message)}</div>`;
     throw e;
   } finally {
     if (btn) btn.disabled = false;
   }
 }
 
+// Poll for the .txt sentinel. Does NOT delete -- the artefact stays on
+// the server so the user can browse files in the tarball afterwards.
+// They can click the "delete" button in the result panel to clean up.
 async function waitForArtefact(digest) {
   const deadline = Date.now() + SUBMIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
     const r = await fetch(`/outputs/${digest}.txt`, { cache: "no-store" });
     if (r.ok) {
       const txt = await r.text();
-      let tarSummary = "";
-      try {
-        const tr = await fetch(`/outputs/${digest}.tar`, { cache: "no-store" });
-        if (tr.ok) {
-          const sz = (await tr.blob()).size;
-          tarSummary = `${sz} bytes`;
-        }
-      } catch (_) {}
-      // Best-effort cleanup -- the agent's only fetch.
-      fetch(`/outputs/${digest}`, { method: "DELETE" }).catch(() => {});
-      return { status: "done", txt, tarSummary };
+      return { status: "done", txt };
     }
     if (r.status !== 404) {
       throw new Error(`artefact poll: ${r.status}`);
@@ -292,6 +279,136 @@ async function waitForArtefact(digest) {
     await sleep(SUBMIT_POLL_MS);
   }
   return { status: "timeout" };
+}
+
+async function renderArtefact(digest, result) {
+  const out = $("#submit-result");
+  if (!out) return;
+  out.innerHTML = "";
+
+  const header = el("div", { class: "artefact-header" },
+    el("span", { class: "artefact-digest", title: digest },
+      digest.slice(0, 12) + "…"),
+    el("span", {},
+      result.status === "done"
+        ? el("span", { class: "tag-ok" }, "done")
+        : el("span", { class: "tag-err" }, result.status)),
+    el("a", {
+      href: `/outputs/${digest}.tar`,
+      download: `${digest}.tar`,
+      class: "artefact-link",
+    }, "download tar"),
+    el("button", {
+      type: "button",
+      class: "artefact-delete",
+      onclick: async () => {
+        if (!confirm(`Delete artefact ${digest.slice(0, 12)}… ?`)) return;
+        await fetch(`/outputs/${digest}`, { method: "DELETE" });
+        out.innerHTML = "<div class='hint'>deleted.</div>";
+      },
+    }, "delete"),
+  );
+  out.appendChild(header);
+
+  if (result.txt) {
+    const sentinelDetails = el("details", { open: "" });
+    sentinelDetails.appendChild(el("summary", {}, "sentinel"));
+    sentinelDetails.appendChild(el("pre", { class: "artefact-text" }, result.txt));
+    out.appendChild(sentinelDetails);
+  }
+
+  const filesDetails = el("details", { open: "" });
+  filesDetails.appendChild(el("summary", {}, "files in tar"));
+  const fileBox = el("div", { class: "artefact-files" });
+  filesDetails.appendChild(fileBox);
+  out.appendChild(filesDetails);
+
+  const viewer = el("div", { class: "artefact-viewer hidden" });
+  out.appendChild(viewer);
+
+  let manifest = [];
+  try {
+    const r = await fetch(`/outputs/${digest}/manifest`, { cache: "no-store" });
+    if (!r.ok) throw new Error(`manifest: ${r.status}`);
+    manifest = await r.json();
+  } catch (e) {
+    fileBox.appendChild(el("div", { class: "tag-err" },
+      `failed to read manifest: ${e.message}`));
+    return;
+  }
+
+  if (!manifest.length) {
+    fileBox.appendChild(el("div", { class: "hint" }, "(empty tar)"));
+    return;
+  }
+
+  for (const f of manifest) {
+    const row = el("div", { class: "artefact-file-row" },
+      el("span", { class: "mono artefact-file-name" }, f.name),
+      el("span", { class: "artefact-file-size" }, `${f.size}B`),
+      el("button", {
+        type: "button",
+        onclick: () => viewArtefactFile(digest, f, viewer),
+      }, "view"),
+      el("a", {
+        href: `/outputs/${digest}/file/${f.name}`,
+        download: f.name.replace(/[\\/]/g, "_"),
+        class: "artefact-link",
+      }, "download"),
+    );
+    fileBox.appendChild(row);
+  }
+}
+
+const TEXT_EXT_RE = /\.(log|jsonl|json|txt|tsv|plan)$/i;
+const VIEW_BYTES_MAX = 256 * 1024;
+
+async function viewArtefactFile(digest, member, viewer) {
+  viewer.classList.remove("hidden");
+  viewer.innerHTML = `<div class='hint'>loading ${escapeHtml(member.name)}…</div>`;
+  try {
+    const r = await fetch(`/outputs/${digest}/file/${member.name}`,
+                          { cache: "no-store" });
+    if (!r.ok) throw new Error(`fetch: ${r.status}`);
+    const buf = await r.arrayBuffer();
+    const isText = TEXT_EXT_RE.test(member.name);
+    let body;
+    if (isText) {
+      const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+      body = el("pre", { class: "artefact-text" },
+        text.length > VIEW_BYTES_MAX
+          ? text.slice(0, VIEW_BYTES_MAX) + `\n\n[truncated; ${text.length} chars total]`
+          : text);
+    } else {
+      // Binary: try utf-8 first; if it has too many replacement chars,
+      // fall back to a hex dump of the head.
+      const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
+      const replacementRatio = (text.match(/�/g) || []).length / Math.max(1, text.length);
+      if (replacementRatio < 0.05 && buf.byteLength <= VIEW_BYTES_MAX) {
+        body = el("pre", { class: "artefact-text" }, text);
+      } else {
+        const head = new Uint8Array(buf, 0, Math.min(buf.byteLength, 1024));
+        const hex = Array.from(head)
+          .map((b, i) => (i % 16 === 15 ? b.toString(16).padStart(2, "0") + "\n" : b.toString(16).padStart(2, "0") + " "))
+          .join("");
+        body = el("pre", { class: "artefact-text" },
+          `(binary; first ${head.length}/${buf.byteLength} bytes)\n\n` + hex);
+      }
+    }
+    viewer.innerHTML = "";
+    viewer.appendChild(el("div", { class: "artefact-viewer-header" },
+      el("span", { class: "mono" }, member.name),
+      el("span", {}, `${buf.byteLength}B`)));
+    viewer.appendChild(body);
+  } catch (e) {
+    viewer.innerHTML = `<div class='tag-err'>${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

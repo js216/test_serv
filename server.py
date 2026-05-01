@@ -147,6 +147,15 @@ class Handler(BaseHTTPRequestHandler):
             return self._list_examples()
         if path.startswith("examples/"):
             return self._fetch_example(path[len("examples/"):])
+        # Artefact tar extraction endpoints (web UI). Order matters:
+        # manifest and file before the bare /outputs/<digest>.<ext>
+        # fetch, since they're more specific.
+        m = re.match(r"^outputs/([0-9a-f]{64})/manifest$", path)
+        if m:
+            return self._outputs_manifest(m.group(1))
+        m = re.match(r"^outputs/([0-9a-f]{64})/file/(.+)$", path)
+        if m:
+            return self._outputs_file(m.group(1), m.group(2))
         if path.startswith("outputs/"):
             return self._fetch_output(path[len("outputs/"):])
         if path == "scope/signals":
@@ -259,6 +268,64 @@ class Handler(BaseHTTPRequestHandler):
         os.makedirs(STATUS, mode=0o700, exist_ok=True)
         _write_atomic(os.path.join(STATUS, name), body)
         self._send_json(b'{"status":"ok"}')
+
+    # --- Browse an artefact tarball (web UI) ---
+
+    def _outputs_manifest(self, digest):
+        tar_path = os.path.join(OUTPUTS, f"{digest}.tar")
+        if not os.path.exists(tar_path):
+            self.send_response(404); self.end_headers(); return
+        members = []
+        try:
+            with tarfile.open(tar_path, "r") as tf:
+                for m in tf.getmembers():
+                    if m.isfile():
+                        members.append({"name": m.name, "size": m.size})
+        except (tarfile.TarError, OSError) as e:
+            self.send_response(500); self.end_headers()
+            self.wfile.write(f"tar parse error: {e}".encode())
+            return
+        return self._send_json(json.dumps(members).encode())
+
+    def _outputs_file(self, digest, member):
+        # Reject obvious path-traversal attempts. tarfile.getmember will
+        # only return members that actually exist in the archive, so the
+        # belt is enough; this is the suspenders.
+        if ".." in member.split("/") or member.startswith("/"):
+            self.send_response(400); self.end_headers(); return
+        tar_path = os.path.join(OUTPUTS, f"{digest}.tar")
+        if not os.path.exists(tar_path):
+            self.send_response(404); self.end_headers(); return
+        try:
+            with tarfile.open(tar_path, "r") as tf:
+                ti = tf.getmember(member)
+                if not ti.isfile():
+                    self.send_response(400); self.end_headers(); return
+                fobj = tf.extractfile(ti)
+                data = fobj.read() if fobj is not None else b""
+        except KeyError:
+            self.send_response(404); self.end_headers(); return
+        except (tarfile.TarError, OSError) as e:
+            self.send_response(500); self.end_headers()
+            self.wfile.write(f"tar read error: {e}".encode())
+            return
+        # Best-effort content-type. Browser-side renderer treats anything
+        # text/* as inline, application/octet-stream as download.
+        text_exts = (".log", ".jsonl", ".txt", ".tsv", ".plan")
+        ext = os.path.splitext(member)[1].lower()
+        if member.endswith(".json"):
+            ctype = "application/json"
+        elif ext in text_exts:
+            ctype = "text/plain; charset=utf-8"
+        else:
+            ctype = "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition",
+                         f'inline; filename="{os.path.basename(member)}"')
+        self.end_headers()
+        self.wfile.write(data)
 
     # --- GET / + GET /web/<file> -- static UI ---
 
