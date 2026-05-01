@@ -61,7 +61,8 @@
   "msc": {
     "instances": [
       {
-        "id": "mp135",
+        "id": "evb",
+        "description": "STM32MP135F-DK eval board's bare-metal MSC bootloader (visible only after DFU-flashing main.stm32). iSerial 385836733232.",
         "usb_vid": "0x0483",
         "usb_pid": "0x571d",
         "usb_serial": "385836733232",
@@ -74,11 +75,18 @@
     "cubeprog_exe": "/home/jk/projects/prog/stm32cubeprog/bin/STM32_Programmer_CLI",
     "instances": [
       {
-        "id": "mp135",
+        "id": "evb",
+        "description": "STM32MP135F-DK eval board's ROM DFU bootloader. iSerial 002800423232511538303631 is fixed-per-chip (derived from the SoC's factory unique ID).",
         "usb_vid": "0x0483",
         "usb_pid": "0xDF11",
-        "usb_serial": "002800423232511538303631",
-        "usb_index": "usb1"
+        "usb_serial": "002800423232511538303631"
+      },
+      {
+        "id": "custom",
+        "description": "Custom STM32MP135 PCB's ROM DFU bootloader. iSerial 001E00063133511332303636.",
+        "usb_vid": "0x0483",
+        "usb_pid": "0xDF11",
+        "usb_serial": "001E00063133511332303636"
       }
     ]
   },
