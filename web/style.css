@@ -129,16 +129,8 @@ td {
 
 tr:hover td { background: var(--bg-row); }
 
-.device-desc {
-  font-family: var(--mono);
-  font-size: 11px;
-  color: var(--fg-dim);
-  font-weight: normal;
-  white-space: normal;
-  max-width: 480px;
-  margin-top: 2px;
-  font-style: italic;
-}
+tr.has-tooltip { cursor: help; }
+tr.has-tooltip:hover { background: var(--bg-row); }
 
 .tag-ok    { color: var(--ok); }
 .tag-warn  { color: var(--warn); }
