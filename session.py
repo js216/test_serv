@@ -8,14 +8,16 @@ import tarfile
 import threading
 import time
 import traceback
+import uuid
 from datetime import datetime
 
 from plan import PlanError
 from plugin import Op as OpSchema
-from plugin import decode_args, DeviceLostError
+from plugin import BusyError, decode_args, DeviceLostError
 
 
-MAX_SESSION_S = 600.0
+DEFAULT_SESSION_S = 600.0
+MAX_SESSION_S = 3600.0
 
 
 class Stream:
@@ -73,6 +75,11 @@ class Session:
         self.errors = []
         self.lock = threading.Lock()
         self.early_done = False
+        self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
+        # Set by a leading lease:resume op or minted by the first lease:claim;
+        # gates session lock acquisition against the registry's lease registry
+        # so other agents can't acquire devices we're holding across sessions.
+        self.lease_token = None
 
     # --- timeline recording ---
 
@@ -95,10 +102,41 @@ class Session:
         self.early_done = True
         self.log_event("CTRL", "session", f"early_done: {reason}")
 
+    def _prescan_lease_resume(self):
+        """If the plan starts with ``lease:resume token=...``, take over
+        that token's lease before any locks are acquired so the lease
+        gate treats us as the owner.  Anything past op 0 is ignored to
+        keep the contract simple: resume must be the first op.
+        """
+        if not self.plan.ops:
+            return
+        op = self.plan.ops[0]
+        if op.device != "lease" or op.verb != "resume":
+            return
+        tok = op.args.get("token")
+        if tok is None:
+            raise PlanError("lease:resume requires token=...")
+        token = tok.raw if hasattr(tok, "raw") else str(tok)
+        held = self.registry.lease_resume(token)
+        if held is None:
+            raise BusyError(
+                f"lease {token!r} is unknown or expired; cannot resume")
+        self.lease_token = token
+        self.log_event(
+            "LEASE", "session",
+            f"resume token={token!r} devices={sorted(held)}")
+
     # --- execution ---
 
     def run_all(self, plugins):
-        deadline = self.t0 + MAX_SESSION_S
+        # Agent picks down via X-Test-Runtime, bench enforces up via
+        # MAX_SESSION_S so a rogue agent can't camp on a device.
+        budget_s = min(self.runtime_s or DEFAULT_SESSION_S, MAX_SESSION_S)
+        deadline = self.t0 + budget_s
+        # Pre-scan for `lease:resume token=...` so the lease gate below
+        # treats this session as the lease's owner. Validation (token
+        # exists / not expired) runs again at op time as a safety net.
+        self._prescan_lease_resume()
         # Job-atomic device locking: grab every device the plan
         # references up front and hold the locks for the whole session.
         # A job that needs {dsp, fpga} therefore pauses any other job
@@ -140,8 +178,36 @@ class Session:
             f"acquire now={eager_keys}  "
             f"deferred={sorted(self._deferred_names)}"
             if eager_keys or self._deferred_names else "(no devices)")
-        for lk in eager_locks:
-            lk.acquire()
+        # Pre-flight lease check: refuse fast if any required device is
+        # leased to a different agent. Cheap; the post-acquire re-check
+        # below closes the race window where someone leases between
+        # this peek and our lock grab.
+        eager_acquired = []
+        try:
+            for k in eager_keys:
+                blocker = self.registry.lease_blocks_us(k, self.lease_token)
+                if blocker is not None:
+                    raise BusyError(
+                        f"{k} is leased to {blocker!r}; resume that lease "
+                        f"or wait for it to expire")
+            for lk, k in zip(eager_locks, eager_keys):
+                lk.acquire()
+                eager_acquired.append(lk)
+                blocker = self.registry.lease_blocks_us(k, self.lease_token)
+                if blocker is not None:
+                    raise BusyError(
+                        f"{k} was leased to {blocker!r} between pre-flight "
+                        f"and lock acquire")
+        except Exception:
+            for held in reversed(eager_acquired):
+                held.release()
+            self.errors.append(traceback.format_exc())
+            self.log_event(
+                "ERROR", "session",
+                f"lock acquire: {self.errors[-1].splitlines()[-1]}")
+            for s in self.streams.values():
+                s.close()
+            return
         self.log_event("LOCK", "session", "acquired; running ops")
         try:
             self._run_block(self.plan.ops, plugins, deadline)
@@ -176,7 +242,8 @@ class Session:
         for op in ops:
             if time.monotonic() > deadline:
                 self.log_event("ERROR", "session",
-                               f"session exceeded {MAX_SESSION_S}s")
+                               f"session exceeded {deadline - self.t0:.0f}s "
+                               f"deadline")
                 return
             if self.early_done:
                 return
@@ -226,10 +293,21 @@ class Session:
             key = self.registry.resolve(plugin_name)
 
         if plugin_name in getattr(self, "_deferred_names", set()):
+            blocker = self.registry.lease_blocks_us(key, self.lease_token)
+            if blocker is not None:
+                raise BusyError(
+                    f"{key} is leased to {blocker!r}; resume that lease "
+                    f"or wait for it to expire")
             with self.registry.lock:
                 lk = self.registry.per_dev_lock.setdefault(
                     key, threading.RLock())
             lk.acquire()
+            blocker = self.registry.lease_blocks_us(key, self.lease_token)
+            if blocker is not None:
+                lk.release()
+                raise BusyError(
+                    f"{key} was leased to {blocker!r} between pre-flight "
+                    f"and lock acquire")
             self._deferred_locks.append(lk)
             self._deferred_names.discard(plugin_name)
             self.log_event("LOCK", "session",

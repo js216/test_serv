@@ -233,12 +233,23 @@ def required_devices(plan):
     """Return the set of plugin names referenced by any op in the plan
     (including fork bodies). Used by the poller for parallelization:
     jobs whose device sets are disjoint can run concurrently.
+
+    ``lease:claim device=foo.bar duration_s=...`` also pulls ``foo``
+    into the set so the session pre-locks it; the lease op needs to
+    hold that device's per_dev_lock when it adds the entry to the
+    registry's lease table.
     """
     out = set()
     def walk(ops):
         for op in ops:
             if op.device is not None:
                 out.add(op.device)
+            if op.device == "lease" and op.verb == "claim":
+                d = op.args.get("device")
+                if d is not None:
+                    raw = d.raw if hasattr(d, "raw") else str(d)
+                    if "." in raw:
+                        out.add(raw.split(".", 1)[0])
             walk(op.body)
     walk(plan.ops)
     return out
