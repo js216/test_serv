@@ -344,9 +344,6 @@ async function renderArtefact(digest, result) {
   filesDetails.appendChild(fileBox);
   out.appendChild(filesDetails);
 
-  const viewer = el("div", { class: "artefact-viewer hidden" });
-  out.appendChild(viewer);
-
   let manifest = [];
   try {
     const r = await fetch(`/outputs/${digest}/manifest`, { cache: "no-store" });
@@ -367,9 +364,11 @@ async function renderArtefact(digest, result) {
     const row = el("div", { class: "artefact-file-row" },
       el("span", { class: "mono artefact-file-name" }, f.name),
       el("span", { class: "artefact-file-size" }, `${f.size}B`),
-      el("button", {
-        type: "button",
-        onclick: () => viewArtefactFile(digest, f, viewer),
+      el("a", {
+        href: `/outputs/${digest}/file/${f.name}`,
+        target: "_blank",
+        rel: "noopener",
+        class: "artefact-link",
       }, "view"),
       el("a", {
         href: `/outputs/${digest}/file/${f.name}`,
@@ -378,51 +377,6 @@ async function renderArtefact(digest, result) {
       }, "download"),
     );
     fileBox.appendChild(row);
-  }
-}
-
-const TEXT_EXT_RE = /\.(log|jsonl|json|txt|tsv|plan)$/i;
-const VIEW_BYTES_MAX = 256 * 1024;
-
-async function viewArtefactFile(digest, member, viewer) {
-  viewer.classList.remove("hidden");
-  viewer.innerHTML = `<div class='hint'>loading ${escapeHtml(member.name)}…</div>`;
-  try {
-    const r = await fetch(`/outputs/${digest}/file/${member.name}`,
-                          { cache: "no-store" });
-    if (!r.ok) throw new Error(`fetch: ${r.status}`);
-    const buf = await r.arrayBuffer();
-    const isText = TEXT_EXT_RE.test(member.name);
-    let body;
-    if (isText) {
-      const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
-      body = el("pre", { class: "artefact-text" },
-        text.length > VIEW_BYTES_MAX
-          ? text.slice(0, VIEW_BYTES_MAX) + `\n\n[truncated; ${text.length} chars total]`
-          : text);
-    } else {
-      // Binary: try utf-8 first; if it has too many replacement chars,
-      // fall back to a hex dump of the head.
-      const text = new TextDecoder("utf-8", { fatal: false }).decode(buf);
-      const replacementRatio = (text.match(/�/g) || []).length / Math.max(1, text.length);
-      if (replacementRatio < 0.05 && buf.byteLength <= VIEW_BYTES_MAX) {
-        body = el("pre", { class: "artefact-text" }, text);
-      } else {
-        const head = new Uint8Array(buf, 0, Math.min(buf.byteLength, 1024));
-        const hex = Array.from(head)
-          .map((b, i) => (i % 16 === 15 ? b.toString(16).padStart(2, "0") + "\n" : b.toString(16).padStart(2, "0") + " "))
-          .join("");
-        body = el("pre", { class: "artefact-text" },
-          `(binary; first ${head.length}/${buf.byteLength} bytes)\n\n` + hex);
-      }
-    }
-    viewer.innerHTML = "";
-    viewer.appendChild(el("div", { class: "artefact-viewer-header" },
-      el("span", { class: "mono" }, member.name),
-      el("span", {}, `${buf.byteLength}B`)));
-    viewer.appendChild(body);
-  } catch (e) {
-    viewer.innerHTML = `<div class='tag-err'>${escapeHtml(e.message)}</div>`;
   }
 }
 

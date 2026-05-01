@@ -322,19 +322,6 @@ textarea {
   text-align: right;
 }
 
-.artefact-viewer {
-  margin-top: 12px;
-  border-top: 1px solid var(--border);
-  padding-top: 8px;
-}
-
-.artefact-viewer-header {
-  display: flex;
-  justify-content: space-between;
-  font-size: 11px;
-  color: var(--fg-dim);
-  margin-bottom: 4px;
-}
 
 .hint {
   color: var(--fg-dim);
