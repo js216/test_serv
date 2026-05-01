@@ -36,7 +36,7 @@
     "instances": [
       {
         "id": "evb",
-        "description": "STM32MP135F-DK eval board. UART comes out on the on-board STLink-V3 VCP (interface 1). Paired with dfu.mp135 and msc.mp135.",
+        "description": "STM32MP135F-DK eval board. UART comes out on the on-board STLink-V3 VCP (interface 1). Paired with dfu.evb and msc.evb.",
         "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1 },
         "baudrate": 115200,
 

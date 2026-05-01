@@ -155,9 +155,12 @@ def _op_verify(session, h, args):
 
 class MscPlugin(DevicePlugin):
     name = "msc"
-    doc = ("USB Mass Storage Class block-device writer. Probes for a "
+    doc = ("USB Mass Storage Class block-device I/O. Probes for a "
            "configured VID/PID/iSerial, resolves the backing /dev/sdX, "
-           "and writes or verifies blobs at LBA offsets.")
+           "and exposes write / read / verify ops at arbitrary LBA "
+           "offsets. Refuses any write if a partition under the device "
+           "is currently mounted, so a stray host-side automount can't "
+           "let the bench corrupt the agent's data.")
 
     ops = {
         "write": Op(

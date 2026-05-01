@@ -30,7 +30,7 @@ def _resolve_device_arg(args, registry):
       * a plain plugin name (e.g. ``mp135``)  -- must currently
         resolve to a unique instance via registry.resolve; lease
         applies to that resolved key.
-      * a fully-qualified ``plugin.id`` key (e.g. ``msc.mp135``) --
+      * a fully-qualified ``plugin.id`` key (e.g. ``msc.evb``) --
         the *plugin* must be loaded but the instance does NOT need
         to currently exist. The lease becomes "dormant": stored in
         the registry's lease table, but with no immediate effect
@@ -39,7 +39,7 @@ def _resolve_device_arg(args, registry):
 
     Dormant claims are how an agent reserves a future-mode device
     key for the same physical board across firmware swaps -- e.g.
-    pre-claim ``msc.mp135`` while the SoC is still in DFU, so no
+    pre-claim ``msc.evb`` while the SoC is still in DFU, so no
     one else can grab the freshly-appeared MSC drive between flash
     and the agent's follow-up plan.
     """
@@ -150,28 +150,30 @@ class LeasePlugin(DevicePlugin):
         "acquisitions of that key.\n"
         "\n"
         "  This is how you reserve a future-mode key for the same "
-        "physical board across firmware changes. Example for the "
-        "STM32MP135 board, which presents different USB device keys "
-        "in different modes (`dfu.mp135`, `msc.mp135`, `mp135.0`, "
+        "physical board across firmware changes. Example for the EVB "
+        "STM32MP135, which presents different USB device keys in "
+        "different modes (`dfu.evb`, `msc.evb`, `mp135.evb`, "
         "`ssh.target`):\n"
         "\n"
         "    # Plan A: pre-claim every key the workflow will touch,\n"
         "    # even ones that don't exist yet (board is in DFU now).\n"
-        "    lease:claim device=dfu.mp135  duration_s=1800\n"
-        "    lease:claim device=msc.mp135  duration_s=1800  # dormant\n"
-        "    lease:claim device=mp135.0    duration_s=1800\n"
+        "    lease:claim device=dfu.evb    duration_s=1800\n"
+        "    lease:claim device=msc.evb    duration_s=1800  # dormant\n"
+        "    lease:claim device=mp135.evb  duration_s=1800\n"
         "    lease:claim device=ssh.target duration_s=1800  # dormant\n"
-        "    dfu:flash_layout layout=@flash.tsv\n"
+        "    dfu.evb:flash_layout layout=@flash.tsv\n"
         "    # Token T now covers all four keys.\n"
         "\n"
-        "    # Plan B (same agent): bootloader is up, msc.mp135 is\n"
+        "    # Plan B (same agent): bootloader is up, msc.evb is\n"
         "    # enumerated -- our lease already covers it.\n"
         "    lease:resume token=<T>\n"
-        "    msc:write data=@sdcard.img\n"
+        "    msc.evb:write data=@sdcard.img\n"
         "\n"
         "  Plain `device=plugin` (no dot) still requires the instance "
         "to currently exist and be unique -- it resolves via the "
-        "registry exactly like a normal device op.")
+        "registry exactly like a normal device op. Use the qualified "
+        "`plugin.id` form whenever multiple instances are configured "
+        "(see the bench's current device list for available ids).")
 
     ops = {
         "claim": Op(
