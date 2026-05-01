@@ -504,6 +504,9 @@ class Handler(BaseHTTPRequestHandler):
                     can DELETE /jobs/<digest> to give up on it.
           done      at least one file in OUTPUTS for this digest.
         """
+        def _try_meta(path):
+            return _read_meta(path) if os.path.exists(path) else {}
+
         jobs = {}
         # Queued
         try:
@@ -522,6 +525,8 @@ class Handler(BaseHTTPRequestHandler):
                     "status": "queued",
                     "queued_at": st.st_mtime,
                     "size_bytes": st.st_size,
+                    "meta": _try_meta(
+                        os.path.join(INPUTS, f"{n}.meta")),
                 }
         except FileNotFoundError:
             pass
@@ -542,6 +547,8 @@ class Handler(BaseHTTPRequestHandler):
                     "status": "running",
                     "picked_up_at": st.st_mtime,
                     "size_bytes": st.st_size,
+                    "meta": _try_meta(
+                        os.path.join(DONE, f"{n}.meta")),
                 }
         except FileNotFoundError:
             pass
