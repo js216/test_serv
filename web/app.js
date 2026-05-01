@@ -242,13 +242,34 @@ async function submitPlanText(text, meta = {}, btn) {
       method: "POST", headers, body: text,
     });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) {
+    // Treat the server's idempotency states as "we already have or are
+    // about to have an artefact for this digest" -- not as errors:
+    //   stale_outputs  output is already on the server; fetch and show.
+    //   duplicate      input is queued; wait for the artefact same as
+    //                  if we'd just submitted it ourselves.
+    let digest;
+    if (r.status === 409 && data.status === "stale_outputs") {
+      digest = data.digest;
+      if (out) {
+        out.innerHTML =
+          `<div class='hint'>existing artefact ${digest.slice(0, 12)}…
+              (server already has results; fetching)</div>`;
+      }
+    } else if (r.status === 409 && data.status === "duplicate") {
+      digest = data.digest;
+      if (out) {
+        out.innerHTML =
+          `<div class='hint'>plan already queued ${digest.slice(0, 12)}…
+              waiting…</div>`;
+      }
+    } else if (!r.ok) {
       throw new Error(`submit failed: ${r.status} ${JSON.stringify(data)}`);
-    }
-    const digest = data.digest;
-    if (out) {
-      out.innerHTML =
-        `<div class='hint'>submitted ${digest.slice(0, 12)}… waiting…</div>`;
+    } else {
+      digest = data.digest;
+      if (out) {
+        out.innerHTML =
+          `<div class='hint'>submitted ${digest.slice(0, 12)}… waiting…</div>`;
+      }
     }
     const result = await waitForArtefact(digest);
     await renderArtefact(digest, result);
@@ -445,9 +466,12 @@ $("#refresh-now").addEventListener("click", refresh);
 
 $("#run-inventory").addEventListener("click", async () => {
   const btn = $("#run-inventory");
-  await submitPlanText("inventory verify=true\n", {}, btn);
-  // submitPlanText already calls refresh() on success; the inventory op
-  // also re-publishes status so devices/ops/leases are fresh by then.
+  // Embed a timestamp in a comment so the plan body's SHA256 differs
+  // from previous runs -- otherwise queue_job's stale_outputs check
+  // would short-circuit and we'd just re-fetch the previous artefact
+  // instead of doing a fresh re-probe.
+  const ts = new Date().toISOString();
+  await submitPlanText(`# inventory ${ts}\ninventory verify=true\n`, {}, btn);
 });
 
 // --- boot ------------------------------------------------------------
