@@ -30,6 +30,11 @@ RELEASE = os.path.join(STATE_DIR, "release")
 SWEEP = os.path.join(STATE_DIR, "sweep")
 LOG = os.path.join(STATE_DIR, "log.txt")
 
+# digest -> Session for jobs currently dispatching on this poller.
+# Used by the cancel-marker drain to find the right session to signal.
+_active_sessions = {}
+_active_lock = threading.Lock()
+
 
 class _Tee:
     def __init__(self, *streams):
@@ -250,6 +255,36 @@ def _publish_status(registry, plugins_by_name):
     _push_status("ops.json", ops)
 
 
+def _drain_cancels():
+    """Pull any cancel markers the server has accumulated and signal
+    the corresponding session(s) running on this poller. The HTTP
+    GET /cancels also clears the markers server-side, so each cancel
+    fires exactly once.
+    """
+    base = f"http://localhost:{HTTP_PORT}"
+    try:
+        status, body, _ = _get(f"{base}/cancels", timeout=10.0)
+    except Exception:
+        return
+    if status != 200 or not body:
+        return
+    try:
+        digests = json.loads(body.decode())
+    except Exception:
+        return
+    for d in digests:
+        with _active_lock:
+            sess = _active_sessions.get(d)
+        if sess is not None:
+            sess.signal_cancel("REST DELETE /jobs/<digest>")
+            print(datetime.now(), f"[{d[:8]}] cancel signaled")
+        else:
+            # Job already completed before the marker arrived, or
+            # never reached this poller -- harmless.
+            print(datetime.now(),
+                  f"[{d[:8]}] cancel marker but no active session")
+
+
 def _drain_release_markers(registry):
     try:
         names = os.listdir(RELEASE)
@@ -357,7 +392,13 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         return
 
     session = Session(registry, parsed, runtime_s=runtime_s)
-    session.run_all(plugins_by_name)
+    with _active_lock:
+        _active_sessions[job_id] = session
+    try:
+        session.run_all(plugins_by_name)
+    finally:
+        with _active_lock:
+            _active_sessions.pop(job_id, None)
 
     tar, manifest_text = pack_artefact(session)
     _post_artefacts(job_id, tar, manifest_text.encode(), upload_s)
@@ -490,6 +531,7 @@ def main():
         while True:
             _drain_release_markers(registry)
             _drain_sweep_markers(registry, plugins_by_name)
+            _drain_cancels()
 
             if time.monotonic() - last_refresh > DEVICE_REFRESH_S:
                 registry.refresh()

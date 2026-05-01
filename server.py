@@ -23,6 +23,11 @@ DONE = os.path.join(STATE_DIR, "done")
 STATUS = os.path.join(STATE_DIR, "status")
 RELEASE = os.path.join(STATE_DIR, "release")
 SWEEP = os.path.join(STATE_DIR, "sweep")
+# Cancel markers. DELETE /jobs/<digest> drops a file here for the
+# poller to pick up via GET /cancels. Cross-host friendly: the file
+# system isn't shared between server and poller, so we exchange the
+# state through HTTP instead.
+CANCEL = os.path.join(STATE_DIR, "cancel")
 
 # Examples dir is relative to this file -- bench-operator-owned starter plans.
 EXAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
@@ -157,6 +162,10 @@ class Handler(BaseHTTPRequestHandler):
         if path == "leases":
             return self._send_json(
                 _read_file(os.path.join(STATUS, "leases.json")) or b"[]")
+        if path == "jobs":
+            return self._list_jobs()
+        if path == "cancels":
+            return self._pull_cancels()
         if path == "examples":
             return self._list_examples()
         if path.startswith("examples/"):
@@ -205,6 +214,9 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.lstrip("/")
         if path.startswith("outputs/"):
             return self._delete_outputs(path[len("outputs/"):])
+        m = re.match(r"^jobs/([0-9a-f]{64})$", path)
+        if m:
+            return self._cancel_job(m.group(1))
         self.send_response(404)
         self.end_headers()
 
@@ -465,6 +477,146 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b"marked\n")
 
+    # --- /jobs and /cancels ---
+
+    def _list_jobs(self):
+        """Enumerate every job the server has on disk and merge into one
+        list. Status taxonomy:
+          queued    plan is in INPUTS, poller hasn't picked it up.
+          running   plan is in DONE (poller pulled it via /plan) but
+                    no artefact in OUTPUTS yet. May actually be done
+                    if the poller crashed before posting; the agent
+                    can DELETE /jobs/<digest> to give up on it.
+          done      at least one file in OUTPUTS for this digest.
+        """
+        jobs = {}
+        # Queued
+        try:
+            for n in os.listdir(INPUTS):
+                if not n.endswith(".plan"):
+                    continue
+                digest = n[:-5]
+                if not SAFE_DIGEST_RE.match(digest):
+                    continue
+                try:
+                    st = os.stat(os.path.join(INPUTS, n))
+                except OSError:
+                    continue
+                jobs[digest] = {
+                    "digest": digest,
+                    "status": "queued",
+                    "queued_at": st.st_mtime,
+                    "size_bytes": st.st_size,
+                }
+        except FileNotFoundError:
+            pass
+        # Picked up but maybe not finished
+        try:
+            for n in os.listdir(DONE):
+                if not n.endswith(".plan"):
+                    continue
+                digest = n[:-5]
+                if not SAFE_DIGEST_RE.match(digest) or digest in jobs:
+                    continue
+                try:
+                    st = os.stat(os.path.join(DONE, n))
+                except OSError:
+                    continue
+                jobs[digest] = {
+                    "digest": digest,
+                    "status": "running",
+                    "picked_up_at": st.st_mtime,
+                    "size_bytes": st.st_size,
+                }
+        except FileNotFoundError:
+            pass
+        # Output present -> done; promote any "running" entry
+        try:
+            seen_outputs = {}
+            for n in os.listdir(OUTPUTS):
+                digest, _ = os.path.splitext(n)
+                if not SAFE_DIGEST_RE.match(digest):
+                    continue
+                try:
+                    st = os.stat(os.path.join(OUTPUTS, n))
+                except OSError:
+                    continue
+                prev = seen_outputs.get(digest, 0)
+                if st.st_mtime > prev:
+                    seen_outputs[digest] = st.st_mtime
+            for digest, mtime in seen_outputs.items():
+                entry = jobs.get(digest, {"digest": digest, "size_bytes": 0})
+                entry["status"] = "done"
+                entry["completed_at"] = mtime
+                jobs[digest] = entry
+        except FileNotFoundError:
+            pass
+        # Cancel-pending markers (in-flight cancels not yet acked)
+        try:
+            for n in os.listdir(CANCEL):
+                if SAFE_DIGEST_RE.match(n) and n in jobs:
+                    jobs[n]["cancel_pending"] = True
+        except FileNotFoundError:
+            pass
+        out = sorted(
+            jobs.values(),
+            key=lambda j: max(j.get("queued_at", 0),
+                              j.get("picked_up_at", 0),
+                              j.get("completed_at", 0)),
+            reverse=True)
+        return self._send_json(json.dumps(out).encode())
+
+    def _cancel_job(self, digest):
+        """If the digest is queued (still in INPUTS), unlink it -- the
+        poller will never pick it up. Otherwise, drop a marker in
+        CANCEL for the poller to pull via /cancels. The artefact for an
+        in-flight cancel will eventually appear in OUTPUTS with the
+        cancel reason in errors.log.
+        """
+        # 1) queued? unlink immediately.
+        queued_path = os.path.join(INPUTS, f"{digest}.plan")
+        meta_path = queued_path + ".meta"
+        canceled_queued = False
+        for p in (queued_path, meta_path):
+            try:
+                os.unlink(p)
+                canceled_queued = True
+            except FileNotFoundError:
+                pass
+        if canceled_queued:
+            return self._send_json(
+                json.dumps({"status": "canceled_queued",
+                            "digest": digest}).encode())
+        # 2) in-flight? leave a marker, poller will see it.
+        if os.path.exists(os.path.join(DONE, f"{digest}.plan")):
+            os.makedirs(CANCEL, mode=0o700, exist_ok=True)
+            with open(os.path.join(CANCEL, digest), "wb"):
+                pass
+            return self._send_json(
+                json.dumps({"status": "cancel_signaled",
+                            "digest": digest}).encode())
+        # 3) unknown digest. Could be: never submitted, or already
+        # done and DONE/.plan was cleaned up. Either way, nothing to
+        # cancel.
+        self.send_response(404)
+        self.end_headers()
+
+    def _pull_cancels(self):
+        """Return the current set of cancel markers and remove them.
+        The poller calls this on its main loop tick; the markers are
+        consumed atomically so duplicate signals don't fire.
+        """
+        try:
+            names = [n for n in os.listdir(CANCEL) if SAFE_DIGEST_RE.match(n)]
+        except FileNotFoundError:
+            names = []
+        for n in names:
+            try:
+                os.unlink(os.path.join(CANCEL, n))
+            except FileNotFoundError:
+                pass
+        return self._send_json(json.dumps(names).encode())
+
     # --- examples ---
 
     def _list_examples(self):
@@ -526,7 +678,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8080)
     args = ap.parse_args()
-    for d in (INPUTS, OUTPUTS, DONE, STATUS, RELEASE, SWEEP):
+    for d in (INPUTS, OUTPUTS, DONE, STATUS, RELEASE, SWEEP, CANCEL):
         os.makedirs(d, mode=0o700, exist_ok=True)
     ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
