@@ -229,10 +229,30 @@ def _check_blob_refs(ops, available):
     walk(ops)
 
 
+def split_device_ref(device):
+    """Decode ``op.device`` into ``(plugin_name, spec_id_or_None)``.
+
+    Plans can write either the bare plugin name (``mp135:uart_open``)
+    when there's a unique instance, or the fully-qualified ``plugin.id``
+    form (``mp135.evb:uart_open``) when there are several. Returns
+    ``(None, None)`` for control-verb ops that have ``device=None``.
+    """
+    if device is None:
+        return None, None
+    if "." not in device:
+        return device, None
+    plugin_name, _, spec_id = device.partition(".")
+    return plugin_name, spec_id or None
+
+
 def required_devices(plan):
     """Return the set of plugin names referenced by any op in the plan
     (including fork bodies). Used by the poller for parallelization:
     jobs whose device sets are disjoint can run concurrently.
+
+    Strips the ``.spec_id`` suffix off ``plugin.id:op`` references --
+    the session's locking and refresh paths key on plugin names, while
+    spec_id resolution happens later in ``registry.resolve``.
 
     ``lease:claim device=foo.bar duration_s=...`` also pulls ``foo``
     into the set so the session pre-locks it; the lease op needs to
@@ -242,8 +262,9 @@ def required_devices(plan):
     out = set()
     def walk(ops):
         for op in ops:
-            if op.device is not None:
-                out.add(op.device)
+            plugin_name, _ = split_device_ref(op.device)
+            if plugin_name is not None:
+                out.add(plugin_name)
             if op.device == "lease" and op.verb == "claim":
                 d = op.args.get("device")
                 if d is not None:

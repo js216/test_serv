@@ -419,10 +419,11 @@ def _validate_against_plugins(parsed, plugins_by_name, registry):
     def walk(ops):
         for op in ops:
             if op.device is not None:
-                if op.device not in plugins_by_name:
+                plugin_name, _ = plan.split_device_ref(op.device)
+                if plugin_name not in plugins_by_name:
                     raise ValueError(f"line {op.lineno}: unknown device "
                                      f"{op.device!r}")
-                pl = plugins_by_name[op.device]
+                pl = plugins_by_name[plugin_name]
                 if op.verb in ("open", "close"):
                     pass
                 elif op.verb not in pl.ops:

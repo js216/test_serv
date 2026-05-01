@@ -308,8 +308,13 @@ class Session:
 
     # --- device ops ---
 
-    def _resolve_device(self, plugin_name):
+    def _resolve_device(self, device_ref):
         """Resolve with one targeted re-probe on miss.
+
+        ``device_ref`` is either a bare plugin name (``mp135``) when
+        the plan has a unique instance, or a fully-qualified
+        ``plugin.id`` form (``mp135.evb``) when the plan needs to
+        target one specific instance among several.
 
         Lets plans whose earlier ops caused a device to appear (DUT
         reset into DFU, board coming online, ...) find it at op time
@@ -318,11 +323,13 @@ class Session:
         it to 'locked for the remainder of the session' so subsequent
         ops on the same device keep the job-atomic guarantee.
         """
+        from plan import split_device_ref
+        plugin_name, spec_id = split_device_ref(device_ref)
         try:
-            key = self.registry.resolve(plugin_name)
+            key = self.registry.resolve(plugin_name, spec_id)
         except LookupError:
             self.registry.refresh_plugin(plugin_name)
-            key = self.registry.resolve(plugin_name)
+            key = self.registry.resolve(plugin_name, spec_id)
 
         if plugin_name in getattr(self, "_deferred_names", set()):
             blocker = self.registry.lease_blocks_us(key, self.lease_token)
@@ -348,9 +355,11 @@ class Session:
         return key
 
     def _run_device_op(self, op, plugins):
-        if op.device not in plugins:
+        from plan import split_device_ref
+        plugin_name, _ = split_device_ref(op.device)
+        if plugin_name not in plugins:
             raise PlanError(f"unknown device {op.device!r}")
-        plugin = plugins[op.device]
+        plugin = plugins[plugin_name]
 
         if op.verb in ("open", "close"):
             key = self._resolve_device(op.device)
@@ -442,7 +451,30 @@ class Session:
         devices = self.registry.list_devices()
         ops_map = {
             "_control": {
-                "doc": "Plan control verbs handled by the session runner.",
+                "doc": (
+                    "Plan control verbs handled by the session runner.\n"
+                    "\n"
+                    "Plan grammar reminders:\n"
+                    "  device:op args...      run plugin op against a\n"
+                    "                         currently-unique instance.\n"
+                    "  device.id:op args...   run plugin op against a\n"
+                    "                         specific instance, e.g.\n"
+                    "                         `mp135.evb:uart_open` when\n"
+                    "                         the bench has both\n"
+                    "                         `mp135.evb` and\n"
+                    "                         `mp135.custom`. The bare\n"
+                    "                         `mp135:uart_open` form\n"
+                    "                         errors with `ambiguous: 2\n"
+                    "                         instances` when more than\n"
+                    "                         one is configured.\n"
+                    "  control-verb args...   no device prefix, e.g.\n"
+                    "                         `delay ms=500` or\n"
+                    "                         `inventory verify=true`.\n"
+                    "\n"
+                    "Available instance ids per plugin appear in this\n"
+                    "session's bench.devices.json (each entry has both\n"
+                    "an `id` like `mp135.evb` and a `description` if\n"
+                    "the operator put one in config.json)."),
                 "ops": {
                     "barrier": {
                         "args": {},
