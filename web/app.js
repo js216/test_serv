@@ -1,8 +1,8 @@
 // test_serv web UI -- vanilla JS, no build step.
-// Polls /devices, /leases, /ops every REFRESH_MS. Submits plans via
+// All status fetches are manual (refresh-now, run-inventory, or the
+// implicit refresh after a plan submit). Submits plans via
 // /submit-text and tracks artefacts at /outputs/<digest>.{txt,tar}.
 
-const REFRESH_MS = 5000;
 const SUBMIT_POLL_MS = 1000;
 const SUBMIT_TIMEOUT_MS = 60_000;
 
@@ -96,10 +96,10 @@ function setPollStatus(kind, msg) {
   const e = $("#poll-status");
   if (kind === "ok") {
     const ts = new Date(state.lastFetch).toLocaleTimeString();
-    e.textContent = `poll: ${ts}`;
+    e.textContent = `last refresh: ${ts}`;
     e.className = "poll-ok";
   } else {
-    e.textContent = `poll: ${msg || "error"}`;
+    e.textContent = `last refresh: ${msg || "error"}`;
     e.className = "poll-err";
   }
 }
@@ -335,5 +335,7 @@ $("#run-inventory").addEventListener("click", async () => {
 
 // --- boot ------------------------------------------------------------
 
+// One initial fetch so the page loads with current state. After that,
+// refreshes only happen on user action (refresh-now button, run-inventory
+// button, or as a side-effect of submitPlanText after a plan completes).
 refresh();
-setInterval(refresh, REFRESH_MS);
