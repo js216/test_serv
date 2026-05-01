@@ -27,9 +27,13 @@ def find_com_by_vid_pid(vid, pid=None, pid_any=None, interface=None,
 
     ``interface`` matches the USB interface number -- Windows encodes it
     in the hwid string as ``MI_0N``, Linux as ``:1.N`` in the location.
-    ``serial`` matches ``ListPortInfo.serial_number`` exactly; pin this
-    when the bench has multiple instances of the same chip and only a
-    specific physical unit should be claimed.
+
+    ``serial`` matches ``ListPortInfo.serial_number``:
+        a non-empty string -> exact-match the iSerial (use this to pin a
+            specific programmed FTDI chip among siblings on the same VID/PID);
+        the empty string ""  -> match only ports whose chip has NO programmed
+            iSerial (the symmetric pin for the unprogrammed sibling);
+        None / not given     -> no serial filter, first match wins.
     """
     vid_i = _int(vid)
     pid_i = _int(pid)
@@ -41,8 +45,12 @@ def find_com_by_vid_pid(vid, pid=None, pid_any=None, interface=None,
             continue
         if pids_any and p.pid not in pids_any:
             continue
-        if serial is not None and p.serial_number != serial:
-            continue
+        if serial is not None:
+            if serial == "":
+                if p.serial_number:
+                    continue
+            elif p.serial_number != serial:
+                continue
         if interface is not None:
             loc = (p.location or "") + " " + (p.hwid or "")
             n = int(interface)
