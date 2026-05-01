@@ -390,33 +390,43 @@ class DfuPlugin(DevicePlugin):
     def open(self, spec):
         tmpdir = os.environ.get(
             "TEST_SERV_DFU_TMPDIR", tempfile.gettempdir())
+        expected_serial = spec.get("usb_serial")
+
+        # Identity handshake AND dynamic usb_index resolution. cubeprog
+        # assigns USB1, USB2, ... in enumeration order; if two boards are
+        # in DFU mode the index a given iSerial sits at can flip between
+        # reboots. Trusting the static config field is a footgun: a flash
+        # for "evb" could land on "custom" and brick the wrong board.
+        # So we always look up the live index by iSerial here, and refuse
+        # to open if the expected serial isn't currently enumerated.
+        if not expected_serial:
+            raise RuntimeError(
+                f"dfu: instance {spec.get('id')!r} has no usb_serial in "
+                f"config; refuse to open since multi-board benches can "
+                f"silently flash the wrong device without it")
+        result = _run_cubeprog(
+            spec["cubeprog_exe"], ["-l", "usb"], LIST_TIMEOUT_S)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"dfu: cubeprog -l usb exit={result.returncode}: "
+                f"{(result.stderr or b'').decode(errors='replace')!r}")
+        devs = _parse_list_output(result.stdout or b"")
+        match = next(
+            (d for d in devs if expected_serial in d.get("serial", "")), None)
+        if match is None:
+            serials = [d.get("serial", "") for d in devs]
+            raise RuntimeError(
+                f"dfu: device {expected_serial!r} not enumerated "
+                f"(saw {serials!r}); is the board in DFU mode?")
+        usb_index = match.get("usb_index") or spec.get("usb_index", "usb1")
         h = DfuHandle(
             instance_id=spec["id"],
             cubeprog_exe=spec["cubeprog_exe"],
-            usb_index=spec["usb_index"],
+            usb_index=usb_index,
             tmpdir=tmpdir,
-            expected_serial=spec.get("usb_serial"),
+            expected_serial=expected_serial,
         )
-
-        # Identity handshake: run `cubeprog -l usb`, parse out the
-        # enumerated DFU devices, and confirm one of them reports the
-        # expected USB serial. Proves both that the bench has the right
-        # physical board attached AND that cubeprog is working before
-        # we attempt a long flash.
-        if h.expected_serial:
-            result = _run_cubeprog(
-                h.cubeprog_exe, ["-l", "usb"], LIST_TIMEOUT_S)
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"dfu: cubeprog -l usb exit={result.returncode}: "
-                    f"{(result.stderr or b'').decode(errors='replace')!r}")
-            devs = _parse_list_output(result.stdout or b"")
-            serials = [d.get("serial", "") for d in devs]
-            if not any(h.expected_serial in s for s in serials):
-                raise RuntimeError(
-                    f"dfu identity mismatch: expected serial "
-                    f"{h.expected_serial!r}, enumerated {serials!r}")
-            h._identity_verified = True
+        h._identity_verified = True
         return h
 
     def close(self, handle):
