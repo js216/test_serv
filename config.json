@@ -13,9 +13,18 @@
   "fpga": {
     "instances": [
       {
-        "id": "0",
+        "id": "hx1k",
+        "description": "Lattice iCEstick (iCE40-HX1K-TQ144). FT2232H has stock EEPROM (no programmed iSerial); disambiguated against the HX8K-B-EVN by descriptor on the libftd2xx side and by 'no serial' on the pyserial side.",
         "ft2232h_desc": "Dual RS232-HS A",
-        "uart_autodetect": { "vid": "0x0403", "pid": "0x6010", "interface": 1 },
+        "uart_autodetect": { "vid": "0x0403", "pid": "0x6010", "serial": "", "interface": 1 },
+        "baudrate": 115200
+      },
+      {
+        "id": "hx8k",
+        "description": "Lattice iCE40-HX8K-B-EVN breakout (iCE40HX8K-CT256). FT2232H has a programmed EEPROM with iSerial FTB5Z4FJ and product 'USB <-> Serial Converter'. Same MPSSE wiring family as the iCEstick -- the program op's SPI-NOR opcode set is generic enough for both flash chips (Micron N25Q032 on hx1k, M25P80 on hx8k).",
+        "ft2232h_desc": "USB <-> Serial Converter A",
+        "ft2232h_serial": "FTB5Z4FJA",
+        "uart_autodetect": { "vid": "0x0403", "pid": "0x6010", "serial": "FTB5Z4FJ", "interface": 1 },
         "baudrate": 115200
       }
     ]
