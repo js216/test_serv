@@ -136,7 +136,18 @@ class Session:
         # Pre-scan for `lease:resume token=...` so the lease gate below
         # treats this session as the lease's owner. Validation (token
         # exists / not expired) runs again at op time as a safety net.
-        self._prescan_lease_resume()
+        # Failures land in self.errors so the agent gets an errors.log
+        # artefact rather than the worker thread crashing with no trace.
+        try:
+            self._prescan_lease_resume()
+        except Exception:
+            self.errors.append(traceback.format_exc())
+            self.log_event(
+                "ERROR", "session",
+                f"prescan: {self.errors[-1].splitlines()[-1]}")
+            for s in self.streams.values():
+                s.close()
+            return
         # Job-atomic device locking: grab every device the plan
         # references up front and hold the locks for the whole session.
         # A job that needs {dsp, fpga} therefore pauses any other job
