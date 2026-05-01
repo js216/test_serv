@@ -64,8 +64,12 @@
   </section>
 
   <section id="jobs-section">
-    <h2>Jobs <button id="prune-jobs" type="button" class="header-btn"
-                    title="Remove every 'running' entry whose artefact is no longer on the server. These are leftovers: the poller picked the job up, the agent fetched + deleted the artefact, but the bookkeeping record stayed.">clear stale</button></h2>
+    <h2>Jobs
+      <button id="prune-jobs" type="button" class="header-btn"
+              title="Remove every 'running' entry whose artefact is no longer on the server. These are leftovers: the poller picked the job up, the agent fetched + deleted the artefact, but the bookkeeping record stayed. Does NOT touch queued or done jobs.">clear stale</button>
+      <button id="wipe-jobs" type="button" class="header-btn header-btn-danger"
+              title="Wipe everything: queued plans, running records, all artefacts. NOT a force-cancel -- a currently-running session will still post its artefact, which will reappear as a fresh 'done' entry.">delete all</button>
+    </h2>
     <table id="jobs-table">
       <thead>
         <tr>
