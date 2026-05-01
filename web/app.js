@@ -178,8 +178,14 @@ function renderJobs() {
         },
       }, "delete"));
     }
+    const descText = j.meta && (j.meta.description || j.meta.Description);
+    const idCell = el("td", { class: "mono", title: j.digest },
+                      j.digest.slice(0, 12) + "…");
+    if (descText) {
+      idCell.appendChild(el("div", { class: "device-desc" }, descText));
+    }
     tbody.appendChild(el("tr", {},
-      el("td", { class: "mono", title: j.digest }, j.digest.slice(0, 12) + "…"),
+      idCell,
       el("td", {}, statusEl),
       el("td", { class: "mono" }, age),
       el("td", { class: "mono" }, fmtBytes(j.size_bytes)),
@@ -491,7 +497,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function releaseLease(token) {
   if (!confirm(`Release lease ${token}?`)) return;
-  await submitPlanText(`lease:release token="${token}"\n`);
+  await submitPlanText(`lease:release token="${token}"\n`,
+                       { Description: `dashboard: release lease ${token.slice(0, 12)}…` });
 }
 
 // --- form wiring -----------------------------------------------------
@@ -503,13 +510,16 @@ $("#claim-form").addEventListener("submit", async (e) => {
   if (!devs) return;
   const lines = devs.split(",").map((s) => s.trim()).filter(Boolean)
     .map((d) => `lease:claim device=${d} duration_s=${dur}`);
-  await submitPlanText(lines.join("\n") + "\n");
+  await submitPlanText(lines.join("\n") + "\n",
+                       { Description: `dashboard: claim ${devs} for ${dur}s` });
 });
 
 $("#submit-plan-btn").addEventListener("click", async () => {
   const text = $("#plan-text").value;
   if (!text.trim()) return;
   const meta = {};
+  const desc = $("#meta-description").value.trim();
+  if (desc) meta.Description = desc;
   const rt = $("#meta-runtime").value;
   if (rt) meta.Runtime = rt;
   const ut = $("#meta-upload").value;
@@ -574,7 +584,8 @@ $("#run-inventory").addEventListener("click", async () => {
   // would short-circuit and we'd just re-fetch the previous artefact
   // instead of doing a fresh re-probe.
   const ts = new Date().toISOString();
-  await submitPlanText(`# inventory ${ts}\ninventory verify=true\n`, {}, btn);
+  await submitPlanText(`# inventory ${ts}\ninventory verify=true\n`,
+                       { Description: "dashboard: run inventory" }, btn);
 });
 
 // --- boot ------------------------------------------------------------

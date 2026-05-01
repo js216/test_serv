@@ -96,6 +96,10 @@
     <textarea id="plan-text" rows="8"
               placeholder="lease:list&#10;# or any multi-op plan"></textarea>
     <div class="row">
+      <label style="flex:1; min-width: 240px;">X-Test-Description (short summary, shows up in Jobs table)
+        <input id="meta-description" type="text"
+               placeholder="e.g. flash bootloader + run smoke test">
+      </label>
       <label>X-Test-Runtime (s)
         <input id="meta-runtime" type="number" min="1" max="3600" placeholder="default: 600">
       </label>
