@@ -75,21 +75,50 @@ def _cmd(dev, out):
     )
 
 
+MPSSE_READ_CHUNK = 1 << 16   # 65536, max MPSSE 0x20 payload per command
+
+
 def _xfer(dev, out, rdlen):
+    """SPI write `out`, then read `rdlen` bytes back, with CS held low
+    across the whole exchange. Used by the SPI-NOR flash sequences
+    (read 0x03, JEDEC 0x9F, status 0x05, etc.).
+
+    Reads larger than 64 KiB are split into multiple 0x20 commands
+    inside the same CS window -- the SPI flash keeps streaming as long
+    as we keep clocking, so back-to-back read commands appear seamless
+    to the chip. Each per-command read is also looped over libftd2xx
+    `dev.read()` since FT_Read returns early on the chip's
+    read-timeout with whatever it's buffered, not the full requested
+    count. Without either of these, large reads short-read silently
+    -- HX8K bitstreams (~135 KB) tripped both at once.
+    """
     nw = len(out) - 1
-    nr = rdlen - 1
-    dev.write(
-        bytes([0x80, ACTIVE_RESET, DIR_LOW,
-               0x11, nw & 0xff, (nw >> 8) & 0xff])
-        + bytes(out)
-        + bytes([0x20, nr & 0xff, (nr >> 8) & 0xff,
-                 0x80, IDLE_RESET, DIR_LOW,
-                 0x87])
-    )
-    got = dev.read(rdlen)
-    if len(got) != rdlen:
-        raise RuntimeError(f"short read: {len(got)}/{rdlen}")
-    return got
+    cmd = bytearray()
+    cmd.extend([0x80, ACTIVE_RESET, DIR_LOW,
+                0x11, nw & 0xff, (nw >> 8) & 0xff])
+    cmd.extend(out)
+    chunks = []
+    remaining = rdlen
+    while remaining > 0:
+        n = min(remaining, MPSSE_READ_CHUNK)
+        nr = n - 1
+        cmd.extend([0x20, nr & 0xff, (nr >> 8) & 0xff])
+        chunks.append(n)
+        remaining -= n
+    cmd.extend([0x80, IDLE_RESET, DIR_LOW, 0x87])
+    dev.write(bytes(cmd))
+
+    got = bytearray()
+    for n in chunks:
+        partial = bytearray()
+        while len(partial) < n:
+            piece = dev.read(n - len(partial))
+            if not piece:
+                raise RuntimeError(
+                    f"short read: {len(got) + len(partial)}/{rdlen}")
+            partial.extend(piece)
+        got.extend(partial)
+    return bytes(got)
 
 
 def _wait_wip(dev):
