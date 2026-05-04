@@ -178,9 +178,8 @@ One op per line. Blank lines and `# comments` ignored.
 
 ```
 device:op k=v k=v ...          # device op, args typed per plugin
-ctrl-verb    k=v ...           # control: barrier, mark, delay,
-                               # inventory, fork, end, join,
-                               # open, close
+ctrl-verb    k=v ...           # control: mark, delay, inventory,
+                               # description, open, close
 ```
 
 Values are parsed as:
@@ -197,13 +196,12 @@ Values are parsed as:
 Control verbs:
 
 - `delay ms=N`
-- `mark tag=NAME` / `barrier tag=NAME` -- checkpoints in the timeline
+- `mark tag=NAME` -- named checkpoint in the timeline
+- `description "<short summary>"` -- label for the dashboard + meta
 - `inventory` -- return the bench poller's device list and supported
   ops as `bench.devices.json` and `bench.ops.json` streams in the
   artefact. Always refreshes the device probe; for a full identity
   sweep, `POST /sweep` first.
-- `fork name=IDENT` ... `end` -- run the enclosed op list in a thread;
-  a plan can contain several `fork` blocks, each joined at its `end`.
 - `open` / `close` on any device -- pin the handle across multiple
   ops in the same session (avoids paying the open cost per op for
   plugins where setup is expensive, e.g. FT4222 SPI ~100 ms).

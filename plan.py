@@ -5,7 +5,7 @@
 import io
 import shlex
 import tarfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -17,12 +17,9 @@ MAX_PLAN_BYTES = 256 * 1024
 MAX_BLOB_BYTES = 512 * 1024 * 1024
 MAX_BLOBS = 64
 MAX_OPS = 4096
-MAX_DEPTH = 2
 
 CONTROL_VERBS = {
-    "fork", "end", "join", "barrier", "mark", "delay",
-    "inventory", "description",
-    "open", "close",
+    "mark", "delay", "inventory", "description", "open", "close",
 }
 
 
@@ -63,7 +60,6 @@ class Op:
     device: Optional[str]   # None for control verbs
     verb: str
     args: dict              # {name: Value}
-    body: list = field(default_factory=list)  # populated for fork
 
 
 @dataclass
@@ -111,12 +107,10 @@ def _parse_args(tokens, lineno):
 
 
 def parse_text(text):
-    """Parse plan text into a flat list of Op (with nested body on fork)."""
+    """Parse plan text into a flat list of Op."""
     if len(text) > MAX_PLAN_BYTES:
         raise PlanError(f"plan too large: {len(text)} > {MAX_PLAN_BYTES}")
-    ops_flat = []
-    stack = [ops_flat]        # current insertion list
-    depth = 0
+    ops = []
     total = 0
 
     for lineno, raw in enumerate(text.splitlines(), 1):
@@ -137,24 +131,8 @@ def parse_text(text):
             device, verb = head.split(":", 1)
             if not device or not verb:
                 raise PlanError(f"line {lineno}: bad device:op {head!r}")
-            op = Op(lineno=lineno, device=device, verb=verb,
-                    args=_parse_args(rest, lineno))
-            stack[-1].append(op)
-        elif head == "fork":
-            if depth >= MAX_DEPTH:
-                raise PlanError(f"line {lineno}: fork nesting too deep")
-            args = _parse_args(rest, lineno)
-            if "name" not in args or args["name"].kind != "ident":
-                raise PlanError(f"line {lineno}: fork requires name=IDENT")
-            fork_op = Op(lineno=lineno, device=None, verb="fork", args=args)
-            stack[-1].append(fork_op)
-            stack.append(fork_op.body)
-            depth += 1
-        elif head == "end":
-            if depth == 0:
-                raise PlanError(f"line {lineno}: 'end' without matching fork")
-            stack.pop()
-            depth -= 1
+            ops.append(Op(lineno=lineno, device=device, verb=verb,
+                          args=_parse_args(rest, lineno)))
         elif head == "description":
             # Special-case: rest of line is free-form text. Accept the
             # k=v form (`description text="..."`) too for grammar
@@ -164,13 +142,11 @@ def parse_text(text):
                 args = _parse_args(rest, lineno)
             else:
                 args = {"text": Value("str", " ".join(rest))}
-            op = Op(lineno=lineno, device=None, verb="description",
-                    args=args)
-            stack[-1].append(op)
+            ops.append(Op(lineno=lineno, device=None, verb="description",
+                          args=args))
         elif head in CONTROL_VERBS:
-            op = Op(lineno=lineno, device=None, verb=head,
-                    args=_parse_args(rest, lineno))
-            stack[-1].append(op)
+            ops.append(Op(lineno=lineno, device=None, verb=head,
+                          args=_parse_args(rest, lineno)))
         else:
             raise PlanError(
                 f"line {lineno}: unknown verb {head!r} "
@@ -181,10 +157,7 @@ def parse_text(text):
         if total > MAX_OPS:
             raise PlanError(f"too many ops (> {MAX_OPS})")
 
-    if depth != 0:
-        raise PlanError("unclosed fork block (missing 'end')")
-
-    return ops_flat
+    return ops
 
 
 def load_tar(data):
@@ -285,15 +258,12 @@ def extract_description(data):
 
 
 def _check_blob_refs(ops, available):
-    def walk(op_list):
-        for op in op_list:
-            for v in op.args.values():
-                if v.kind == "blob" and v.raw not in available:
-                    raise PlanError(
-                        f"line {op.lineno}: @{v.raw} not in tar"
-                    )
-            walk(op.body)
-    walk(ops)
+    for op in ops:
+        for v in op.args.values():
+            if v.kind == "blob" and v.raw not in available:
+                raise PlanError(
+                    f"line {op.lineno}: @{v.raw} not in tar"
+                )
 
 
 def split_device_ref(device):
@@ -313,9 +283,9 @@ def split_device_ref(device):
 
 
 def required_devices(plan):
-    """Return the set of plugin names referenced by any op in the plan
-    (including fork bodies). Used by the poller for parallelization:
-    jobs whose device sets are disjoint can run concurrently.
+    """Return the set of plugin names referenced by any op in the plan.
+    Used by the poller for parallelization: jobs whose device sets are
+    disjoint can run concurrently.
 
     Strips the ``.spec_id`` suffix off ``plugin.id:op`` references --
     the session's locking and refresh paths key on plugin names, while
@@ -327,19 +297,16 @@ def required_devices(plan):
     registry's lease table.
     """
     out = set()
-    def walk(ops):
-        for op in ops:
-            plugin_name, _ = split_device_ref(op.device)
-            if plugin_name is not None:
-                out.add(plugin_name)
-            if op.device == "lease" and op.verb == "claim":
-                d = op.args.get("device")
-                if d is not None:
-                    raw = d.raw if hasattr(d, "raw") else str(d)
-                    if "." in raw:
-                        out.add(raw.split(".", 1)[0])
-            walk(op.body)
-    walk(plan.ops)
+    for op in plan.ops:
+        plugin_name, _ = split_device_ref(op.device)
+        if plugin_name is not None:
+            out.add(plugin_name)
+        if op.device == "lease" and op.verb == "claim":
+            d = op.args.get("device")
+            if d is not None:
+                raw = d.raw if hasattr(d, "raw") else str(d)
+                if "." in raw:
+                    out.add(raw.split(".", 1)[0])
     return out
 
 

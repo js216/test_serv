@@ -20,6 +20,14 @@ DEFAULT_SESSION_S = 600.0
 MAX_SESSION_S = 3600.0
 
 
+class StopSession(Exception):
+    """Raised by a plan op (currently uart_expect with end_session=true)
+    to terminate the rest of the plan cleanly. _run_block catches it
+    at the top level and treats it as a normal end-of-plan, not an
+    error or a cancellation.
+    """
+
+
 class Stream:
     """A time-stamped byte stream.
 
@@ -74,7 +82,6 @@ class Session:
         self.touched_keys = set()
         self.errors = []
         self.lock = threading.Lock()
-        self.early_done = False
         self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
         # Set by a leading lease:resume op or minted by the first lease:claim;
         # gates session lock acquisition against the registry's lease registry
@@ -107,8 +114,10 @@ class Session:
         return s
 
     def signal_early_done(self, reason=""):
-        self.early_done = True
-        self.log_event("CTRL", "session", f"early_done: {reason}")
+        # Plugins (uart_expect with end_session=true) raise this to
+        # short-circuit the rest of the plan. _run_block catches it
+        # at the top level and treats it as clean termination.
+        raise StopSession(reason)
 
     def bail_if_canceled(self, where):
         """Plugin helper: raise RuntimeError if the session is canceled.
@@ -250,6 +259,11 @@ class Session:
         self.log_event("LOCK", "session", "acquired; running ops")
         try:
             self._run_block(self.plan.ops, plugins, deadline)
+        except StopSession as e:
+            # Plan asked to short-circuit (uart_expect end_session=true).
+            # Clean termination, not an error.
+            self.log_event("CTRL", "session",
+                           f"early_done: {e.args[0] if e.args else ''}")
         except Exception:
             self.errors.append(traceback.format_exc())
             self.log_event("ERROR", "session",
@@ -289,8 +303,6 @@ class Session:
                 self.log_event("ERROR", "session",
                                f"session exceeded {deadline - self.t0:.0f}s "
                                f"deadline")
-                return
-            if self.early_done:
                 return
             if self.canceled:
                 msg = (f"canceled at op {op.lineno} "
@@ -424,11 +436,7 @@ class Session:
 
     def _run_control(self, op, plugins, deadline):
         v = op.verb
-        if v == "barrier":
-            tag = op.args.get("tag")
-            self.log_event("BARRIER", "ctrl",
-                           tag.raw if tag is not None else "")
-        elif v == "mark":
+        if v == "mark":
             tag = op.args.get("tag")
             self.log_event("MARK", "ctrl",
                            tag.raw if tag is not None else "")
@@ -444,11 +452,6 @@ class Session:
             self.cancel_event.wait(max(0.0, ms.as_int() / 1000.0))
         elif v == "inventory":
             self._run_inventory(op, plugins)
-        elif v == "fork":
-            self._run_fork(op, plugins, deadline)
-        elif v == "join":
-            # join is a no-op: fork block already joins at its end.
-            pass
         elif v == "description":
             # Op-time no-op: the server already extracted the text
             # from the plan body at submit time and stuffed it into
@@ -502,11 +505,6 @@ class Session:
                     "an `id` like `mp135.evb` and a `description` if\n"
                     "the operator put one in config.json)."),
                 "ops": {
-                    "barrier": {
-                        "args": {},
-                        "optional_args": {"tag": "ident"},
-                        "doc": "Add a barrier checkpoint to timeline.log.",
-                    },
                     "delay": {
                         "args": {"ms": "int"},
                         "optional_args": {},
@@ -529,11 +527,6 @@ class Session:
                             "set this make their work easier to "
                             "triage, cancel, and audit."),
                     },
-                    "fork": {
-                        "args": {"name": "ident"},
-                        "optional_args": {},
-                        "doc": "Start a fork block; terminated by end.",
-                    },
                     "inventory": {
                         "args": {},
                         "optional_args": {},
@@ -542,11 +535,6 @@ class Session:
                             "bench.devices.json + bench.ops.json. For an "
                             "identity-verified sweep, POST /sweep instead."
                         ),
-                    },
-                    "join": {
-                        "args": {},
-                        "optional_args": {},
-                        "doc": "No-op; fork blocks join at end.",
                     },
                     "mark": {
                         "args": {},
@@ -580,46 +568,6 @@ class Session:
         self.log_event(
             "INVENTORY", "ctrl",
             f"devices={len(devices)} plugins={len(ops_map)}")
-
-    def _run_fork(self, fork_op, plugins, deadline):
-        """Run each child of the fork body in its own thread; join at end."""
-        children = fork_op.body
-        # static check: no two concurrent ops on the same device.
-        devices_per_branch = [
-            {o.device for o in [child] if o.device is not None}
-            for child in children
-        ]
-        # (children are top-level ops, no nested fork here per MAX_DEPTH=2)
-        seen = set()
-        for ds in devices_per_branch:
-            clash = ds & seen
-            if clash:
-                raise PlanError(
-                    f"fork line {fork_op.lineno}: device {clash!r} "
-                    f"used in two concurrent branches"
-                )
-            seen |= ds
-
-        errs = []
-        threads = []
-        for child in children:
-            t = threading.Thread(
-                target=self._fork_child_runner,
-                args=(child, plugins, deadline, errs),
-                daemon=True,
-            )
-            threads.append(t)
-            t.start()
-        for t in threads:
-            t.join(timeout=MAX_SESSION_S)
-        for e in errs:
-            self.errors.append(e)
-
-    def _fork_child_runner(self, op, plugins, deadline, errs):
-        try:
-            self._run_one(op, plugins, deadline)
-        except Exception:
-            errs.append(traceback.format_exc())
 
 
 # ---- artefact packing ----
@@ -660,7 +608,6 @@ def pack_artefact(session):
         "streams": sorted(session.streams.keys()),
         "n_ops": len(session.ops_log),
         "n_errors": len(session.errors),
-        "early_done": session.early_done,
         "required_devices": sorted(_req_devs(session.plan)),
     }
     manifest_text = json.dumps(manifest, indent=2) + "\n"

@@ -107,20 +107,6 @@ def test_unknown_verb_rejected():
         raise AssertionError("expected PlanError")
 
 
-def test_fork_join_nesting():
-    text = """
-    fork name=A
-      fake:noop k=1
-    end
-    fork name=B
-      fake:noop k=2
-    end
-    """
-    ops = plan.parse_text(text)
-    assert len(ops) == 2
-    assert ops[0].verb == "fork" and len(ops[0].body) == 1
-
-
 def test_pack_and_load_roundtrip():
     text = 'fake:emit stream=s data="hi"\n'
     blobs = {"foo.ldr": b"FFFF\n0001\n"}
@@ -290,7 +276,6 @@ def main():
         test_parse_basic,
         test_blob_ref_missing_rejected,
         test_unknown_verb_rejected,
-        test_fork_join_nesting,
         test_pack_and_load_roundtrip,
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
