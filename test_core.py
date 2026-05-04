@@ -560,6 +560,54 @@ def test_failure_artefact_carries_identity_fields():
     assert m["blob_digests"] == {}, m
 
 
+def test_prune_skips_inflight_digests():
+    """Reviewer P / round-8 P1: clear-stale must not unlink DONE/.plan
+    of digests the poller currently considers in flight. Without this
+    guard, a long-running job whose DONE/.plan is written but whose
+    OUTPUTS/.tar hasn't posted yet would be silently destroyed.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dirs = (server.INPUTS, server.OUTPUTS, server.DONE,
+                    server.STATUS, server.RELEASE, server.SWEEP)
+        server.INPUTS = os.path.join(tmp, "inputs")
+        server.OUTPUTS = os.path.join(tmp, "outputs")
+        server.DONE = os.path.join(tmp, "done")
+        server.STATUS = os.path.join(tmp, "status")
+        server.RELEASE = os.path.join(tmp, "release")
+        server.SWEEP = os.path.join(tmp, "sweep")
+        for d in (server.INPUTS, server.OUTPUTS, server.DONE,
+                  server.STATUS, server.RELEASE, server.SWEEP):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            live = "a" * 64
+            stale = "b" * 64
+            for digest in (live, stale):
+                with open(os.path.join(server.DONE, f"{digest}.plan"),
+                          "wb") as f:
+                    f.write(b"plan-bytes\n")
+            with open(os.path.join(server.STATUS, "inflight.json"),
+                      "wb") as f:
+                f.write(json.dumps([{"digest": live}]).encode())
+
+            removed = server.prune_stale_jobs()
+            assert removed == 1, removed
+            assert os.path.exists(
+                os.path.join(server.DONE, f"{live}.plan")), \
+                "in-flight digest must survive prune"
+            assert not os.path.exists(
+                os.path.join(server.DONE, f"{stale}.plan")), \
+                "non-inflight stale digest must be pruned"
+
+            # Defence in depth: gate logic accepts upload for an
+            # inflight digest even after DONE/.plan is gone.
+            inflight = server._inflight_digests()
+            assert live in inflight
+            assert stale not in inflight
+        finally:
+            (server.INPUTS, server.OUTPUTS, server.DONE,
+             server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
+
+
 def test_check_record_lands_in_manifest():
     """A plugin's session.record_check call must populate
     manifest.checks[] with a structured pass/fail record."""
@@ -613,6 +661,7 @@ def main():
         test_stream_truncation_marker_survives_multiple_cap_hits,
         test_lease_claim_rejects_lease_pseudo_device,
         test_failure_artefact_carries_identity_fields,
+        test_prune_skips_inflight_digests,
         test_check_record_lands_in_manifest,
     ]
     failed = 0

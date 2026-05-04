@@ -138,6 +138,84 @@ def _queued_plan_count():
         return 0
 
 
+def prune_stale_jobs():
+    """Remove DONE/<digest>.plan files whose digests have no OUTPUTS
+    and aren't currently in flight on the poller. These are the
+    "running forever" entries -- the poller picked the job up at some
+    point but no artefact is on the server (e.g. the poller crashed /
+    restarted before posting, or the agent already DELETE'd it after
+    fetching).
+
+    The inflight skip-set is critical: a long-running session has
+    DONE/<digest>.plan written + OUTPUTS/.tar not yet posted, so
+    without this guard the operator could prune their own running
+    job. The artefact upload would then 409 against the idempotency
+    gate and the poller would unlink its spool -- silent data loss.
+
+    Returns the count of plan records actually removed. Module-level
+    so tests can exercise the protection logic without HTTP plumbing.
+    """
+    have_output = set()
+    try:
+        for n in os.listdir(OUTPUTS):
+            d, _ = os.path.splitext(n)
+            if SAFE_DIGEST_RE.match(d):
+                have_output.add(d)
+    except FileNotFoundError:
+        pass
+    protect = _inflight_digests()
+    removed = 0
+    try:
+        for n in list(os.listdir(DONE)):
+            if not n.endswith(".plan"):
+                continue
+            digest = n[:-5]
+            if not SAFE_DIGEST_RE.match(digest):
+                continue
+            if digest in have_output:
+                continue
+            if digest in protect:
+                continue
+            try:
+                os.unlink(os.path.join(DONE, n))
+                removed += 1
+            except FileNotFoundError:
+                pass
+            try:
+                os.unlink(os.path.join(DONE, f"{digest}.plan.meta"))
+            except FileNotFoundError:
+                pass
+    except FileNotFoundError:
+        pass
+    return removed
+
+
+def _inflight_digests():
+    """Read STATUS/inflight.json and return the set of digests the
+    poller currently considers live. Used to protect mid-flight jobs
+    from prune/idempotency-gate races: a long session has DONE/.plan
+    written + OUTPUTS/.tar not yet posted, so it would otherwise look
+    indistinguishable from a stale leftover.
+    """
+    raw = _read_file(os.path.join(STATUS, "inflight.json"))
+    if not raw:
+        return set()
+    try:
+        data = json.loads(raw.decode("utf-8", errors="replace"))
+    except (ValueError, UnicodeDecodeError):
+        return set()
+    if not isinstance(data, list):
+        return set()
+    out = set()
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        d = entry.get("digest")
+        if isinstance(d, str) and SAFE_DIGEST_RE.match(d):
+            out.add(d)
+    return out
+
+
 def _gc_outputs(now=None):
     """Delete artefacts and DONE/<digest>.plan records whose mtime
     is older than OUTPUT_MAX_AGE_S. Best-effort; missing files are
@@ -711,17 +789,21 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         body = self.rfile.read(n) if n else b""
-        # Idempotency gate: refuse the upload if neither DONE/<digest>.plan
-        # (job still in flight from this poller's perspective) nor
-        # INPUTS/<digest>.plan (job hasn't been picked up yet, e.g. a
-        # second poller racing) is present. That's the "agent already
-        # fetched + DELETE'd, then a poller-side retry of an earlier
-        # attempt belatedly arrives" case -- without this gate the
-        # phantom artefact lingers in OUTPUTS and blocks the next
-        # /submit of the same digest with stale_outputs.
+        # Idempotency gate: refuse the upload if no job record matches
+        # the digest. Three signals that a record exists:
+        #  - DONE/<digest>.plan  (poller picked it up, mid-flight)
+        #  - INPUTS/<digest>.plan  (queued; second poller racing)
+        #  - inflight.json contains digest  (defence in depth: a
+        #    racing _prune_stale_jobs may have just deleted DONE/.plan
+        #    while the session is still running)
+        # Without this gate a "agent already fetched + DELETE'd, then
+        # a poller-side retry of an earlier attempt belatedly arrives"
+        # case would leave a phantom artefact in OUTPUTS and block the
+        # next /submit of the same digest with stale_outputs.
         plan_present = (
             os.path.exists(os.path.join(DONE, f"{digest}.plan")) or
-            os.path.exists(os.path.join(INPUTS, f"{digest}.plan")))
+            os.path.exists(os.path.join(INPUTS, f"{digest}.plan")) or
+            digest in _inflight_digests())
         if not plan_present:
             self.send_response(409)
             self.end_headers()
@@ -935,45 +1017,7 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _prune_stale_jobs(self):
-        """Remove DONE/<digest>.plan files whose digests have no
-        OUTPUTS. These are the "running forever" entries -- the
-        poller picked the job up at some point but no artefact is
-        on the server (either the agent already DELETE'd it after
-        fetching, or the poller crashed / restarted before posting).
-        Currently-truly-running jobs have no OUTPUTS yet and would
-        also match; the brief blip of disappearing from the listing
-        until the artefact arrives is harmless -- the poller doesn't
-        reference DONE/.plan after pickup.
-        """
-        have_output = set()
-        try:
-            for n in os.listdir(OUTPUTS):
-                d, _ = os.path.splitext(n)
-                if SAFE_DIGEST_RE.match(d):
-                    have_output.add(d)
-        except FileNotFoundError:
-            pass
-        removed = 0
-        try:
-            for n in list(os.listdir(DONE)):
-                if not n.endswith(".plan"):
-                    continue
-                digest = n[:-5]
-                if not SAFE_DIGEST_RE.match(digest):
-                    continue
-                if digest in have_output:
-                    continue
-                try:
-                    os.unlink(os.path.join(DONE, n))
-                    removed += 1
-                except FileNotFoundError:
-                    pass
-                try:
-                    os.unlink(os.path.join(DONE, f"{digest}.plan.meta"))
-                except FileNotFoundError:
-                    pass
-        except FileNotFoundError:
-            pass
+        removed = prune_stale_jobs()
         return self._send_json(
             json.dumps({"status": "ok", "removed": removed}).encode())
 

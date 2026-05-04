@@ -753,7 +753,8 @@ $("#prune-jobs").addEventListener("click", async () => {
     j => j.status === "running" && !j.completed_at).length;
   if (!confirm(
     `Clear ${stale} 'running' job(s) with no artefact on the server?\n` +
-    `(Queued and done jobs are NOT touched.)`)) {
+    `(Queued and done jobs are NOT touched. Currently-running ` +
+    `sessions are protected via the live inflight signal.)`)) {
     return;
   }
   try {
