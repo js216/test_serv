@@ -684,3 +684,15 @@ class DspPlugin(DevicePlugin):
 
     def close(self, handle):
         handle.uart_close()
+
+    def cleanup_after_cancel(self, handle):
+        # FT4222 SPI/I2C ops re-open the device per call and use
+        # try/finally to close it even on cancel-raised exceptions,
+        # so the chip is already back at idle. Just flush the UART
+        # buffers in case uart_write was interrupted mid-byte.
+        ser = getattr(handle, "_ser", None)
+        if ser is not None:
+            try: ser.reset_input_buffer()
+            except Exception: pass
+            try: ser.reset_output_buffer()
+            except Exception: pass

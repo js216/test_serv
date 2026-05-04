@@ -375,3 +375,13 @@ class FpgaPlugin(DevicePlugin):
 
     def close(self, handle):
         handle.uart_close()
+
+    def cleanup_after_cancel(self, handle):
+        # UART side: flush stale bytes left by an interrupted
+        # uart_write or partial expect.
+        ser = getattr(handle, "_ser", None)
+        if ser is not None:
+            try: ser.reset_input_buffer()
+            except Exception: pass
+            try: ser.reset_output_buffer()
+            except Exception: pass

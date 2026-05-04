@@ -217,5 +217,14 @@ class ScopePlugin(DevicePlugin):
             h._identity_verified = True
         return h
 
+    def cleanup_after_cancel(self, handle):
+        # If an op was interrupted mid-SCPI, the scope's input queue
+        # may have a partial response. Send a Device Clear so the
+        # next op starts on a fresh boundary.
+        inst = getattr(handle, "_inst", None)
+        if inst is not None:
+            try: inst.clear()
+            except Exception: pass
+
     def close(self, handle):
         handle.close()

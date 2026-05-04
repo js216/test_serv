@@ -255,6 +255,29 @@ class Session:
                 except Exception:
                     pass
             self.pinned.clear()
+            # On cancel, fire each plugin's post-cancel cleanup hook
+            # before close, so the next job sees a clean device.
+            # Hardware state from a half-finished op (partial flash,
+            # partial MSC write) can't be magicked away here -- but
+            # bytes-in-serial-buffer, mid-transaction FT4222 handles,
+            # etc. all get reset.
+            if self.canceled:
+                for key in sorted(self.touched_keys):
+                    try:
+                        spec_pname_pair = self.registry.specs.get(key)
+                        if spec_pname_pair is None:
+                            continue
+                        pname, _spec = spec_pname_pair
+                        pl = plugins.get(pname)
+                        cache = self.registry.cache.get(key)
+                        handle = cache[0] if cache else None
+                        if pl is not None and handle is not None:
+                            pl.cleanup_after_cancel(handle)
+                            self.log_event(
+                                "CLEANUP", "session",
+                                f"{key}: post-cancel cleanup ran")
+                    except Exception:
+                        traceback.print_exc()
             for key in sorted(self.touched_keys):
                 try:
                     if self.registry.release_now(key):
