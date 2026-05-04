@@ -985,6 +985,16 @@ class Handler(BaseHTTPRequestHandler):
         return self._send_json(json.dumps(entries).encode())
 
     def _fetch_example(self, name):
+        # Two forms:
+        #   foo.plan       -> raw plan text (text/plain), for the
+        #                     dashboard's textarea + edit flow.
+        #   foo.plan.tar   -> packed tar (plan.txt + every @blob the
+        #                     plan references, pulled from examples/),
+        #                     ready to POST straight to /submit. Lets
+        #                     the dashboard run blob-bearing examples
+        #                     end-to-end without an FS roundtrip.
+        if name.endswith(".plan.tar"):
+            return self._fetch_example_packed(name[:-4])
         if not name.endswith(".plan") or not SAFE_NAME_RE.match(name):
             self.send_response(400)
             self.end_headers()
@@ -996,6 +1006,59 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _fetch_example_packed(self, name):
+        if not name.endswith(".plan") or not SAFE_NAME_RE.match(name):
+            self.send_response(400)
+            self.end_headers()
+            return
+        plan_path = os.path.join(EXAMPLES, name)
+        plan_text = _read_file(plan_path)
+        if plan_text is None:
+            self.send_response(404)
+            self.end_headers()
+            return
+        # Parse to find @blob refs; reject if anything fails so a
+        # broken example doesn't ship a half-built tar.
+        try:
+            ops = plan.parse_text(plan_text.decode("utf-8"))
+        except plan.PlanError as e:
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(f"plan parse failed: {e}".encode())
+            return
+        wanted = set()
+        for op in ops:
+            for v in op.args.values():
+                if v.kind == "blob":
+                    wanted.add(v.raw)
+        # Pull each referenced blob from examples/. Reject if any is
+        # missing so the agent doesn't get a "blob not in tar" failure
+        # at run time -- they'd have to read the artefact to find out
+        # the example was incomplete.
+        blobs = {}
+        for blob_name in sorted(wanted):
+            if not SAFE_NAME_RE.match(blob_name):
+                self.send_response(400)
+                self.end_headers()
+                self.wfile.write(
+                    f"unsafe blob name {blob_name!r}".encode())
+                return
+            data = _read_file(os.path.join(EXAMPLES, blob_name))
+            if data is None:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(
+                    f"example {name!r} references @{blob_name} "
+                    f"which is not in examples/".encode())
+                return
+            blobs[blob_name] = data
+        body = plan.pack_tar(plan_text.decode("utf-8"), blobs)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)

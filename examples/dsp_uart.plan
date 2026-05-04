@@ -1,0 +1,17 @@
+description "Boot DSP with the bundled UART-test image; capture 3s of UART."
+
+# Uses the @uart.ldr blob shipped in this examples/ directory.
+#
+# Manual submission via CLI:
+#   python3 submit.py examples/dsp_uart.plan \
+#     --blob uart.ldr=examples/uart.ldr \
+#     --wait 30 --extract /tmp/dsp-uart
+
+expect "DSP boots from uart.ldr and emits UART traffic within 3s"
+
+dsp:reset
+dsp:uart_open
+dsp:boot ldr=@uart.ldr
+delay ms=3000
+dsp:uart_close
+mark tag=done

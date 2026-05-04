@@ -1,0 +1,14 @@
+description "Program iCEstick with the bundled blink bitstream and run for 5s."
+
+# Uses the @blink.bin blob shipped in this examples/ directory --
+# pick this plan from the dashboard's example dropdown and submit;
+# the server auto-attaches @blink.bin from examples/.
+#
+# Manual submission via CLI:
+#   python3 submit.py examples/fpga_blink.plan \
+#     --blob blink.bin=examples/blink.bin \
+#     --wait 30 --extract /tmp/fpga-blink
+
+fpga:program bin=@blink.bin
+delay ms=5000
+mark tag=done

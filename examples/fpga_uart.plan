@@ -1,0 +1,16 @@
+description "Program iCEstick with the bundled UART-echo bitstream; capture 3s of UART."
+
+# Uses the @uart.bin blob shipped in this examples/ directory.
+#
+# Manual submission via CLI:
+#   python3 submit.py examples/fpga_uart.plan \
+#     --blob uart.bin=examples/uart.bin \
+#     --wait 30 --extract /tmp/fpga-uart
+
+expect "FPGA UART image programmed and running"
+
+fpga:program bin=@uart.bin
+fpga:uart_open
+delay ms=3000
+fpga:uart_close
+mark tag=done

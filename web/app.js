@@ -333,16 +333,23 @@ function renderInventory() {
 // --- actions ---------------------------------------------------------
 
 async function submitPlanText(text, meta = {}, btn) {
+  return submitPlanBody({
+    body: text,
+    contentType: "text/plain",
+  }, meta, btn);
+}
+
+async function submitPlanBody({ body, contentType }, meta = {}, btn) {
   if (btn) btn.disabled = true;
   const out = $("#submit-result");
   if (out) out.innerHTML = "<div class='hint'>submitting...</div>";
   try {
-    const headers = { "Content-Type": "text/plain" };
+    const headers = { "Content-Type": contentType };
     for (const [k, v] of Object.entries(meta)) {
       if (v != null && v !== "") headers[`X-Test-${k}`] = String(v);
     }
     const r = await fetch("/submit", {
-      method: "POST", headers, body: text,
+      method: "POST", headers, body,
     });
     const data = await r.json().catch(() => ({}));
     // Treat the server's idempotency states as "we already have or are
@@ -501,16 +508,40 @@ async function loadExamples() {
   }
 }
 
+// Track which example was last loaded from the dropdown. While the
+// textarea content matches what we loaded, submitting routes through
+// /examples/<name>.tar so the server auto-attaches the example's
+// referenced @blobs (blink.bin, uart.ldr, ...) -- otherwise the plan
+// would fail with "blob not in tar" and the operator couldn't run a
+// blob-bearing example without a CLI roundtrip. Once the user types
+// anything, we fall back to plain text submit on their edited body.
+const _exampleState = { name: null, original: "" };
+
 $("#example-picker")?.addEventListener("change", async (ev) => {
   const name = ev.target.value;
-  if (!name) return;
+  if (!name) {
+    _exampleState.name = null;
+    _exampleState.original = "";
+    return;
+  }
   try {
     const r = await fetch(`/examples/${encodeURIComponent(name)}`,
                           { cache: "no-store" });
     if (!r.ok) throw new Error(`/examples/${name}: ${r.status}`);
-    $("#plan-text").value = await r.text();
+    const text = await r.text();
+    $("#plan-text").value = text;
+    _exampleState.name = name;
+    _exampleState.original = text;
   } catch (e) {
     alert(`failed to load example: ${e}`);
+  }
+});
+
+$("#plan-text")?.addEventListener("input", () => {
+  if (_exampleState.name &&
+      $("#plan-text").value !== _exampleState.original) {
+    _exampleState.name = null;
+    _exampleState.original = "";
   }
 });
 
@@ -524,6 +555,29 @@ $("#submit-plan-btn").addEventListener("click", async () => {
   if (rt) meta.Runtime = rt;
   const ut = $("#meta-upload").value;
   if (ut) meta["Upload-Timeout"] = ut;
+  // Unmodified example: route through the server's packer so any
+  // @blob references (blink.bin, uart.ldr, ...) resolve against
+  // the bundled examples/ directory automatically.
+  if (_exampleState.name && text === _exampleState.original) {
+    try {
+      const r = await fetch(
+        `/examples/${encodeURIComponent(_exampleState.name)}.tar`,
+        { cache: "no-store" });
+      if (!r.ok) {
+        const msg = await r.text();
+        alert(`failed to pack example: ${r.status} ${msg}`);
+        return;
+      }
+      const tar = await r.arrayBuffer();
+      await submitPlanBody(
+        { body: tar, contentType: "application/octet-stream" },
+        meta, $("#submit-plan-btn"));
+      return;
+    } catch (e) {
+      alert(`failed to fetch packed example: ${e}`);
+      return;
+    }
+  }
   await submitPlanText(text, meta, $("#submit-plan-btn"));
 });
 
