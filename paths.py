@@ -11,10 +11,8 @@ def write_atomic(path, body):
 
     A unique tempfile is used per call so concurrent writers don't
     collide on a shared "<path>.tmp" name -- ThreadingHTTPServer in
-    server.py runs status pushes in parallel; the poller fires
-    _publish_status from both the main loop and worker threads via
-    the inventory op. ``os.replace`` is atomic on POSIX and overwrites-
-    if-exists on Windows.
+    server.py runs status pushes in parallel. ``os.replace`` is
+    atomic on POSIX and overwrites-if-exists on Windows.
     """
     d = os.path.dirname(path) or "."
     fd, tmp = tempfile.mkstemp(

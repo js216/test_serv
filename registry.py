@@ -31,11 +31,6 @@ class DeviceRegistry:
         self.cache = {}        # "dsp.A" -> (handle, opened_at, last_used, refs)
         self.per_dev_lock = {} # "dsp.A" -> threading.RLock
         self.verify_results = {}  # "dsp.A" -> {t, ok, err, latency_ms}
-        # Set by the poller in its main(); session._run_inventory and
-        # any other on-demand caller can fire it to push the current
-        # devices/ops/leases JSONs to the server right now instead of
-        # waiting for the next 15s refresh tick.
-        self.publish_status = None
         # Lease registry: token -> {"devices": set, "expires_at": monotonic}.
         # Persists across sessions so an agent can hold devices for an
         # extended debug window. Reaper expires entries; lease_blocks_us()
@@ -129,10 +124,11 @@ class DeviceRegistry:
                 f"no device matches {plugin_name}"
                 + (f".{spec_id}" if spec_id else ""))
         if len(candidates) > 1 and spec_id is None:
+            ids = ", ".join(sorted(c.split(".", 1)[1] for c in candidates))
             raise LookupError(
-                f"ambiguous: {plugin_name} has {len(candidates)} instances; "
-                f"specify id"
-            )
+                f"ambiguous: {plugin_name} has {len(candidates)} "
+                f"instances ({ids}); use `{plugin_name}.<id>:op` "
+                f"to disambiguate")
         return candidates[0]
 
     def list_devices(self):

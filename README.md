@@ -204,8 +204,9 @@ Control verbs:
   sweep, `POST /sweep` first.
 - `fork name=IDENT` ... `end` -- run the enclosed op list in a thread;
   a plan can contain several `fork` blocks, each joined at its `end`.
-- `open` / `close` on any device -- pin or release its handle for the
-  remainder of the session, overriding the default lazy acquire.
+- `open` / `close` on any device -- pin the handle across multiple
+  ops in the same session (avoids paying the open cost per op for
+  plugins where setup is expensive, e.g. FT4222 SPI ~100 ms).
 
 Unknown device, op, arg, or arg type is rejected before any hardware
 is touched.

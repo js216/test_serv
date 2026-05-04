@@ -466,16 +466,13 @@ class Session:
         # (which actually open every device) live in POST /sweep so an
         # agent who just wants the device map doesn't pay for I/O on
         # every call.
+        #
+        # The poller's main loop pushes status to the server on a
+        # 15s tick. inventory used to also publish on demand so the
+        # dashboard refreshed faster, but having two refresh paths
+        # made dashboards see stale data only sometimes; the tick is
+        # the single source of truth now.
         self.registry.refresh()
-        # Also push the freshly probed state to the server right away so
-        # an `inventory` op from the web UI updates the dashboard
-        # without waiting for the next 15 s tick.
-        publish = getattr(self.registry, "publish_status", None)
-        if callable(publish):
-            try:
-                publish()
-            except Exception:
-                traceback.print_exc()
 
         devices = self.registry.list_devices()
         ops_map = {

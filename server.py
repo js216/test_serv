@@ -32,7 +32,9 @@ CANCEL = os.path.join(STATE_DIR, "cancel")
 
 # Examples dir is relative to this file -- bench-operator-owned starter plans.
 EXAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
-# Static UI lives next to server.py.
+# Static UI lives next to server.py. Serving the dashboard from the
+# same process as the broker means the agent's SSH tunnel reaches
+# both endpoints with one port forward; no extra static-server to run.
 WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
 STATIC_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
