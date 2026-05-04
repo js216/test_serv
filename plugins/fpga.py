@@ -294,12 +294,15 @@ class FpgaHandle:
         self._ser.flush()
 
     def _drain(self):
+        # See mp135._drain: snapshot self._ser to avoid AttributeError
+        # if uart_close races to set self._ser = None mid-read.
+        ser = self._ser
         try:
             while not self._stop.is_set():
-                data = self._ser.read(1024)
+                data = ser.read(1024)
                 if data:
                     self._stream.append(data)
-            tail = self._ser.read(4096)
+            tail = ser.read(4096)
             if tail:
                 self._stream.append(tail)
         except Exception:

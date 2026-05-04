@@ -87,12 +87,16 @@ class DspHandle:
                     time.sleep(inter_byte_s)
 
     def _reader_fn(self):
+        # Snapshot self._ser locally; uart_close races to set
+        # self._ser = None after stopping the thread, and a naive
+        # `self._ser.read()` would AttributeError on that path.
+        ser = self._ser
         try:
             while not self._reader_stop.is_set():
-                data = self._ser.read(1024)
+                data = ser.read(1024)
                 if data:
                     self._stream.append(data)
-            tail = self._ser.read(4096)
+            tail = ser.read(4096)
             if tail:
                 self._stream.append(tail)
         except Exception:

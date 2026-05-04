@@ -247,8 +247,20 @@ class Session:
                                f"deadline")
                 return
             if self.canceled:
+                # Record where the cancel landed, with elapsed time.
+                # The last completed op in ops_log gives the operator
+                # the "what was actually running when the cancel
+                # arrived" context they want at 3am.
+                elapsed = time.monotonic() - self.t0
+                last = self.ops_log[-1] if self.ops_log else None
+                last_str = (
+                    f"; last completed op: line {last['line']} "
+                    f"{last['device'] or 'ctrl'}:{last['verb']} "
+                    f"({last['status']})"
+                    if last else "")
                 msg = (f"canceled at op {op.lineno} "
-                       f"({op.device or 'ctrl'}:{op.verb})")
+                       f"({op.device or 'ctrl'}:{op.verb}) "
+                       f"after {elapsed:.1f}s{last_str}")
                 self.log_event("ERROR", "session", msg)
                 self.errors.append(msg + "\n")
                 return

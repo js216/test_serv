@@ -63,12 +63,18 @@ class Mp135Handle:
         self._ser.flush()
 
     def _drain(self):
+        # Snapshot self._ser locally; uart_close sets self._ser = None
+        # after self._stop.set(), and a naive `self._ser.read()` could
+        # AttributeError after that race. Local ref keeps the read on
+        # a (possibly closed-by-now) handle, which raises SerialException
+        # and exits cleanly.
+        ser = self._ser
         try:
             while not self._stop.is_set():
-                data = self._ser.read(1024)
+                data = ser.read(1024)
                 if data:
                     self._stream.append(data)
-            tail = self._ser.read(4096)
+            tail = ser.read(4096)
             if tail:
                 self._stream.append(tail)
         except Exception:

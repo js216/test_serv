@@ -48,6 +48,12 @@ _active_lock = threading.Lock()
 
 
 class _Tee:
+    # Errors we must swallow so a closed-stream / pipe-closed during
+    # process teardown doesn't blow up the worker thread. Anything else
+    # (including OSError from a full disk) surfaces -- otherwise a
+    # disk-full bench would silently stop logging.
+    _SAFE_TEE_ERRORS = (BrokenPipeError, ValueError)
+
     def __init__(self, *streams):
         self._streams = streams
     def write(self, s):
@@ -55,15 +61,38 @@ class _Tee:
             try:
                 st.write(s)
                 st.flush()
-            except Exception:
+            except self._SAFE_TEE_ERRORS:
                 pass
         return len(s)
     def flush(self):
         for st in self._streams:
             try:
                 st.flush()
-            except Exception:
+            except self._SAFE_TEE_ERRORS:
                 pass
+
+
+# log.txt rotation: if the file already has >LOG_ROTATE_BYTES at
+# startup, rename it to log.txt.1 (replacing any prior .1) and start
+# fresh. Bounds bench-host disk usage from a runaway plugin trace
+# without forcing the operator to wire up logrotate.
+LOG_ROTATE_BYTES = 64 * 1024 * 1024
+
+
+def _rotate_log_if_large(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size < LOG_ROTATE_BYTES:
+        return
+    backup = path + ".1"
+    try:
+        if os.path.exists(backup):
+            os.unlink(backup)
+        os.rename(path, backup)
+    except OSError:
+        pass
 
 HTTP_PORT = int(os.environ.get("TEST_SERV_PORT", "8080"))
 POLL_INTERVAL_S = 2.5
@@ -275,8 +304,20 @@ def _drain_release_markers(registry):
         names = os.listdir(RELEASE)
     except FileNotFoundError:
         return
+    import re as _re
+    safe = _re.compile(r"^[A-Za-z0-9._-]+$")
     for n in names:
         path = os.path.join(RELEASE, n)
+        # Defence in depth: server-side validation already gates the
+        # marker filename, but if RELEASE is ever populated by another
+        # path (dropped file, future feature) we don't want to call
+        # release_now("..").
+        if not safe.match(n):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
         try:
             ok = registry.release_now(n)
             os.remove(path)
@@ -517,6 +558,7 @@ def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):
 def main():
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     os.makedirs(PENDING, mode=0o700, exist_ok=True)
+    _rotate_log_if_large(LOG)
     log_f = open(LOG, "a", buffering=1, encoding="utf-8", errors="replace")
     sys.stdout = _Tee(sys.__stdout__, log_f)
     sys.stderr = _Tee(sys.__stderr__, log_f)

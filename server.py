@@ -65,6 +65,22 @@ MAX_ARTEFACT_BYTES = 256 * 1024 * 1024
 MAX_PLAN_BYTES = 16 * 1024 * 1024
 # Status snapshots are small JSON.
 MAX_STATUS_BYTES = 4 * 1024 * 1024
+
+# Hard ceiling on the queue depth so a runaway agent loop can't fill
+# the disk before the poller picks up. Returns 429 when reached;
+# legitimate workloads stay well below.
+MAX_QUEUED_PLANS = 256
+# Refuse new submissions / artefacts when the state-dir filesystem
+# has less than this much free space. 1 GiB is comfortably above any
+# single reasonable artefact and gives the operator headroom to clean
+# up before the disk actually fills.
+MIN_FREE_DISK_BYTES = 1 * 1024 * 1024 * 1024
+# OUTPUTS GC: artefacts older than this auto-delete. 7 days is long
+# enough that an agent catching up after a weekend still sees its
+# results; short enough that a forgetful agent doesn't pile up
+# tarballs forever.
+OUTPUT_MAX_AGE_S = 7 * 24 * 3600
+GC_INTERVAL_S = 3600.0  # background sweep cadence
 # Allowed extension for artefact uploads. Used to also accept ".txt"
 # for a manifest sentinel; that's gone -- agents poll completion via
 # HEAD /outputs/<digest>.tar and read the manifest out of the tar.
@@ -98,6 +114,66 @@ def _read_file(path):
 _write_atomic = paths.write_atomic
 
 
+def _disk_full():
+    """Return True if STATE_DIR's filesystem has less than
+    MIN_FREE_DISK_BYTES free. Used to gate /submit and artefact
+    uploads with a clean 507 instead of letting _write_atomic
+    fail mid-write with ENOSPC.
+    """
+    import shutil
+    try:
+        return shutil.disk_usage(STATE_DIR).free < MIN_FREE_DISK_BYTES
+    except OSError:
+        return False
+
+
+def _queued_plan_count():
+    try:
+        return sum(1 for n in os.listdir(INPUTS) if n.endswith(".plan"))
+    except FileNotFoundError:
+        return 0
+
+
+def _gc_outputs(now=None):
+    """Delete artefacts and DONE/<digest>.plan records whose mtime
+    is older than OUTPUT_MAX_AGE_S. Best-effort; missing files are
+    treated as already gone.
+    """
+    cutoff = (now or time.time()) - OUTPUT_MAX_AGE_S
+    removed = 0
+    for d in (OUTPUTS, DONE):
+        try:
+            names = list(os.listdir(d))
+        except FileNotFoundError:
+            continue
+        for n in names:
+            p = os.path.join(d, n)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.unlink(p)
+                    removed += 1
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+    return removed
+
+
+def _gc_loop():
+    """Background sweep -- runs once per GC_INTERVAL_S, daemon thread.
+    Single-tenant server, light enough to inline.
+    """
+    while True:
+        time.sleep(GC_INTERVAL_S)
+        try:
+            n = _gc_outputs()
+            if n:
+                print(f"output GC: removed {n} stale file(s)")
+        except Exception:
+            import traceback as _tb
+            _tb.print_exc()
+
+
 # Two named per-submission knobs honoured by the runner. Anything
 # else an agent might want to convey about a job goes in the in-plan
 # `description "..."` line. Generic X-Test-* passthrough used to
@@ -123,6 +199,8 @@ def queue_job(body, meta=None):
     # and race on rewrites. The dedupe check (os.path.exists(dst))
     # would otherwise be a TOCTOU racing against another writer.
     with _submit_lock:
+        if _queued_plan_count() >= MAX_QUEUED_PLANS:
+            return digest, "queue_full"
         stale = [
             n for n in os.listdir(OUTPUTS)
             if n.startswith(f"{digest}.")
@@ -297,6 +375,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 json.dumps({"status": "too_large",
                             "limit": MAX_PLAN_BYTES}).encode(), status=413)
+        if _disk_full():
+            return self._send_json(
+                json.dumps({"status": "disk_full"}).encode(), status=507)
         body = self.rfile.read(n) if n else b""
         if not body:
             return self._send_json(
@@ -314,6 +395,16 @@ class Handler(BaseHTTPRequestHandler):
             meta["description"] = desc
         digest, status = queue_job(body, meta)
 
+        if status == "queue_full":
+            self.send_response(429)
+            self.send_header("Retry-After", "30")
+            self.send_header("Content-Type", "application/json")
+            body = json.dumps({"status": "queue_full",
+                               "limit": MAX_QUEUED_PLANS}).encode()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if status == "stale_outputs":
             return self._send_json(
                 json.dumps({"status": "stale_outputs",
@@ -498,6 +589,10 @@ class Handler(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         if n < 0 or n > MAX_ARTEFACT_BYTES:
             self.send_response(413)
+            self.end_headers()
+            return
+        if _disk_full():
+            self.send_response(507)
             self.end_headers()
             return
         body = self.rfile.read(n) if n else b""
@@ -866,6 +961,7 @@ def main():
         os.makedirs(d, mode=0o700, exist_ok=True)
     print(f"state dir: {STATE_DIR}")
     print(f"listening on 127.0.0.1:{args.port}")
+    threading.Thread(target=_gc_loop, daemon=True).start()
     ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 
