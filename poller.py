@@ -269,11 +269,19 @@ def _publish_status(registry, plugins_by_name):
     _push_status("ops.json", ops)
 
 
+_signaled_cancels = set()  # digests this poller has already signalled
+_signaled_lock = threading.Lock()
+
+
 def _drain_cancels():
-    """Pull any cancel markers the server has accumulated and signal
-    the corresponding session(s) running on this poller. The HTTP
-    GET /cancels also clears the markers server-side, so each cancel
-    fires exactly once.
+    """Pull cancel markers and signal the matching active sessions.
+
+    The server now keeps cancel markers across reads so a marker that
+    arrives mid-dispatch is found again on the next tick once the
+    Session is registered. To avoid re-signalling (and re-logging)
+    the same cancel every 2.5s for the duration of pack+spool+upload,
+    track which digests we've already signalled in this process.
+    Entries are evicted when the session leaves _active_sessions.
     """
     base = f"http://localhost:{HTTP_PORT}"
     try:
@@ -286,17 +294,25 @@ def _drain_cancels():
         digests = json.loads(body.decode())
     except Exception:
         return
+    # Garbage-collect _signaled_cancels for jobs we no longer track.
+    with _signaled_lock, _active_lock:
+        _signaled_cancels.intersection_update(_active_sessions)
     for d in digests:
+        with _signaled_lock:
+            if d in _signaled_cancels:
+                continue
         with _active_lock:
             sess = _active_sessions.get(d)
-        if sess is not None:
-            sess.signal_cancel()
-            print(datetime.now(), f"[{d[:8]}] cancel signaled")
-        else:
-            # Job already completed before the marker arrived, or
-            # never reached this poller -- harmless.
-            print(datetime.now(),
-                  f"[{d[:8]}] cancel marker but no active session")
+        if sess is None:
+            # Job already completed (artefact upload unlinks the
+            # marker server-side) or hasn't been picked up by this
+            # poller yet. Either way, nothing to signal right now;
+            # next tick will re-check.
+            continue
+        sess.signal_cancel()
+        with _signaled_lock:
+            _signaled_cancels.add(d)
+        print(datetime.now(), f"[{d[:8]}] cancel signaled")
 
 
 def _drain_release_markers(registry):
@@ -464,10 +480,25 @@ def _failure_artefact(job_id, message):
     import io
     import tarfile
     buf = io.BytesIO()
+    now_wall = time.time()
+    iso = datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds")
+    # Mirror the success-path manifest shape so a script reading
+    # /outputs/<digest>.tar's manifest.json sees the same keys
+    # whether the run succeeded, errored, or never started. status
+    # is the discriminator.
     manifest = {
         "status": "failed",
         "message": message,
         "job_id": job_id,
+        "t0_monotonic": time.monotonic(),
+        "t0_wall_iso": iso,
+        "t0_wall_unix": now_wall,
+        "runtime_s": 0.0,
+        "streams": [],
+        "n_ops": 0,
+        "n_errors": 1,
+        "required_devices": [],
+        "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
     }
     manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
     with tarfile.open(fileobj=buf, mode="w") as tf:

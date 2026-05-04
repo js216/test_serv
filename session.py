@@ -4,6 +4,7 @@
 
 import io
 import json
+import os
 import tarfile
 import threading
 import time
@@ -50,6 +51,19 @@ class Stream:
             if not self.closed:
                 self.records.append((t, bytes(data)))
 
+    def replace(self, data):
+        """Drop all prior records and replace with a single payload.
+        Used by control verbs (inventory) that produce one self-
+        contained JSON document per call -- two calls in one plan
+        would otherwise concatenate two JSON blobs into an
+        unparseable stream.
+        """
+        t = time.monotonic() - self.t0
+        with self.lock:
+            if self.closed:
+                return
+            self.records = [(t, bytes(data))]
+
     def close(self):
         with self.lock:
             self.closed = True
@@ -75,6 +89,11 @@ class Session:
         self.plan = plan
         self.runtime_s = runtime_s
         self.t0 = time.monotonic()
+        # Wall-clock anchor so timeline.log + manifest can be
+        # correlated to lab clocks (dmesg, syslog, oscilloscope
+        # screenshots) at 3am. monotonic alone is meaningless to
+        # a human reading an old artefact.
+        self.t0_wall = time.time()
         self.streams = {}
         self.events = []       # list of dicts for timeline.log
         self.ops_log = []      # list of dicts for ops.jsonl
@@ -532,9 +551,12 @@ class Session:
                 },
             }
 
-        self.stream("bench.devices.json").append(
+        # replace() instead of append(): a plan calling `inventory`
+        # twice should leave one JSON document per stream, not two
+        # concatenated blobs that the artefact-reader can't parse.
+        self.stream("bench.devices.json").replace(
             (json.dumps(devices, indent=2, sort_keys=True) + "\n").encode())
-        self.stream("bench.ops.json").append(
+        self.stream("bench.ops.json").replace(
             (json.dumps(ops_map, indent=2, sort_keys=True) + "\n").encode())
         self.log_event(
             "INVENTORY", "ctrl",
@@ -565,7 +587,16 @@ def render_timeline(session, bytes_budget_per_stream=8192):
             all_rows.append((t, f"STREAM   {name:<20} {printable!r}"))
 
     all_rows.sort(key=lambda r: r[0])
-    lines = [f"{t:8.3f}  {body}" for t, body in all_rows]
+    # Render every row twice: a session-relative seconds offset (cheap
+    # to scan visually for relative timing) plus the wall-clock ISO
+    # timestamp (so an oncall engineer can correlate to dmesg /
+    # syslog / scope screenshots taken at the same wall time).
+    wall = session.t0_wall
+    lines = []
+    for t, body in all_rows:
+        iso = datetime.fromtimestamp(wall + t).isoformat(
+            timespec="milliseconds")
+        lines.append(f"{iso}  {t:8.3f}  {body}")
     return "\n".join(lines) + "\n"
 
 
@@ -573,13 +604,21 @@ def pack_artefact(session):
     """Build the .tar artefact. Returns (tar_bytes, manifest_text)."""
     buf = io.BytesIO()
     from plan import required_devices as _req_devs
+    bench_id = os.environ.get("TEST_SERV_BENCH_ID")
+    t0_wall_iso = datetime.fromtimestamp(session.t0_wall).isoformat(
+        timespec="milliseconds")
+    n_errors = len(session.errors)
     manifest = {
+        "status": "ok" if n_errors == 0 else "errors",
         "t0_monotonic": session.t0,
+        "t0_wall_iso": t0_wall_iso,
+        "t0_wall_unix": session.t0_wall,
         "runtime_s": time.monotonic() - session.t0,
         "streams": sorted(session.streams.keys()),
         "n_ops": len(session.ops_log),
-        "n_errors": len(session.errors),
+        "n_errors": n_errors,
         "required_devices": sorted(_req_devs(session.plan)),
+        "bench_id": bench_id,
     }
     manifest_text = json.dumps(manifest, indent=2) + "\n"
 

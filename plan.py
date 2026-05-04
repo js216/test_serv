@@ -114,11 +114,18 @@ def parse_text(text):
     total = 0
 
     for lineno, raw in enumerate(text.splitlines(), 1):
-        line = raw.split("#", 1)[0].strip()
-        if not line:
+        if not raw.strip():
             continue
+        # Use shlex with comment handling enabled so `#` inside a
+        # quoted string isn't treated as the start of a comment.
+        # Plain `raw.split("#", 1)[0]` ate any '#' regardless of
+        # quoting, which broke `description "see issue #123"` and
+        # any URL embedded in an arg.
         try:
-            toks = shlex.split(line, posix=True)
+            lex = shlex.shlex(raw, posix=True)
+            lex.commenters = "#"
+            lex.whitespace_split = True
+            toks = list(lex)
         except ValueError as e:
             raise PlanError(f"line {lineno}: tokenize: {e}")
         if not toks:
@@ -134,14 +141,13 @@ def parse_text(text):
             ops.append(Op(lineno=lineno, device=device, verb=verb,
                           args=_parse_args(rest, lineno)))
         elif head == "description":
-            # Special-case: rest of line is free-form text. Accept the
-            # k=v form (`description text="..."`) too for grammar
-            # symmetry, but the canonical and recommended form is just
-            # `description "<short summary of what this plan does>"`.
-            if rest and "=" in rest[0]:
-                args = _parse_args(rest, lineno)
-            else:
-                args = {"text": Value("str", " ".join(rest))}
+            # Single supported form: `description "<free text>"`.
+            # The previous parser also accepted `description text="..."`
+            # for k=v symmetry, but that branch was indistinguishable
+            # from `description "x=1"` after shlex tokenization and
+            # silently swallowed the user's text. Free-form positional
+            # is the only form now.
+            args = {"text": Value("str", " ".join(rest))}
             ops.append(Op(lineno=lineno, device=None, verb="description",
                           args=args))
         elif head in CONTROL_VERBS:
@@ -203,22 +209,15 @@ def load_tar(data):
 
 
 def looks_like_tar(data):
-    # ustar/POSIX magic at offset 257; many writers omit it. Fall back
-    # to: a real tar starts with a printable filename in offsets 0..99,
-    # padded with NUL. Plan text starts with non-NUL printable too --
-    # but the size field at offset 124 is 11 octal digits + space, not
-    # arbitrary text. Sniffing magic first and the size field next
-    # catches both PAX and old-ustar tars without false-positiving on
-    # plan.txt.
-    if len(data) < 512:
-        return False
-    if data[257:262] == b"ustar":
-        return True
-    try:
-        int(data[124:135].rstrip(b" \x00") or b"0", 8)
-        return data[100:108].rstrip(b" \x00").isdigit() or False
-    except (ValueError, AttributeError):
-        return False
+    # Strict ustar/POSIX magic check at offset 257. tarfile.open() in
+    # the rest of the codebase uses Python's tarfile, which writes
+    # ustar headers, and submit.py/run_md.py/web/app.js are the only
+    # producers in practice -- they all use Python's tarfile too. So
+    # we only accept what we'd produce. The previous sniff also tried
+    # to detect "old-ustar" tars without magic by validating the size
+    # field, but `int(b"" or b"0", 8) = 0` always succeeds, making
+    # that branch a no-op that false-positived on long plan.txts.
+    return len(data) >= 512 and data[257:262] == b"ustar"
 
 
 def extract_description(data):

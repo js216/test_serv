@@ -414,15 +414,55 @@ class FpgaPlugin(DevicePlugin):
                 "ft2232h_serial": match["serial"] if want_serial else "",
                 "serial_port": uart_port,
                 "baudrate": int(inst.get("baudrate", FPGA_BAUD_DEFAULT)),
+                "expected_uart_vid": inst.get("expected_uart_vid"),
+                "expected_uart_pid": inst.get("expected_uart_pid"),
+                "expected_uart_serial": inst.get("expected_uart_serial"),
+                "expected_uart_interface": inst.get("expected_uart_interface"),
                 "description": inst.get("description"),
             })
         return out
 
     def open(self, spec):
-        return FpgaHandle(serial_port=spec.get("serial_port"),
-                          baud=spec["baudrate"],
-                          ft2232h_desc=spec["ft2232h_desc"],
-                          ft2232h_serial=spec.get("ft2232h_serial") or None)
+        # MPSSE-channel identity: re-walk the enumerated FTDI device
+        # list and confirm the iSerial we got from probe is still
+        # there. probe ran some seconds (or 15s) ago; the real check
+        # has to happen at open time. We don't actually open the
+        # MPSSE channel here -- _program_flash does that lazily --
+        # but failing fast on a missing chip beats a confusing
+        # error inside the flash sequence.
+        want_serial = spec.get("ft2232h_serial") or None
+        ft_desc = spec["ft2232h_desc"]
+        if want_serial:
+            devs = _usb.ftd2xx_devices() or []
+            if not any(d["description"] == ft_desc and d["serial"] == want_serial
+                       for d in devs):
+                raise RuntimeError(
+                    f"fpga: FT2232H {want_serial!r} ({ft_desc!r}) not "
+                    f"enumerated; saw "
+                    f"{sorted(d['serial'] for d in devs) or '(none)'}")
+        # UART side: pin VID/PID/iSerial if config gave them.
+        # Catches a Windows re-enumeration that lands the configured
+        # COM port on a sibling FTDI chip's channel B. _identity_-
+        # verified is set so verify_sweep reports the truth.
+        port = spec.get("serial_port")
+        verified = False
+        if port:
+            verified = _usb.verify_com_identity(
+                port, label="fpga.uart",
+                exp_vid=spec.get("expected_uart_vid"),
+                exp_pid=spec.get("expected_uart_pid"),
+                exp_serial=spec.get("expected_uart_serial"),
+                exp_interface=spec.get("expected_uart_interface"))
+        h = FpgaHandle(serial_port=spec.get("serial_port"),
+                       baud=spec["baudrate"],
+                       ft2232h_desc=spec["ft2232h_desc"],
+                       ft2232h_serial=spec.get("ft2232h_serial") or None)
+        # If either MPSSE serial or UART identity was pinned + verified,
+        # mark the handle as identity-verified so verify_sweep doesn't
+        # report "open ok (no handshake)" misleadingly.
+        if want_serial or verified:
+            h._identity_verified = True
+        return h
 
     def close(self, handle):
         # Flush UART buffers before close in case an interrupted
