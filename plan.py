@@ -9,7 +9,12 @@ from dataclasses import dataclass
 from typing import Optional
 
 
-MAX_PLAN_BYTES = 256 * 1024
+# Cap on plan.txt text (just the grammar lines, no blobs). The
+# server-side request-body cap that covers the whole packed tar
+# lives in server.py as MAX_PLAN_BYTES; these are different
+# numbers because they protect different things. 256 KiB of grammar
+# is already more than any sane plan could need.
+MAX_PLAN_TEXT_BYTES = 256 * 1024
 # 512 MiB per blob is enough for a signed SD-card image used as a
 # DFU flashlayout target; still bounded to keep the poller-host RAM
 # cost predictable. Raise if you need full-image updates, but mind
@@ -115,8 +120,8 @@ def _parse_args(tokens, lineno):
 
 def parse_text(text):
     """Parse plan text into a flat list of Op."""
-    if len(text) > MAX_PLAN_BYTES:
-        raise PlanError(f"plan too large: {len(text)} > {MAX_PLAN_BYTES}")
+    if len(text) > MAX_PLAN_TEXT_BYTES:
+        raise PlanError(f"plan too large: {len(text)} > {MAX_PLAN_TEXT_BYTES}")
     ops = []
     total = 0
 
@@ -181,7 +186,7 @@ def parse_text(text):
 
 def load_tar(data):
     """Load a .plan tar: one 'plan.txt' member + arbitrary blob members."""
-    if len(data) > MAX_PLAN_BYTES + MAX_BLOB_BYTES * MAX_BLOBS + 65536:
+    if len(data) > MAX_PLAN_TEXT_BYTES + MAX_BLOB_BYTES * MAX_BLOBS + 65536:
         raise PlanError("tar too large")
     try:
         tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:")
@@ -202,7 +207,7 @@ def load_tar(data):
             continue
         body = f.read()
         if name == "plan.txt":
-            if len(body) > MAX_PLAN_BYTES:
+            if len(body) > MAX_PLAN_TEXT_BYTES:
                 raise PlanError("plan.txt too large")
             plan_text = body.decode("utf-8", errors="strict")
         else:
