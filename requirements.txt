@@ -1,8 +1,12 @@
 # Runtime dependencies for the bench poller.
-# The server (server.py) and the agent client (submit.py, run_md.py)
+# The server (server.py) and the agent clients (submit.py, run_md.py)
 # are pure-stdlib -- they don't need anything from this file.
-# Each line is annotated with which plugin pulls the dep so a bench
-# that doesn't use a given device can skip the matching install.
+#
+# *** EVERY LINE BELOW IS OPTIONAL. ***
+# The poller try-imports each driver lazily; a bench that doesn't use
+# a given device skips the matching install and the corresponding
+# plugin's probe just returns "no devices." So you only need the
+# packages your bench actually uses.
 
 # UART -- mp135, dsp, bench_mcu, fpga (channel B), ssh probe path.
 pyserial>=3.5
@@ -11,7 +15,8 @@ pyserial>=3.5
 ftd2xx>=1.3.3
 
 # FTDI FT4222 SPI -- dsp (SPI link to the eval board).
-ft4222>=1.10
+# Distributed on PyPI as `pyft4222`; imported in code as `ft4222`.
+pyft4222>=1.10
 
 # libusb device enumeration -- _usb.winusb_device_present, used by
 # msc and dfu probe paths to confirm the bootloader is enumerated.

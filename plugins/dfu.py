@@ -262,68 +262,72 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     _track_subproc(proc)
-
-    seen_running = [False]
-    seen_reconnect = [False]
-    reader_err = []
-    deadline = time.monotonic() + timeout_s
-
-    stream_out = session.stream("dfu.flash.stdout")
-
-    def _reader():
-        try:
-            while True:
-                line = proc.stdout.readline()
-                if not line:
-                    return
-                stream_out.append(line)
-                if b"RUNNING Program" in line:
-                    seen_running[0] = True
-                if b"Reconnecting the device" in line:
-                    seen_reconnect[0] = True
-                    return
-        except Exception as e:
-            reader_err.append(repr(e))
-
-    t = threading.Thread(target=_reader, daemon=True)
-    t.start()
-
-    # Wait for either the reader to signal reconnect, cubeprog to
-    # exit, the session to be canceled, or the overall timeout.
-    canceled = False
-    while time.monotonic() < deadline:
-        if seen_reconnect[0]:
-            break
-        if proc.poll() is not None:
-            break
-        if session.canceled:
-            canceled = True
-            break
-        time.sleep(0.05)
-
-    # Kill path: give cubeprog a chance to exit cleanly, then escalate.
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=5)
-
-    # Drain whatever's left on both pipes.
     try:
-        _rest_stdout, rest_stderr = proc.communicate(timeout=5)
-    except Exception:
-        _rest_stdout, rest_stderr = (b"", b"")
-    if _rest_stdout:
-        stream_out.append(_rest_stdout)
-    if rest_stderr:
-        session.stream("dfu.flash.stderr").append(rest_stderr)
-    t.join(timeout=2)
-    # proc has fully exited and we're past every kill path; drop it
-    # from the shutdown registry so a SIGINT after this point doesn't
-    # try to SIGKILL an already-reaped pid.
-    _untrack_subproc(proc)
+        seen_running = [False]
+        seen_reconnect = [False]
+        reader_err = []
+        deadline = time.monotonic() + timeout_s
+
+        stream_out = session.stream("dfu.flash.stdout")
+
+        def _reader():
+            try:
+                while True:
+                    line = proc.stdout.readline()
+                    if not line:
+                        return
+                    stream_out.append(line)
+                    if b"RUNNING Program" in line:
+                        seen_running[0] = True
+                    if b"Reconnecting the device" in line:
+                        seen_reconnect[0] = True
+                        return
+            except Exception as e:
+                reader_err.append(repr(e))
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+
+        # Wait for either the reader to signal reconnect, cubeprog to
+        # exit, the session to be canceled, or the overall timeout.
+        canceled = False
+        while time.monotonic() < deadline:
+            if seen_reconnect[0]:
+                break
+            if proc.poll() is not None:
+                break
+            if session.canceled:
+                canceled = True
+                break
+            time.sleep(0.05)
+
+        # Kill path: cubeprog gets a chance to exit cleanly, then
+        # we escalate.
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+        # Drain whatever's left on both pipes.
+        try:
+            _rest_stdout, rest_stderr = proc.communicate(timeout=5)
+        except Exception:
+            _rest_stdout, rest_stderr = (b"", b"")
+        if _rest_stdout:
+            stream_out.append(_rest_stdout)
+        if rest_stderr:
+            session.stream("dfu.flash.stderr").append(rest_stderr)
+        t.join(timeout=2)
+    finally:
+        # _untrack_subproc unconditionally so an unexpected raise
+        # from any of the wait/communicate/terminate paths above
+        # doesn't leak the Popen into _active_subprocs forever
+        # (where a later SIGINT would try to SIGKILL an already-
+        # reaped pid; harmless on Linux, brittle in general).
+        _untrack_subproc(proc)
 
     if reader_err:
         session.log_event("DFU", "dfu:flash_layout",

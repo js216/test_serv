@@ -500,6 +500,66 @@ def test_expect_lands_in_manifest():
     reg.close_all()
 
 
+def test_stream_truncation_marker_survives_multiple_cap_hits():
+    """L1 regression: the previous Stream impl stored the truncation
+    marker as a record at index 0 on first cap-hit and silently
+    popped it on the second cap-hit. snapshot_bytes() / snapshot_-
+    timestamped() must still produce the marker after multiple
+    eviction cycles.
+    """
+    from session import Stream, STREAM_MAX_BYTES
+    s = Stream("x", t0=time.monotonic())
+    chunk = b"a" * (STREAM_MAX_BYTES // 4)
+    # Fill past the cap so eviction starts.
+    for _ in range(8):
+        s.append(chunk)
+    snap1 = s.snapshot_bytes()
+    assert b"STREAM TRUNCATED" in snap1, "marker missing after 1st cycle"
+    # Fill again past the cap; the marker would be the oldest record
+    # in the previous impl and would be silently popped.
+    for _ in range(8):
+        s.append(chunk)
+    snap2 = s.snapshot_bytes()
+    assert b"STREAM TRUNCATED" in snap2, (
+        "marker silently dropped on second cap-hit cycle (L1 regression)")
+    # Same for the timestamped snapshot (used by render_timeline).
+    recs = s.snapshot_timestamped()
+    assert any(b"STREAM TRUNCATED" in r[1] for r in recs), recs
+
+
+def test_lease_claim_rejects_lease_pseudo_device():
+    """L3 regression: an agent could claim `lease._default` (the
+    lease plugin's own probe pseudo-device) and lock the lease
+    subsystem bench-wide, since every other session's lease op
+    would acquire lease._default and hit the lease check."""
+    from plugins.lease import LeasePlugin
+    plugins = {"lease": LeasePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    try:
+        reg.lease_claim(["lease._default"], 60)
+    except Exception as e:
+        assert "lease plugin" in str(e) or "pseudo" in str(e), str(e)
+    else:
+        raise AssertionError(
+            "lease_claim must reject lease._default (L3 regression)")
+    reg.close_all()
+
+
+def test_failure_artefact_carries_identity_fields():
+    """L8 regression: _failure_artefact's manifest must carry
+    run_id, plan_digest, code_digest so an aggregator scripting on
+    those fields doesn't see null on failed runs."""
+    import poller
+    tar = poller._failure_artefact("a" * 64, "test failure")
+    with tarfile.open(fileobj=io.BytesIO(tar), mode="r") as tf:
+        m = json.loads(tf.extractfile("manifest.json").read())
+    assert m["status"] == "failed"
+    assert m["plan_digest"] == "a" * 64, m
+    assert m["run_id"] and m["run_id"].startswith("sess-"), m
+    assert m["code_digest"] is not None, m
+    assert m["blob_digests"] == {}, m
+
+
 def test_check_record_lands_in_manifest():
     """A plugin's session.record_check call must populate
     manifest.checks[] with a structured pass/fail record."""
@@ -550,6 +610,9 @@ def main():
         test_spool_unique_per_attempt,
         test_lease_lifecycle,
         test_expect_lands_in_manifest,
+        test_stream_truncation_marker_survives_multiple_cap_hits,
+        test_lease_claim_rejects_lease_pseudo_device,
+        test_failure_artefact_carries_identity_fields,
         test_check_record_lands_in_manifest,
     ]
     failed = 0

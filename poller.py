@@ -431,6 +431,17 @@ def _publish_status(registry, plugins_by_name):
     _write_atomic(os.path.join(STATUS, "devices.json"), devices)
     _push_status("devices.json", devices)
 
+    # bench.json: small file the dashboard reads to render the bench
+    # identity in the header. Lets a multi-bench operator see at a
+    # glance which bench they're talking to right now (vs hunting
+    # through artefacts for manifest.bench_id).
+    bench = json.dumps({
+        "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
+        "code_digest": _CODE_DIGEST,
+    }).encode()
+    _write_atomic(os.path.join(STATUS, "bench.json"), bench)
+    _push_status("bench.json", bench)
+
     _publish_inflight()
 
     ops_map = {}

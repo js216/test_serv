@@ -4,6 +4,7 @@
 
 import argparse
 import hashlib
+import sys
 import io
 import json
 import os
@@ -48,7 +49,8 @@ STATIC_CONTENT_TYPES = {
 }
 # Names the poller is allowed to push into the STATUS dir. Anything
 # else is rejected so a foreign POST can't drop arbitrary files there.
-ALLOWED_STATUS_FILES = ("devices.json", "ops.json", "inflight.json")
+ALLOWED_STATUS_FILES = (
+    "devices.json", "ops.json", "inflight.json", "bench.json")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -386,6 +388,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "inflight":
             return self._send_json(
                 _read_file(os.path.join(STATUS, "inflight.json")) or b"[]")
+        if path == "bench":
+            return self._send_json(
+                _read_file(os.path.join(STATUS, "bench.json")) or b"{}")
         if path == "jobs":
             return self._list_jobs()
         if path == "cancels":
@@ -1160,9 +1165,22 @@ def main():
     for d in (INPUTS, OUTPUTS, DONE, STATUS, RELEASE, SWEEP, CANCEL):
         os.makedirs(d, mode=0o700, exist_ok=True)
     print(f"state dir: {STATE_DIR}")
-    print(f"listening on 127.0.0.1:{args.port}")
     threading.Thread(target=_gc_loop, daemon=True).start()
-    _BoundedThreadingServer(("127.0.0.1", args.port), Handler).serve_forever()
+    try:
+        srv = _BoundedThreadingServer(
+            ("127.0.0.1", args.port), Handler)
+    except OSError as e:
+        # EADDRINUSE: print one actionable line instead of a stock
+        # OSError traceback. Most common path for an operator
+        # accidentally double-launching the server.
+        if e.errno in (98, 48):  # EADDRINUSE Linux/BSD
+            print(f"port {args.port} is already in use. Either stop "
+                  f"the existing process or pass --port=N to pick "
+                  f"another.", file=sys.stderr)
+            sys.exit(2)
+        raise
+    print(f"listening on 127.0.0.1:{args.port}")
+    srv.serve_forever()
 
 
 if __name__ == "__main__":

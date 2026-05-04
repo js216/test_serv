@@ -153,11 +153,19 @@ POST /devices/<id>/release    # drop an idle cached handle
 One op per line. Blank lines and `# comments` ignored.
 
 ```
-device:op k=v k=v ...          # device op, args typed per plugin
-device:open / device:close     # pin the handle across ops
+plugin:op k=v k=v ...          # plugin alone, when only one
+                               # instance is configured
+plugin.id:op k=v k=v ...       # specific instance when several
+                               # exist (e.g. mp135.evb / mp135.custom)
+plugin.id:open / :close        # pin the handle across ops
 ctrl-verb    k=v ...           # control: mark, delay, inventory,
                                # description, expect
 ```
+
+The `plugin:op` short form errors with `ambiguous: 2 instances` when
+the bench has more than one instance of the named plugin. Lease ops
+(`lease:claim devices=...`) require fully-qualified `plugin.id`
+strings in the device list.
 
 Values are parsed as:
 
@@ -178,9 +186,15 @@ Control verbs:
 - `expect "<plain-text claim>"` -- record the human-readable
   *intent* of the plan, surfaced in `manifest.expectations[]`. This
   is descriptive only -- nothing checks it. Machine-checkable
-  pass/fail records are in `manifest.checks[]`, populated by ops
-  like `*:uart_expect` (which writes `kind=uart_expect, status=hit`
-  on match or `status=timeout` on miss).
+  pass/fail records live in a *separate* list, `manifest.checks[]`,
+  populated by ops like `*:uart_expect` (which writes
+  `kind=uart_expect, status=hit` on match or `status=timeout` on
+  miss). Note: the verb `expect` and the op suffix `*_expect` are
+  different things despite sharing the word -- one records intent,
+  the other actually waits for bytes. A plan that uses only `expect`
+  and never any `*_expect` op (or `scope:capture`, `msc:verify`,
+  ...) comes back with `manifest.status: "inert"` -- the run
+  proved nothing.
 - `inventory` -- return the bench poller's device list and supported
   ops as `bench.devices.json` and `bench.ops.json` files in the
   artefact tar. Always refreshes the device probe; for a full identity

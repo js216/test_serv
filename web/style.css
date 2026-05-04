@@ -368,3 +368,7 @@ code {
   word-break: break-all;
   font-size: 11px;
 }
+
+.bench-id { padding: 2px 6px; border-radius: 3px; font-size: 11px; margin-right: 8px; }
+.bench-id-set { background: #2a4a2a; color: #afa; }
+.bench-id-unset { background: #4a3a2a; color: #fa9; }

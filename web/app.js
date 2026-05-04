@@ -78,21 +78,37 @@ async function jget(path) {
 
 async function refresh() {
   try {
-    const [devices, ops, jobs, inflight] = await Promise.all([
+    const [devices, ops, jobs, inflight, bench] = await Promise.all([
       jget("/devices"),
       jget("/ops"),
       jget("/jobs"),
       jget("/inflight").catch(() => []),
+      jget("/bench").catch(() => ({})),
     ]);
     state.devices = devices;
     state.ops = ops;
     state.jobs = jobs;
     state.inflight = Array.isArray(inflight) ? inflight : [];
+    state.bench = bench || {};
     state.lastFetch = Date.now();
     renderAll();
+    renderBenchId();
     setPollStatus("ok");
   } catch (e) {
     setPollStatus("err", e.message);
+  }
+}
+
+function renderBenchId() {
+  const e = $("#bench-id");
+  if (!e) return;
+  const bid = state.bench && state.bench.bench_id;
+  if (bid) {
+    e.textContent = `bench: ${bid}`;
+    e.className = "bench-id bench-id-set";
+  } else {
+    e.textContent = "bench: (unset — set $TEST_SERV_BENCH_ID)";
+    e.className = "bench-id bench-id-unset";
   }
 }
 
@@ -491,13 +507,38 @@ async function renderArtefact(digest, result) {
   if (!out) return;
   out.innerHTML = "";
 
+  // The /jobs row already surfaces manifest.status via a server-side
+  // peek, but the freshly-submitted-result panel rendered just the
+  // transport status ("done") and hid the more meaningful one.
+  // Read manifest.json proactively so this header tells the operator
+  // the truth (ok / inert / errors / failed / canceled), with the
+  // tooltip explaining what each means.
+  let manifestStatusEl = el("span", {});
+  try {
+    const r = await fetch(`/outputs/${digest}/file/manifest.json`,
+                          { cache: "no-store" });
+    if (r.ok) {
+      const m = await r.json();
+      const ms = m.status;
+      const mtip = m.inert_reason || ({
+        ok: "ran, no errors, at least one check fired",
+        errors: "one or more ops raised; see errors.log",
+        failed: "poller refused before run started",
+        canceled: "DELETE /jobs/<digest> arrived mid-run",
+      })[ms] || "";
+      const cls = (ms === "ok") ? "tag-ok"
+        : (ms === "inert" || ms === "canceled") ? "tag-warn"
+        : "tag-err";
+      manifestStatusEl = el("span",
+        { class: cls, title: mtip }, ms || "?");
+    }
+  } catch (e) {
+    // fall through
+  }
   const header = el("div", { class: "artefact-header" },
     el("span", { class: "artefact-digest", title: digest },
       digest.slice(0, 12) + "…"),
-    el("span", {},
-      result.status === "done"
-        ? el("span", { class: "tag-ok" }, "done")
-        : el("span", { class: "tag-err" }, result.status)),
+    manifestStatusEl,
     el("a", {
       href: `/outputs/${digest}.tar`,
       download: `${digest}.tar`,
@@ -617,6 +658,32 @@ $("#example-picker")?.addEventListener("change", async (ev) => {
       substituted = true;
     }
     $("#plan-text").value = text;
+    // Tell the operator the substitution happened so they know
+    // (a) something changed silently in the textarea, (b) the token
+    // is from a previous run -- if their last claim was on a poller
+    // that has since restarted, the lease is gone and the resume
+    // will fail with "lease unknown or expired."
+    const out = $("#submit-result");
+    if (out) {
+      if (substituted) {
+        out.innerHTML =
+          `<div class='hint'>auto-filled lease_token (` +
+          `${stored.slice(0, 8)}…) from your last claim. ` +
+          `Edit the textarea to override; clear with the ` +
+          `"forget lease token" button.</div>` +
+          `<button id='forget-lease-token' type='button'>` +
+          `forget lease token</button>`;
+        const btn = document.getElementById("forget-lease-token");
+        if (btn) {
+          btn.addEventListener("click", () => {
+            setStoredLeaseToken("");
+            out.innerHTML = "<div class='hint'>lease token forgotten.</div>";
+          });
+        }
+      } else {
+        out.innerHTML = "";
+      }
+    }
     if (substituted) {
       // The dashboard text now differs from examples/<name>.plan; if
       // we left exampleState set, submit would route through

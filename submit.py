@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.request
 
+import plan
 from plan import pack_tar
 
 
@@ -218,10 +219,19 @@ def main():
         return _fetch(args.server, args.fetch, args.extract,
                       force=args.force)
 
-    # .plan = already-packed tar, otherwise treat as plan.txt + blobs.
-    if args.plan.endswith(".plan"):
-        with open(args.plan, "rb") as f:
-            data = f.read()
+    # Sniff the file: a packed plan-tar starts with ustar magic at
+    # offset 257 (plan.looks_like_tar). Plain plan-text gets packed
+    # via _pack_from_plan with --blob attachments. The previous
+    # implementation switched on the `.plan` extension, which
+    # silently treated text-content `examples/*.plan` files as if
+    # they were tarballs and corrupted them on submit. Sniffing the
+    # bytes lets text and tar coexist under the same filename.
+    with open(args.plan, "rb") as f:
+        first = f.read(512)
+        rest = f.read() if len(first) >= 512 else b""
+    head = first + rest
+    if plan.looks_like_tar(head):
+        data = head
     else:
         data = _pack_from_plan(args.plan, args.blob)
 
