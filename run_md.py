@@ -15,7 +15,7 @@ import datetime as _dt
 
 from plan import pack_tar
 from submit import (
-    DEFAULT_SERVER, StaleOutputsError, _delete_outputs, _get_output,
+    DEFAULT_SERVER, StaleOutputsError, _delete_outputs, _get_tar,
     _submit, _wait,
 )
 
@@ -145,56 +145,52 @@ def _collect_blobs(plan_text, md_dir):
     return blobs
 
 
-def _deliver(outputs, digest, out_dir):
-    """Extract tar members + sentinel into out_dir."""
+def _deliver(tar_body, digest, out_dir):
+    """Extract tar members into out_dir, also keep the raw tar."""
     os.makedirs(out_dir, exist_ok=True)
-    sentinel = outputs.get("txt")
-    tar_body = outputs.get("tar")
-    if tar_body is not None:
-        with tarfile.open(fileobj=io.BytesIO(tar_body), mode="r:") as tf:
-            for m in tf.getmembers():
-                if ".." in m.name or m.name.startswith("/"):
-                    raise RuntimeError(f"unsafe member {m.name!r}")
-            try:
-                tf.extractall(out_dir, filter="data")
-            except TypeError:
-                tf.extractall(out_dir)
-        with open(os.path.join(out_dir, f"{digest}.tar"), "wb") as f:
-            f.write(tar_body)
-    if sentinel is not None:
-        with open(os.path.join(out_dir, "sentinel.txt"), "wb") as f:
-            f.write(sentinel)
-    return sentinel
-
-
-def _fetch_outputs(server, digest):
-    txt = _get_output(server, digest, "txt")
-    tar = _get_output(server, digest, "tar")
-    if txt is None and tar is None:
+    if tar_body is None:
         return None
-    return {"txt": txt, "tar": tar}
+    with tarfile.open(fileobj=io.BytesIO(tar_body), mode="r:") as tf:
+        for m in tf.getmembers():
+            if ".." in m.name or m.name.startswith("/"):
+                raise RuntimeError(f"unsafe member {m.name!r}")
+        try:
+            tf.extractall(out_dir, filter="data")
+        except TypeError:
+            tf.extractall(out_dir)
+        # Pull manifest.json out as the "what happened" summary the
+        # caller prints to stdout; same content the .txt sentinel
+        # used to carry, just sourced from the tar.
+        try:
+            f = tf.extractfile("manifest.json")
+            manifest = f.read() if f is not None else None
+        except KeyError:
+            manifest = None
+    with open(os.path.join(out_dir, f"{digest}.tar"), "wb") as f:
+        f.write(tar_body)
+    return manifest
 
 
 def _run_block(plan_text, out_dir, fresh=False, server=DEFAULT_SERVER):
-    """Submit a plan, wait, deliver to out_dir. Returns sentinel bytes."""
+    """Submit a plan, wait, deliver to out_dir. Returns manifest bytes."""
     blobs = _collect_blobs(plan_text, ".")
     data = pack_tar(plan_text, blobs)
     try:
         digest = _submit(data, {}, server)
-        outputs = _wait(server, digest, DEFAULT_WAIT)
+        tar = _wait(server, digest, DEFAULT_WAIT)
     except StaleOutputsError as e:
         digest = str(e)
         if not fresh:
-            outputs = _fetch_outputs(server, digest)
+            tar = _get_tar(server, digest)
         else:
             _delete_outputs(server, digest)
             print(f"fresh: removed stale outputs for {digest}")
             digest = _submit(data, {}, server)
-            outputs = _wait(server, digest, DEFAULT_WAIT)
-    if outputs is None:
+            tar = _wait(server, digest, DEFAULT_WAIT)
+    if tar is None:
         raise RuntimeError(f"timeout waiting for {digest}")
     try:
-        return _deliver(outputs, digest, out_dir)
+        return _deliver(tar, digest, out_dir)
     finally:
         _delete_outputs(server, digest)
 
@@ -419,17 +415,17 @@ def main(argv):
         block_ok = True
 
         try:
-            sentinel = _run_block(
+            manifest = _run_block(
                 plan_text, out_dir, fresh=fresh, server=server)
         except (FileNotFoundError, OSError, RuntimeError) as e:
             print(f"submission error: {e}", file=sys.stderr)
             block_ok = False
-            sentinel = None
+            manifest = None
 
-        if sentinel is not None:
-            sentinel_text = sentinel.decode(
+        if manifest is not None:
+            manifest_text = manifest.decode(
                 "utf-8", errors="replace").rstrip()
-            print(f"--- sentinel ---\n{sentinel_text}")
+            print(f"--- manifest ---\n{manifest_text}")
 
         if block_ok and bullets and not os.path.isfile(verify_path):
             print(f"{VERIFY} missing", file=sys.stderr)

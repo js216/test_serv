@@ -64,8 +64,10 @@ MAX_ARTEFACT_BYTES = 256 * 1024 * 1024
 MAX_PLAN_BYTES = 16 * 1024 * 1024
 # Status snapshots are small JSON.
 MAX_STATUS_BYTES = 4 * 1024 * 1024
-# Allowed extensions for artefact uploads (POST /<digest>.<ext>).
-ARTEFACT_EXTS = ("tar", "txt")
+# Allowed extension for artefact uploads. Used to also accept ".txt"
+# for a manifest sentinel; that's gone -- agents poll completion via
+# HEAD /outputs/<digest>.tar and read the manifest out of the tar.
+ARTEFACT_EXTS = ("tar",)
 
 # Serialize queue_job's check-and-write so two concurrent /submit calls
 # for the same digest can't both pass the duplicate check and race on
@@ -241,6 +243,24 @@ class Handler(BaseHTTPRequestHandler):
             return self._receive_status(m.group(1))
         # artefact upload: /<digest>[.ext]
         return self._artefact(path)
+
+    def do_HEAD(self):
+        # Sole HEAD path: /outputs/<digest>.tar -- cheap completion
+        # poll for clients waiting on a job to finish. 200 when the
+        # tar is on disk, 404 otherwise. No body either way.
+        path = self.path.lstrip("/")
+        m = re.match(r"^outputs/([0-9a-f]{64})\.tar$", path)
+        if not m:
+            self.send_response(404)
+            self.end_headers()
+            return
+        tar_path = os.path.join(OUTPUTS, f"{m.group(1)}.tar")
+        if os.path.exists(tar_path):
+            self.send_response(200)
+            self.send_header("Content-Length", str(os.path.getsize(tar_path)))
+        else:
+            self.send_response(404)
+        self.end_headers()
 
     def do_DELETE(self):
         path = self.path.lstrip("/")
@@ -462,7 +482,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(400)
             self.end_headers()
             return
-        ext_bare = url_ext.lstrip(".") if url_ext else "txt"
+        ext_bare = url_ext.lstrip(".") if url_ext else "tar"
         if ext_bare not in ARTEFACT_EXTS:
             self.send_response(400)
             self.end_headers()
@@ -494,7 +514,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
-        ctype = "application/json" if ext == ".txt" else "application/x-tar"
+        ctype = "application/x-tar"
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))

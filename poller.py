@@ -372,9 +372,8 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         except plan.PlanError as e:
             print(datetime.now(), tag,
                   f"pickup {len(payload)} B  devices=?  parse failed: {e}")
-            tar, txt = _failure_artefact(
-                job_id, f"plan parse failed: {e}")
-            _post_artefacts(job_id, tar, txt, upload_s)
+            tar = _failure_artefact(job_id, f"plan parse failed: {e}")
+            _post_artefact(job_id, tar, upload_s)
             return
 
         needed = sorted(plan.required_devices(parsed))
@@ -385,8 +384,8 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         try:
             _validate_against_plugins(parsed, plugins_by_name, registry)
         except Exception as e:
-            tar, txt = _failure_artefact(job_id, f"validation: {e}")
-            _post_artefacts(job_id, tar, txt, upload_s)
+            tar = _failure_artefact(job_id, f"validation: {e}")
+            _post_artefact(job_id, tar, upload_s)
             return
 
         session = Session(registry, parsed, runtime_s=runtime_s)
@@ -396,8 +395,8 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         with _active_lock:
             _active_sessions[job_id] = session
         session.run_all(plugins_by_name)
-        tar, manifest_text = pack_artefact(session)
-        _post_artefacts(job_id, tar, manifest_text.encode(), upload_s)
+        tar, _manifest_text = pack_artefact(session)
+        _post_artefact(job_id, tar, upload_s)
     finally:
         with _active_lock:
             _active_sessions.pop(job_id, None)
@@ -450,20 +449,15 @@ def _failure_artefact(job_id, message):
         ti = tarfile.TarInfo("errors.log")
         ti.size = len(err)
         tf.addfile(ti, io.BytesIO(err))
-    return buf.getvalue(), manifest_bytes
+    return buf.getvalue()
 
 
-def _post_artefacts(job_id, tar_bytes, sentinel_bytes,
-                    timeout_s=DEFAULT_UPLOAD_S):
+def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):
     base = f"http://localhost:{HTTP_PORT}"
     try:
         _post(f"{base}/{job_id}.tar", tar_bytes, timeout=timeout_s)
     except Exception:
         print(datetime.now(), f"POST .tar failed:\n{traceback.format_exc()}")
-    try:
-        _post(f"{base}/{job_id}.txt", sentinel_bytes, timeout=timeout_s)
-    except Exception:
-        print(datetime.now(), f"POST .txt failed:\n{traceback.format_exc()}")
 
 
 def main():

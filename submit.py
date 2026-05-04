@@ -15,10 +15,6 @@ import urllib.request
 from plan import pack_tar
 
 
-GREEN = "\033[32m"
-RED = "\033[31m"
-RESET = "\033[0m"
-
 DEFAULT_SERVER = os.environ.get("TEST_SERV_URL", "http://localhost:8080")
 
 
@@ -73,14 +69,28 @@ def _submit(data, meta, server):
     return body["digest"]
 
 
-def _get_output(server, digest, ext):
+def _get_tar(server, digest):
     try:
         _status, body, _hdrs = _request(
-            "GET", _url(server, f"outputs/{digest}.{ext}"))
+            "GET", _url(server, f"outputs/{digest}.tar"))
         return body
     except urllib.error.HTTPError as e:
         if e.code == 404:
             return None
+        raise
+
+
+def _head_tar(server, digest):
+    """Cheap completion poll. Returns True iff the tar exists on the
+    server. Used by --wait to avoid downloading the full artefact on
+    every poll tick.
+    """
+    try:
+        _request("HEAD", _url(server, f"outputs/{digest}.tar"))
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
         raise
 
 
@@ -94,10 +104,8 @@ def _delete_outputs(server, digest):
 def _wait(server, digest, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        txt = _get_output(server, digest, "txt")
-        if txt is not None:
-            tar = _get_output(server, digest, "tar")
-            return {"txt": txt, "tar": tar}
+        if _head_tar(server, digest):
+            return _get_tar(server, digest)
         time.sleep(0.05)
     return None
 
@@ -137,47 +145,27 @@ def _extract(data, out_dir):
             tf.extractall(out_dir)
 
 
-def _dump_outputs(outputs, digest, extract_to):
-    txt_bytes = outputs.get("txt")
-    tar_bytes = outputs.get("tar")
-    if txt_bytes is not None:
-        sys.stdout.buffer.write(b"=== sentinel .txt ===\n")
-        sys.stdout.buffer.write(txt_bytes)
-        if not txt_bytes.endswith(b"\n"):
-            sys.stdout.buffer.write(b"\n")
-    if tar_bytes is not None:
-        _summarize_tar(tar_bytes)
-        if extract_to is not None:
-            _extract(tar_bytes, extract_to)
-            tar_path = os.path.join(extract_to, f"{digest}.tar")
-            with open(tar_path, "wb") as f:
-                f.write(tar_bytes)
-            sys.stdout.buffer.write(
-                f"\nextracted to {extract_to}\n".encode())
+def _dump_outputs(tar_bytes, digest, extract_to):
+    if tar_bytes is None:
+        return
+    _summarize_tar(tar_bytes)
+    if extract_to is not None:
+        _extract(tar_bytes, extract_to)
+        tar_path = os.path.join(extract_to, f"{digest}.tar")
+        with open(tar_path, "wb") as f:
+            f.write(tar_bytes)
+        sys.stdout.buffer.write(
+            f"\nextracted to {extract_to}\n".encode())
     sys.stdout.buffer.flush()
-    return txt_bytes
 
 
-def _compare(txt_bytes, expected_path):
-    with open(expected_path, "rb") as f:
-        expected = f.read()
-    if txt_bytes == expected:
-        print(f"{GREEN}SUCCESS{RESET}")
-        return 0
-    print(f"{RED}FAIL{RESET}")
-    return 1
-
-
-def _fetch(server, digest, expected_path, extract_to):
-    txt = _get_output(server, digest, "txt")
-    tar = _get_output(server, digest, "tar")
-    if txt is None and tar is None:
+def _fetch(server, digest, extract_to):
+    tar = _get_tar(server, digest)
+    if tar is None:
         print(f"no outputs for digest {digest}", file=sys.stderr)
         return 1
-    txt = _dump_outputs({"txt": txt, "tar": tar}, digest, extract_to)
+    _dump_outputs(tar, digest, extract_to)
     _delete_outputs(server, digest)
-    if expected_path is not None:
-        return _compare(txt, expected_path)
     return 0
 
 
@@ -196,7 +184,6 @@ def main():
                          f"(default: {DEFAULT_SERVER})")
     ap.add_argument("--wait", type=float,
                     help="block up to N seconds for artefacts")
-    ap.add_argument("--expected", help="compare sentinel .txt against this")
     ap.add_argument("--extract", metavar="DIR",
                     help="extract artefact tarball into DIR (keeps the tar)")
     ap.add_argument("--runtime", type=float,
@@ -213,7 +200,7 @@ def main():
         ap.error("either a plan file or --fetch DIGEST is required")
 
     if args.fetch:
-        return _fetch(args.server, args.fetch, args.expected, args.extract)
+        return _fetch(args.server, args.fetch, args.extract)
 
     # .plan = already-packed tar, otherwise treat as plan.txt + blobs.
     if args.plan.endswith(".plan"):
@@ -242,15 +229,13 @@ def main():
         print(digest)
         return 0
 
-    outputs = _wait(args.server, digest, args.wait)
-    if outputs is None:
+    tar = _wait(args.server, digest, args.wait)
+    if tar is None:
         print(f"timeout waiting for {digest}", file=sys.stderr)
         return 1
 
-    txt = _dump_outputs(outputs, digest, args.extract)
+    _dump_outputs(tar, digest, args.extract)
     _delete_outputs(args.server, digest)
-    if args.expected is not None:
-        return _compare(txt, args.expected)
     return 0
 
 

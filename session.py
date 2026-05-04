@@ -558,12 +558,6 @@ def pack_artefact(session):
         for name, stream in session.streams.items():
             safe = name.replace("/", "_")
             _add(tf, f"streams/{safe}.bin", stream.snapshot_bytes())
-            # Binary index: repeated (f8 t_s, u4 len) then payloads follow.
-            idx = io.BytesIO()
-            import struct
-            for t, data in stream.snapshot_timestamped():
-                idx.write(struct.pack("<dI", t, len(data)))
-            _add(tf, f"streams/{safe}.ts", idx.getvalue())
 
     return buf.getvalue(), manifest_text
 

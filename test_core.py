@@ -141,8 +141,8 @@ def test_session_runs_and_artefact_has_expected_shape():
     tf = tarfile.open(fileobj=io.BytesIO(tar_out), mode="r:")
     members = set(tf.getnames())
     expected = {"manifest.json", "timeline.log", "ops.jsonl",
-                "errors.log", "streams/foo.bin", "streams/foo.ts",
-                "streams/fake.log.bin", "streams/fake.log.ts"}
+                "errors.log", "streams/foo.bin",
+                "streams/fake.log.bin"}
     missing = expected - members
     assert not missing, f"missing from artefact tar: {missing}"
 

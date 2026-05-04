@@ -108,22 +108,21 @@ Response:
 409 {"status": "stale_outputs", "digest": "<sha256>"}
 ```
 
-Optional request headers become job metadata for the poller:
+Two optional request headers tune the poller:
 
 ```
-X-Test-Runtime: 30
-X-Test-Anything: value
+X-Test-Runtime: 30          # per-session deadline in seconds
+X-Test-Upload-Timeout: 30   # artefact-POST timeout in seconds
 ```
 
 Fetch results:
 
 ```
-GET /outputs/<digest>.txt    # manifest/completion sentinel
-GET /outputs/<digest>.tar    # full artefact
+HEAD /outputs/<digest>.tar    # 200 when ready, 404 when pending
+GET  /outputs/<digest>.tar    # full artefact
 ```
 
-Both return `404` until the poller has posted that output. After a
-successful fetch, clean up server-held results:
+After a successful fetch, clean up server-held results:
 
 ```
 DELETE /outputs/<digest>
@@ -211,8 +210,9 @@ is touched.
 
 ### artefact layout
 
-One tarball posted as `<digest>.tar`, plus a short `<digest>.txt`
-(the manifest JSON) used as the completion sentinel.
+One tarball at `<digest>.tar`. Clients poll completion with
+`HEAD /outputs/<digest>.tar` (200 = ready, 404 = pending) and then
+`GET` the tar.
 
 ```
 manifest.json         status, streams list, runtime, n_ops, n_errors
@@ -220,7 +220,6 @@ timeline.log          merged human-sortable timeline of events + streams
 ops.jsonl             one JSON record per op: verb, start, end, status
 errors.log            tracebacks, only when something failed
 streams/NAME.bin      raw bytes per stream (uart, scope csv, prbs mismatches...)
-streams/NAME.ts       binary index: (<d t_s>,<u4 len>) records per stream
 ```
 
 Read `manifest.json` first, then `timeline.log`. Pull `streams/*.bin`
