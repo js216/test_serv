@@ -190,7 +190,7 @@ One op per line. Blank lines and `# comments` ignored.
 ```
 device:op k=v k=v ...          # device op, args typed per plugin
 ctrl-verb    k=v ...           # control: barrier, mark, delay,
-                               # wall_time, inventory, fork, end, join,
+                               # inventory, fork, end, join,
                                # open, close
 ```
 
@@ -209,8 +209,6 @@ Control verbs:
 
 - `delay ms=N`
 - `mark tag=NAME` / `barrier tag=NAME` -- checkpoints in the timeline
-- `wall_time` -- return the bench poller's wall clock as
-  `bench.time.json` in the artefact.
 - `inventory [refresh=true] [verify=false]` -- return the bench
   poller's device list and supported ops as `bench.devices.json` and
   `bench.ops.json` streams in the artefact. `refresh=false` skips the

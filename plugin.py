@@ -62,25 +62,16 @@ class DevicePlugin:
         raise NotImplementedError
 
     def close(self, handle):
-        """Release a previously-opened handle."""
-        raise NotImplementedError
-
-    def cleanup_after_cancel(self, handle):
-        """Best-effort recovery hook fired when a session ends via
-        cancellation. Default is no-op. Plugins with reclaimable
+        """Release a previously-opened handle. Plugins with reclaimable
         side-effects (stale bytes in a serial RX buffer, an FT4222
-        master left mid-transaction, etc.) override to flush them so
-        the next job sees a clean device. The handle is still open
-        when this runs; ``close()`` fires immediately after.
+        master left mid-transaction) flush them here -- close() runs
+        on every session end, cancel or not, so a clean wipe before
+        teardown is enough; there's no separate cancel hook.
         """
-        pass
+        raise NotImplementedError
 
 
 class BusyError(RuntimeError):
-    pass
-
-
-class DeviceLostError(RuntimeError):
     pass
 
 

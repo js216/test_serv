@@ -162,18 +162,6 @@ class Mp135Plugin(DevicePlugin):
             })
         return out
 
-    def cleanup_after_cancel(self, handle):
-        # The session was canceled while uart_open was active, so the
-        # background reader is still draining, and the agent's plan
-        # may have left half-typed bytes in either direction. Flush
-        # both buffers so the next session's uart_open starts clean.
-        ser = getattr(handle, "_ser", None)
-        if ser is not None:
-            try: ser.reset_input_buffer()
-            except Exception: pass
-            try: ser.reset_output_buffer()
-            except Exception: pass
-
     def open(self, spec):
         h = Mp135Handle(port=spec["serial_port"], baud=spec["baudrate"])
 
@@ -243,4 +231,13 @@ class Mp135Plugin(DevicePlugin):
         return h
 
     def close(self, handle):
+        # Flush UART buffers before close so the next session's
+        # uart_open starts clean even if an op was interrupted
+        # mid-write.
+        ser = getattr(handle, "_ser", None)
+        if ser is not None:
+            try: ser.reset_input_buffer()
+            except Exception: pass
+            try: ser.reset_output_buffer()
+            except Exception: pass
         handle.uart_close()

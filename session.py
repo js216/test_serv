@@ -13,7 +13,7 @@ from datetime import datetime
 
 from plan import PlanError
 from plugin import Op as OpSchema
-from plugin import BusyError, decode_args, DeviceLostError
+from plugin import BusyError, decode_args
 
 
 DEFAULT_SESSION_S = 600.0
@@ -263,36 +263,12 @@ class Session:
                 except Exception:
                     pass
             self.pinned.clear()
-            # On cancel, fire each plugin's post-cancel cleanup hook
-            # before close, so the next job sees a clean device.
-            # Hardware state from a half-finished op (partial flash,
-            # partial MSC write) can't be magicked away here -- but
-            # bytes-in-serial-buffer, mid-transaction FT4222 handles,
-            # etc. all get reset.
-            #
-            # `registry.acquire` here bumps the cache entry's refs for
-            # the duration of the cleanup call, so the reaper thread
-            # can't TTL-evict and close the handle out from under us.
-            # If the device has vanished from registry.specs (probe
-            # said it's gone), LookupError surfaces and we skip --
-            # nothing to clean up on a vanished device.
-            if self.canceled:
-                for key in sorted(self.touched_keys):
-                    try:
-                        spec_pname_pair = self.registry.specs.get(key)
-                        if spec_pname_pair is None:
-                            continue
-                        pname, _spec = spec_pname_pair
-                        pl = plugins.get(pname)
-                        if pl is None:
-                            continue
-                        with self.registry.acquire(key) as handle:
-                            pl.cleanup_after_cancel(handle)
-                        self.log_event(
-                            "CLEANUP", "session",
-                            f"{key}: post-cancel cleanup ran")
-                    except Exception:
-                        traceback.print_exc()
+            # release_now closes each touched device's cached handle
+            # (refs are zero by now -- pinning released above, op-level
+            # acquires released as each op returned). Each plugin's
+            # close() does its own pre-close flush, so a canceled
+            # session tears down cleanly without a separate cleanup
+            # hook.
             for key in sorted(self.touched_keys):
                 try:
                     if self.registry.release_now(key):
@@ -469,8 +445,6 @@ class Session:
             # we don't care which since _run_block re-tests
             # self.canceled at the next iteration.
             self.cancel_event.wait(max(0.0, ms.as_int() / 1000.0))
-        elif v == "wall_time":
-            self._run_wall_time()
         elif v == "inventory":
             self._run_inventory(op, plugins)
         elif v == "fork":
@@ -489,17 +463,6 @@ class Session:
                 text.raw if (text and hasattr(text, "raw")) else "")
         else:
             raise PlanError(f"unknown control verb {v!r}")
-
-    def _run_wall_time(self):
-        now = datetime.now().astimezone()
-        rec = {
-            "iso": now.isoformat(timespec="microseconds"),
-            "unix_s": time.time(),
-            "tz": now.tzname(),
-        }
-        self.stream("bench.time.json").append(
-            (json.dumps(rec, indent=2, sort_keys=True) + "\n").encode())
-        self.log_event("TIME", "ctrl", rec["iso"])
 
     def _run_inventory(self, op, plugins):
         verify = op.args.get("verify")
@@ -598,11 +561,6 @@ class Session:
                         "args": {},
                         "optional_args": {"tag": "ident"},
                         "doc": "Add a named checkpoint to timeline.log.",
-                    },
-                    "wall_time": {
-                        "args": {},
-                        "optional_args": {},
-                        "doc": "Return bench.time.json with poller wall time.",
                     },
                 },
             },

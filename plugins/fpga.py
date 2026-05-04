@@ -422,14 +422,12 @@ class FpgaPlugin(DevicePlugin):
                           ft2232h_serial=spec.get("ft2232h_serial") or None)
 
     def close(self, handle):
-        handle.uart_close()
-
-    def cleanup_after_cancel(self, handle):
-        # UART side: flush stale bytes left by an interrupted
-        # uart_write or partial expect.
+        # Flush UART buffers before close in case an interrupted
+        # uart_write or partial expect left stale bytes.
         ser = getattr(handle, "_ser", None)
         if ser is not None:
             try: ser.reset_input_buffer()
             except Exception: pass
             try: ser.reset_output_buffer()
             except Exception: pass
+        handle.uart_close()
