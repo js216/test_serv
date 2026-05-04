@@ -229,6 +229,59 @@ def load_tar(data):
     return Plan(ops=ops, blobs=blobs, text=plan_text)
 
 
+def extract_description(source):
+    """Return the first top-level ``description "<text>"`` value from a
+    plan, or ``None`` if absent / unparseable. ``source`` may be:
+
+    * a parsed list of ``Op`` (top-level only -- nested ``description``
+      inside a fork is intentionally ignored, since meta is a
+      whole-plan attribute);
+    * a ``Plan`` instance;
+    * raw plan text (str or bytes), in which case parsing is run and
+      any ``PlanError`` is swallowed -- callers ask for the
+      description as a *labeling* convenience and don't want a malformed
+      plan to fail their request.
+
+    This is the single source of truth for "what is this plan called?";
+    server.py and any other meta-extractor should defer here rather
+    than re-implementing description detection.
+    """
+    if isinstance(source, Plan):
+        ops = source.ops
+    elif isinstance(source, list):
+        ops = source
+    else:
+        if isinstance(source, bytes):
+            source = source.decode("utf-8", errors="replace")
+        try:
+            ops = parse_text(source)
+        except PlanError:
+            return None
+    for op in ops:
+        if op.verb == "description":
+            v = op.args.get("text")
+            if v is not None:
+                return v.raw if hasattr(v, "raw") else v
+    return None
+
+
+def extract_description_from_tar(data):
+    """Like ``extract_description`` but reads ``plan.txt`` out of a
+    submitted .plan tarball without running the full ``load_tar``
+    blob-validation pass. Returns ``None`` on any tar/parse failure --
+    the caller (server queue path) treats the description as a label
+    and tolerates absence.
+    """
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tf:
+            f = tf.extractfile("plan.txt")
+            if f is None:
+                return None
+            return extract_description(f.read())
+    except (tarfile.TarError, OSError, KeyError):
+        return None
+
+
 def _check_blob_refs(ops, available):
     def walk(op_list):
         for op in op_list:

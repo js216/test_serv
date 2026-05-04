@@ -10,12 +10,12 @@ import os
 import random
 import re
 import tarfile
-import tempfile
 import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
 import paths
+import plan
 
 STATE_DIR = paths.state_dir()
 INPUTS = os.path.join(STATE_DIR, "inputs")
@@ -91,48 +91,6 @@ def _read_file(path):
 
 
 _write_atomic = paths.write_atomic
-
-
-def _extract_plan_description(text):
-    """Find the first top-level ``description "<text>"`` line in a
-    plan.txt body. Server-side, parser-free; tolerant of malformed
-    plans -- failures fall through to "no description". Used by both
-    /submit and /submit-text to populate the job's meta dict at queue
-    time, so the dashboard can label entries without parsing the full
-    plan or opening the artefact.
-    """
-    if isinstance(text, bytes):
-        text = text.decode("utf-8", errors="replace")
-    import shlex
-    for raw in text.splitlines():
-        line = raw.split("#", 1)[0].strip()
-        if not line:
-            continue
-        try:
-            toks = shlex.split(line, posix=True)
-        except ValueError:
-            continue
-        if len(toks) < 2 or toks[0] != "description":
-            continue
-        rest = toks[1:]
-        # k=v form: `description text="..."`
-        if rest[0].startswith("text="):
-            return rest[0][len("text="):]
-        # positional form: `description "..."` (shlex already
-        # stripped the outer quotes).
-        return " ".join(rest)
-    return None
-
-
-def _extract_plan_description_from_tar(body):
-    try:
-        with tarfile.open(fileobj=io.BytesIO(body), mode="r") as tf:
-            f = tf.extractfile("plan.txt")
-            if f is None:
-                return None
-            return _extract_plan_description(f.read())
-    except (tarfile.TarError, OSError, KeyError):
-        return None
 
 
 def queue_job(body, meta=None):
@@ -301,7 +259,7 @@ class Handler(BaseHTTPRequestHandler):
         # In-plan `description "..."` line wins over (and populates) the
         # meta dict if the agent didn't set one any other way.
         if "description" not in meta:
-            desc = _extract_plan_description_from_tar(body)
+            desc = plan.extract_description_from_tar(body)
             if desc:
                 meta["description"] = desc
         digest, status = queue_job(body, meta)
@@ -349,7 +307,7 @@ class Handler(BaseHTTPRequestHandler):
             if k.lower().startswith("x-test-"):
                 meta[k[len("X-Test-"):].lower()] = v
         if "description" not in meta:
-            desc = _extract_plan_description(text)
+            desc = plan.extract_description(text)
             if desc:
                 meta["description"] = desc
         digest, status = queue_job(body, meta)
