@@ -45,6 +45,13 @@ def _op_claim(session, h, args):
     token = session.registry.lease_claim(devices, duration_s)
     session.lease_token = token
     session.lease_just_claimed = True
+    # If the caller asked for auto-release, mark the lease so the
+    # session's finally block drops it on session end. Useful for
+    # one-plan workflows ("claim, do work, release") that don't
+    # want to leave the bench locked if something goes wrong
+    # mid-plan; for cross-session holds, leave default (false).
+    if bool(args.get("auto_release_on_session_end")):
+        session.lease_release_on_end = True
     # The token is the credential. Don't write it to a stream or to
     # event-msg text -- both surface in the live /inflight feed any
     # other tunnel client can read every 2.5s, allowing trivial
@@ -112,13 +119,17 @@ class LeasePlugin(DevicePlugin):
     ops = {
         "claim": Op(
             args={"devices": "str", "duration_s": "int"},
+            optional_args={"auto_release_on_session_end": "bool"},
             doc=("Claim devices=\"dsp.A,fpga.hx1k\" duration_s=600. "
                  "The issued token is delivered ONLY in the artefact's "
                  "manifest.json under \"lease_token\" -- never in "
                  "streams or timeline events, so it doesn't leak via "
                  "the live /inflight feed to other tunnel clients. "
                  "Fetch the artefact, read manifest.json, pass the "
-                 "token to subsequent `resume` ops."),
+                 "token to subsequent `resume` ops. Pass "
+                 "auto_release_on_session_end=true for one-plan "
+                 "workflows where you want the bench unlocked on "
+                 "session end (the default is to hold across plans)."),
             run=_op_claim),
         "resume": Op(
             args={"token": "str"},

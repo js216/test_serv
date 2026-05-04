@@ -217,6 +217,9 @@ class Session:
         # False if we just resumed someone else's claim. Only the
         # claiming run's manifest publishes the token.
         self.lease_just_claimed = False
+        # True iff lease:claim auto_release_on_session_end=true was
+        # set; the finally block drops the lease on session end.
+        self.lease_release_on_end = False
         # Plan/run identity, set by the dispatcher before run_all.
         # Surfaces in manifest.json so an aggregator can group runs
         # of the same plan without parsing plan.txt.
@@ -484,6 +487,16 @@ class Session:
                         self.registry.pinned_specs.pop(k, None)
             for s in self.streams.values():
                 s.close()
+            # If the lease was claimed in this session with
+            # auto_release_on_session_end=true, drop the lease now
+            # so the bench unlocks on session end rather than
+            # holding for the full duration_s. Default is the
+            # original cross-session-hold behaviour.
+            if (getattr(self, "lease_release_on_end", False)
+                    and self.lease_token is not None):
+                self.registry.lease_release(self.lease_token)
+                self.log_event("LEASE", "session",
+                               "auto-released on session end")
             # Release deferred locks (acquired mid-session) first, then
             # eager locks. Reverse of acquisition order in both lists.
             for lk in reversed(self._deferred_locks):
@@ -832,12 +845,14 @@ def render_timeline(session, bytes_budget_per_stream=8192):
             take = min(len(data), bytes_budget_per_stream - inlined)
             chunk = data[:take]
             inlined += take
+            # Leading '>' marks stream-chunk rows so an operator can
+            # cleanly grep events out of streams: `grep -v ' > '`.
             # Single repr() round so a literal backslash and a real
             # newline render distinguishably -- the manual
             # replace("\n","\\n") then repr() collapsed both 0x5C 0x6E
             # and 0x0A to the same characters in the timeline.
             printable = repr(chunk.decode("utf-8", errors="replace"))
-            all_rows.append((t, f"STREAM   {name:<20} {printable}"))
+            all_rows.append((t, f"> STREAM {name:<20} {printable}"))
 
     all_rows.sort(key=lambda r: r[0])
     # Render every row twice: a session-relative seconds offset (cheap
