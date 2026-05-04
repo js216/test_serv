@@ -21,7 +21,7 @@ dsp:boot ldr=@pattern.ldr
 
 # Boot settles, then send pattern over QSPI single-lane at 5 MHz.
 delay ms=200
-dsp:qspi_write_prbs seed=0xC0FFEE n=4096 clk_div=8 mode=1
+dsp:qspi_write_prbs seed=0xC0FFEE n=4096 clk_div=8 mode=1 chunk_size=512
 delay ms=100
 
 # FPGA prints its own "OK" once it saw all 4096 bytes with matching PRBS.

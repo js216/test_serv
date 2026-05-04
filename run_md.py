@@ -346,7 +346,6 @@ def main(argv):
         print("error: --ledger and --module must be used together",
               file=sys.stderr)
         return 1
-    log_handle = _install_log(log_path) if log_path is not None else None
 
     if os.path.isfile(TEST_MD):
         src = TEST_MD
@@ -396,6 +395,11 @@ def main(argv):
     if os.path.isdir(out_root):
         shutil.rmtree(out_root)
     os.makedirs(out_root, exist_ok=True)
+    # Install the log AFTER the rmtree -- a --log path inside OUT_DIR
+    # would otherwise be silently deleted out from under the open fd
+    # (Linux: writes go to an orphaned inode, file vanishes; Windows:
+    # rmtree fails with "in use" and aborts the whole run).
+    log_handle = _install_log(log_path) if log_path is not None else None
 
     checks_map = {}
     for plan_text, bullets in pairs:

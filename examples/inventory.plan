@@ -8,7 +8,7 @@ description "Probe the bench and dump device + op tables."
 #
 #   python3 submit.py examples/inventory.plan --wait 30 --extract /tmp/inv
 #
-# Then read /tmp/inv/streams/bench.devices.json.bin to see what the
-# poller can see, and bench.ops.json.bin for the per-plugin op map.
+# Then read /tmp/inv/bench.devices.json to see what the poller can
+# see, and bench.ops.json for the per-plugin op map.
 
 inventory

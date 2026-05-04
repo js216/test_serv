@@ -56,8 +56,8 @@ A trivial inventory plan, end to end:
 ```
 printf 'inventory\n' > /tmp/inventory.txt
 python3 submit.py --server http://localhost:8080 /tmp/inventory.txt --extract /tmp/inv --wait 30
-cat /tmp/inv/streams/bench.devices.json.bin   # devices the poller can see
-cat /tmp/inv/streams/bench.ops.json.bin       # per-plugin op signatures
+cat /tmp/inv/bench.devices.json   # devices the poller can see
+cat /tmp/inv/bench.ops.json       # per-plugin op signatures
 ```
 
 For a full identity-verified sweep before returning the device list,

@@ -890,12 +890,18 @@ def pack_artefact(session):
         name: _hashlib.sha256(data).hexdigest()
         for name, data in (getattr(session.plan, "blobs", {}) or {}).items()
     }
-    # Status discriminator: "ok" vs "inert" vs "errors". A run that
-    # produced no machine-checkable claim (no *_expect, no scope
-    # summary, no msc:verify) is "inert" -- it survived but proved
-    # nothing. The reader who scripts on `status == "ok"` then knows
-    # the run actually checked something.
-    if n_errors:
+    # Status discriminator: "canceled" vs "errors" vs "inert" vs
+    # "ok". "canceled" wins over "errors" so a script reading the
+    # manifest can distinguish "operator gave up mid-run" from "DUT
+    # misbehaved". The cancel reason still lives in errors.log for
+    # debug context. A run that produced no machine-checkable claim
+    # (no *_expect, no scope:capture, no msc:verify, ...) is "inert"
+    # -- it survived but proved nothing. The reader who scripts on
+    # `status == "ok"` then knows the run actually checked something.
+    if session.canceled:
+        status = "canceled"
+        inert_reason = None
+    elif n_errors:
         status = "errors"
         inert_reason = None
     elif not session.checks:

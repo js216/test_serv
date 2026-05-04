@@ -442,7 +442,17 @@ class _BoundedThreadingServer(ThreadingHTTPServer):
                 self.shutdown_request(request)
                 return
             self._active_workers += 1
-        super().process_request(request, client_address)
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            # Thread.start() can raise (RuntimeError under fd / memory
+            # pressure, OSError EAGAIN). Without this rollback the
+            # counter pins at _max_workers and every subsequent
+            # connection 503s forever -- the bench HTTP wedges with
+            # no diagnostic.
+            with self._worker_lock:
+                self._active_workers -= 1
+            raise
 
     def process_request_thread(self, request, client_address):
         try:

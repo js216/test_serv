@@ -4,6 +4,7 @@
 
 import hashlib
 import http.client
+import io
 import json
 import os
 import re
@@ -295,7 +296,17 @@ def _post_streamed(url, data, timeout):
         _progress_dots("", 0, -1)
         resp = conn.getresponse()
         # Drain so the connection can be reused / closed cleanly.
-        resp.read()
+        body = resp.read()
+        # Mirror urllib.urlopen semantics: raise on non-2xx so the
+        # spool-aware retry path in _post_spooled can distinguish 409
+        # (park under refused/) from 5xx (retry next tick) and from
+        # other 4xx (terminal). Without this, _post_streamed silently
+        # returns the int status and the caller's try/except never
+        # fires, which is a data-loss path for any artefact >= 1 MiB.
+        if resp.status >= 400:
+            raise urllib.error.HTTPError(
+                url, resp.status, resp.reason or "",
+                dict(resp.getheaders()), io.BytesIO(body))
         return resp.status
     finally:
         conn.close()
@@ -410,19 +421,28 @@ def _snapshot_inflight():
     return out
 
 
+_was_active_inflight = False
+
+
 def _publish_inflight():
     """Publish only the inflight snapshot. Cheap; called on every
     poll-loop tick (2.5s) so the dashboard's live tail tracks the
-    bench in near-real-time. Skips entirely when no session is
-    active so an idle bench doesn't churn the network.
+    bench in near-real-time. Skips the network push when the bench
+    has been idle so an idle bench doesn't churn the tunnel -- but
+    forces one push on the busy->idle transition so the server's
+    inflight.json doesn't carry the just-finished session's tail
+    forever (the dashboard would attach stale "live" metadata to a
+    completed job's row).
     """
+    global _was_active_inflight
     with _active_lock:
         any_active = bool(_active_sessions)
     inflight = json.dumps(_snapshot_inflight()).encode()
     os.makedirs(STATUS, mode=0o700, exist_ok=True)
     _write_atomic(os.path.join(STATUS, "inflight.json"), inflight)
-    if any_active:
+    if any_active or _was_active_inflight:
         _push_status("inflight.json", inflight)
+    _was_active_inflight = any_active
 
 
 def _publish_status(registry, plugins_by_name):
@@ -533,12 +553,26 @@ def _drain_release_markers(registry):
 
 
 def _drain_sweep_markers(registry, plugins_by_name):
-    """Honour a REST-triggered re-sweep: re-probe + verify + republish."""
+    """Honour a REST-triggered re-sweep: re-probe + verify + republish.
+
+    Defers when any session is active. verify_sweep's per-device open
+    would otherwise race the session's eager dev_lock: the sweep
+    thread blocks for VERIFY_OPEN_TIMEOUT_S, then quarantines the
+    very key the session is currently using, and the session crashes
+    on its next op with "device hung; replug + restart poller". So
+    we leave the marker in place; the next tick (or the one after
+    the session ends) will re-honour it. Same rationale as the
+    SIGHUP handler.
+    """
     try:
         names = os.listdir(SWEEP)
     except FileNotFoundError:
         return
     if not names:
+        return
+    with _active_lock:
+        active = len(_active_sessions)
+    if active:
         return
     print(datetime.now(), "sweep requested via REST")
     registry.refresh()
@@ -916,10 +950,14 @@ def main():
                 _publish_status(registry, plugins_by_name)
                 last_refresh = time.monotonic()
 
-            # Block until a worker slot opens so we don't hold the job
-            # payload in memory unread, and so disk-queued jobs don't
-            # accumulate live Python threads all blocked on locks.
-            worker_slot.acquire()
+            # Try to claim a worker slot, but don't block: if all
+            # workers are busy on long sessions, we still need to drain
+            # cancels / sweeps / pending uploads / publish inflight on
+            # the next tick. Blocking acquire here meant a cancel issued
+            # while the bench was saturated could wait minutes before
+            # being signaled.
+            if not worker_slot.acquire(timeout=POLL_INTERVAL_S):
+                continue
             try:
                 status, body, headers = _get(f"{base}/plan")
             except Exception:
@@ -1000,7 +1038,6 @@ def main():
         except Exception:
             pass
     finally:
-        registry.stop()
         registry.close_all()
 
 

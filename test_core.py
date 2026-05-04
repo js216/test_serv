@@ -152,7 +152,6 @@ def test_session_runs_and_artefact_has_expected_shape():
     statuses = [r["status"] for r in recs]
     assert statuses == ["ok", "ok", "error", "ok"], statuses
 
-    reg.stop()
     reg.close_all()
 
 
@@ -172,7 +171,6 @@ def test_session_closes_touched_handles_at_job_end():
     assert fake.closes == 1
     assert key not in reg.cache
 
-    reg.stop()
     reg.close_all()
 
 
@@ -196,7 +194,6 @@ def test_inventory_returns_devices_and_ops_streams():
     assert "fake" in ops
     assert "emit" in ops["fake"]["ops"]
 
-    reg.stop()
     reg.close_all()
 
 
@@ -369,6 +366,13 @@ def test_cancel_propagates_to_session():
     elapsed = time.monotonic() - t0
     assert elapsed < 0.5, f"delay didn't abort on cancel ({elapsed:.2f}s)"
     assert session.canceled
+    # Round-10 S3: a canceled run must surface as manifest.status
+    # "canceled", not "errors". The README and dashboard both
+    # documented this status; before this fix the discriminator only
+    # produced ok/inert/errors and a script keying off "canceled"
+    # never fired.
+    _, mtxt = pack_artefact(session)
+    assert json.loads(mtxt)["status"] == "canceled", mtxt
     reg.close_all()
 
 

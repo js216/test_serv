@@ -72,11 +72,6 @@ class DeviceRegistry:
         # "replug + restart" signal in /devices verify column.
         self.quarantined = set()
 
-    def stop(self):
-        # Kept for API compatibility with the older TTL-reaper version;
-        # there's no background thread to stop now.
-        pass
-
     def refresh(self):
         """Rescan every plugin's probe() and update specs."""
         # Drop any cached config snapshot so all plugins probe()d in
