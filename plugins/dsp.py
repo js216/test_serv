@@ -71,14 +71,20 @@ class DspHandle:
         self._ser = None
         self._reader_thread = None
 
-    def uart_write(self, data, inter_byte_s=0.05):
+    def uart_write(self, data, inter_byte_s=0.05, session=None):
         if self._ser is None:
             raise RuntimeError("dsp uart not open (call dsp:uart_open first)")
         for ch in data:
+            if session is not None and session.canceled:
+                raise RuntimeError(
+                    "dsp:uart_write canceled mid-byte-stream")
             self._ser.write(bytes([ch]))
             self._ser.flush()
             if inter_byte_s > 0:
-                time.sleep(inter_byte_s)
+                if session is not None:
+                    session.cancel_event.wait(inter_byte_s)
+                else:
+                    time.sleep(inter_byte_s)
 
     def _reader_fn(self):
         try:
@@ -205,6 +211,7 @@ def _op_boot(session, h, args):
     dev = _open_master(h.ft4222_desc, clk_div=8, mode=1, flags=0)
     try:
         for i in range(0, padded, CHUNK):
+            _bail_if_canceled(session, f"dsp:boot @ {i}/{padded}B")
             last = (i + CHUNK) >= padded
             dev.spiMaster_SingleWrite(bytes(buf[i:i+CHUNK]), last)
     finally:
@@ -220,7 +227,7 @@ def _op_uart_close(session, h, args):
 
 
 def _op_uart_write(session, h, args):
-    h.uart_write(decode_escapes(args["data"]))
+    h.uart_write(decode_escapes(args["data"]), session=session)
 
 
 def _op_uart_expect(session, h, args):
@@ -253,7 +260,14 @@ def _validate_chunk_size(mode, chunk_size):
             f"{CHUNK_ABS_MAX}]")
 
 
-def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None):
+def _bail_if_canceled(session, where):
+    if session is not None and session.canceled:
+        raise RuntimeError(
+            f"{where} canceled via DELETE /jobs/<digest>")
+
+
+def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None,
+                  session=None):
     """Write ``data`` in ``chunk_size``-byte CS frames.
 
     mode=1 (SINGLE): chunks are stitched into one CS-low window via
@@ -281,6 +295,7 @@ def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None):
     pfx = bytes(prefix or b"")
     if mode == 1:
         for off in range(0, len(raw), chunk_size):
+            _bail_if_canceled(session, f"dsp:qspi_write @ {off}/{len(raw)}B")
             last = (off + chunk_size) >= len(raw)
             slice_ = raw[off:off+chunk_size]
             dev.spiMaster_SingleWrite(slice_, last)
@@ -288,6 +303,7 @@ def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None):
                 on_chunk(off, len(slice_), len(slice_))
     else:
         for off in range(0, len(raw), chunk_size):
+            _bail_if_canceled(session, f"dsp:qspi_write @ {off}/{len(raw)}B")
             chunk = raw[off:off+chunk_size]
             frame = pfx + chunk
             dev.spiMaster_MultiReadWrite(b"", frame, 0)
@@ -295,24 +311,26 @@ def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None):
                 on_chunk(off, len(chunk), len(frame))
 
 
-def _master_read(dev, n, mode, chunk_size):
+def _master_read(dev, n, mode, chunk_size, session=None):
     """Read ``n`` bytes in ``chunk_size``-byte CS frames."""
     _validate_chunk_size(mode, chunk_size)
     if mode == 1:
         out = bytearray()
         while len(out) < n:
+            _bail_if_canceled(session, f"dsp:qspi_read @ {len(out)}/{n}B")
             want = min(chunk_size, n - len(out))
             last = (len(out) + want) >= n
             out += bytes(dev.spiMaster_SingleRead(want, last))
         return bytes(out)
     out = bytearray()
     while len(out) < n:
+        _bail_if_canceled(session, f"dsp:qspi_read @ {len(out)}/{n}B")
         want = min(chunk_size, n - len(out))
         out += bytes(dev.spiMaster_MultiReadWrite(b"", b"", want))
     return bytes(out)
 
 
-def _master_xfer(dev, data, mode, chunk_size, prefix=b""):
+def _master_xfer(dev, data, mode, chunk_size, prefix=b"", session=None):
     """Full-duplex ``data`` exchange; single-lane only on FT4222.
 
     ``prefix`` is accepted for schema symmetry with _master_write but
@@ -328,6 +346,7 @@ def _master_xfer(dev, data, mode, chunk_size, prefix=b""):
     raw = bytes(data)
     out = bytearray()
     for off in range(0, len(raw), chunk_size):
+        _bail_if_canceled(session, f"dsp:qspi_xfer @ {off}/{len(raw)}B")
         last = (off + chunk_size) >= len(raw)
         out += bytes(dev.spiMaster_SingleReadWrite(
             raw[off:off+chunk_size], last))
@@ -365,7 +384,7 @@ def _op_qspi_write(session, h, args):
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        _master_write(dev, data, mode, args["chunk_size"], prefix, cb)
+        _master_write(dev, data, mode, args["chunk_size"], prefix, cb, session=session)
     finally:
         dev.close()
     session.log_event(
@@ -380,7 +399,7 @@ def _op_qspi_read(session, h, args):
     dev = _open_master(h.ft4222_desc,
                        clk_div=args["clk_div"], mode=mode, flags=0)
     try:
-        got = _master_read(dev, n, mode, args["chunk_size"])
+        got = _master_read(dev, n, mode, args["chunk_size"], session=session)
     finally:
         dev.close()
     session.stream("dsp.qspi_read").append(got)
@@ -404,7 +423,7 @@ def _op_qspi_write_prbs(session, h, args):
                        clk_div=args["clk_div"], mode=mode, flags=0)
     t_open = time.monotonic()
     try:
-        _master_write(dev, buf, mode, args["chunk_size"], prefix, cb)
+        _master_write(dev, buf, mode, args["chunk_size"], prefix, cb, session=session)
     finally:
         dev.close()
     t_wire = time.monotonic()
@@ -433,7 +452,7 @@ def _op_qspi_read_verify_prbs(session, h, args):
                        clk_div=args["clk_div"], mode=mode, flags=0)
     t_open = time.monotonic()
     try:
-        got = _master_read(dev, n, mode, args["chunk_size"])
+        got = _master_read(dev, n, mode, args["chunk_size"], session=session)
     finally:
         dev.close()
     t_wire = time.monotonic()
@@ -526,7 +545,7 @@ def _op_qspi_xfer_prbs(session, h, args):
                        clk_div=args["clk_div"], mode=mode, flags=0)
     t_open = time.monotonic()
     try:
-        got = _master_xfer(dev, buf, mode, args["chunk_size"], prefix)
+        got = _master_xfer(dev, buf, mode, args["chunk_size"], prefix, session=session)
     finally:
         dev.close()
     t_wire = time.monotonic()

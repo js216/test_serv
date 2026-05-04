@@ -78,7 +78,7 @@ def _cmd(dev, out):
 MPSSE_READ_CHUNK = 1 << 16   # 65536, max MPSSE 0x20 payload per command
 
 
-def _xfer(dev, out, rdlen):
+def _xfer(dev, out, rdlen, session=None):
     """SPI write `out`, then read `rdlen` bytes back, with CS held low
     across the whole exchange. Used by the SPI-NOR flash sequences
     (read 0x03, JEDEC 0x9F, status 0x05, etc.).
@@ -112,6 +112,9 @@ def _xfer(dev, out, rdlen):
     for n in chunks:
         partial = bytearray()
         while len(partial) < n:
+            _bail_if_canceled(
+                session,
+                f"fpga:_xfer @ {len(got)+len(partial)}/{rdlen}B")
             piece = dev.read(n - len(partial))
             if not piece:
                 raise RuntimeError(
@@ -121,9 +124,15 @@ def _xfer(dev, out, rdlen):
     return bytes(got)
 
 
-def _wait_wip(dev):
-    while _xfer(dev, [0x05], 1)[0] & 0x01:
-        time.sleep(0.001)
+def _wait_wip(dev, session=None):
+    while _xfer(dev, [0x05], 1, session=session)[0] & 0x01:
+        if session is not None:
+            if session.canceled:
+                raise RuntimeError(
+                    "fpga:_wait_wip canceled during flash status poll")
+            session.cancel_event.wait(0.001)
+        else:
+            time.sleep(0.001)
 
 
 def _bail_if_canceled(session, where):
@@ -140,7 +149,7 @@ def _erase(dev, nbytes, session=None):
                    (addr >> 16) & 0xff,
                    (addr >> 8) & 0xff,
                    addr & 0xff])
-        _wait_wip(dev)
+        _wait_wip(dev, session=session)
 
 
 def _write(dev, buf, session=None):
@@ -152,12 +161,12 @@ def _write(dev, buf, session=None):
                    (off >> 16) & 0xff,
                    (off >> 8) & 0xff,
                    off & 0xff] + list(chunk))
-        _wait_wip(dev)
+        _wait_wip(dev, session=session)
 
 
 def _verify(dev, buf, session=None):
     _bail_if_canceled(session, "fpga:verify (read-back)")
-    got = _xfer(dev, [0x03, 0, 0, 0], len(buf))
+    got = _xfer(dev, [0x03, 0, 0, 0], len(buf), session=session)
     if got == buf:
         return
     for i, (a, b) in enumerate(zip(buf, got)):

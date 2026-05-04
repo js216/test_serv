@@ -97,7 +97,8 @@ def _parse_list_output(stdout):
 # --- op: list ---
 
 def _op_list(session, h, args):
-    result = _run_cubeprog(h.cubeprog_exe, ["-l", "usb"], LIST_TIMEOUT_S)
+    result = _run_cubeprog(h.cubeprog_exe, ["-l", "usb"], LIST_TIMEOUT_S,
+                           session=session)
     if result.stdout:
         session.stream("dfu.list").append(result.stdout)
     if result.stderr:

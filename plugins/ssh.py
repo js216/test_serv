@@ -98,10 +98,26 @@ def _op_trust_host_key(session, h, args):
             f"ssh:trust_host_key: invalid key line {line!r}; expected "
             f"'<algo> <base64> [comment]'")
     # Drop any existing entries for the target IP so we don't accumulate
-    # stale host keys across reflashes. -R is idempotent.
-    subprocess.run(
+    # stale host keys across reflashes. -R is idempotent and finishes in
+    # <100 ms; we still poll and SIGTERM on cancel for completeness.
+    if session.canceled:
+        raise RuntimeError("ssh:trust_host_key canceled before ssh-keygen")
+    proc = subprocess.Popen(
         ["ssh-keygen", "-R", h.ip, "-f", h.known_hosts],
-        capture_output=True, check=False)
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    while True:
+        try:
+            proc.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if session.canceled:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise RuntimeError(
+                    "ssh:trust_host_key canceled mid-keygen")
     # Append the new entry IP-prefixed; ssh-keygen leaves the file
     # without a trailing newline, so emit one before our line.
     with open(h.known_hosts, "ab") as f:

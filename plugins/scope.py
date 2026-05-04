@@ -23,14 +23,24 @@ def _parse_val(s):
     return float(''.join(c for c in s if (c.isdigit() or c in ".-+eE")))
 
 
-def _read_channel(inst, ch):
+def _bail_if_canceled(session, where):
+    if session is not None and session.canceled:
+        raise RuntimeError(f"{where} canceled via DELETE /jobs/<digest>")
+
+
+def _read_channel(inst, ch, session=None):
     np = _lazy_numpy()
+    _bail_if_canceled(session, f"scope:capture {ch} (set source)")
     inst.write(f"WAV:SOUR {ch}")
+    _bail_if_canceled(session, f"scope:capture {ch} (data fetch)")
     raw = inst.query_binary_values(
         "WAV:DATA?", datatype="B", container=bytes)
     wave = np.frombuffer(raw, dtype=np.uint8)
+    _bail_if_canceled(session, f"scope:capture {ch} (vdiv)")
     vdiv = _parse_val(inst.query(f"{ch}:VDIV?"))
+    _bail_if_canceled(session, f"scope:capture {ch} (ofst)")
     ofst = _parse_val(inst.query(f"{ch}:OFST?"))
+    _bail_if_canceled(session, f"scope:capture {ch} (sara)")
     sara = _parse_val(inst.query("SARA?"))
     v = (wave - 128) * (vdiv / 25.0) - ofst
     t = np.arange(len(v)) / sara
@@ -126,14 +136,16 @@ def _summarize_traces(traces, signal_cfg):
 def _op_capture(session, h, args):
     chans_raw = args["chans"]
     chans = tuple(c for c in chans_raw.split(",") if c)
-    h._inst.write("STOP")
-    h._inst.write("WAV:FORM BYTE")
-    h._inst.write("WAV:MODE RAW")
-    h._inst.write("WAV:POIN MAX")
+    for cmd in ("STOP", "WAV:FORM BYTE", "WAV:MODE RAW", "WAV:POIN MAX"):
+        _bail_if_canceled(session, f"scope:capture (setup '{cmd}')")
+        h._inst.write(cmd)
     traces = {}
     for ch in chans:
-        traces[ch] = _read_channel(h._inst, ch)
+        _bail_if_canceled(session, f"scope:capture (channel {ch})")
+        traces[ch] = _read_channel(h._inst, ch, session=session)
+    _bail_if_canceled(session, "scope:capture (run)")
     h._inst.write("RUN")
+    _bail_if_canceled(session, "scope:capture (trig auto)")
     h._inst.write("TRIG:MODE AUTO")
     csv_text = _traces_to_csv(traces)
     session.stream("scope.csv").append(csv_text.encode())

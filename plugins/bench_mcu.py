@@ -19,27 +19,32 @@ def _lazy_serial():
     return serial
 
 
-def _drain(ser, window_s):
+def _drain(ser, window_s, session=None):
     end = time.monotonic() + window_s
     buf = bytearray()
     while time.monotonic() < end:
+        if session is not None and session.canceled:
+            return bytes(buf)
         data = ser.read(256)
         if data:
             buf += data
             end = time.monotonic() + 0.05
         else:
-            time.sleep(0.005)
+            if session is not None:
+                session.cancel_event.wait(0.005)
+            else:
+                time.sleep(0.005)
     return bytes(buf)
 
 
-def _query_identity(port, baud, timeout_s=READ_WINDOW_S):
+def _query_identity(port, baud, timeout_s=READ_WINDOW_S, session=None):
     serial = _lazy_serial()
     ser = serial.Serial(port, baudrate=baud, timeout=0.1)
     try:
         ser.reset_input_buffer()
         ser.write(b"?")
         ser.flush()
-        return _drain(ser, timeout_s)
+        return _drain(ser, timeout_s, session=session)
     finally:
         ser.close()
 
@@ -47,7 +52,7 @@ def _query_identity(port, baud, timeout_s=READ_WINDOW_S):
 # --- ops ---
 
 def _op_identify(session, h, args):
-    reply = _query_identity(h.port, h.baud)
+    reply = _query_identity(h.port, h.baud, session=session)
     session.stream("bench_mcu.identity").append(reply)
     if not reply:
         raise RuntimeError("bench_mcu returned nothing to '?'")
@@ -68,7 +73,7 @@ def _send_one(session, h, byte, stream_name):
         ser.reset_input_buffer()
         ser.write(byte)
         ser.flush()
-        reply = _drain(ser, READ_WINDOW_S)
+        reply = _drain(ser, READ_WINDOW_S, session=session)
     finally:
         ser.close()
     if reply:
@@ -90,7 +95,7 @@ def _op_send(session, h, args):
         ser.reset_input_buffer()
         ser.write(payload)
         ser.flush()
-        reply = _drain(ser, READ_WINDOW_S)
+        reply = _drain(ser, READ_WINDOW_S, session=session)
     finally:
         ser.close()
     session.stream("bench_mcu.send").append(reply)
