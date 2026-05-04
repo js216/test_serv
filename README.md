@@ -173,10 +173,12 @@ Control verbs:
 - `delay ms=N`
 - `mark tag=NAME` -- named checkpoint in the timeline
 - `description "<short summary>"` -- label for the dashboard + meta
-- `expect "<plain-text claim>"` -- record what the plan asserts,
-  surfaced in `manifest.expectations[]`. Doesn't run anything; lets a
-  future reader see the test's intent (`expect "DUT boots to login
-  within 60s"`) instead of reverse-engineering it from sentinel matches.
+- `expect "<plain-text claim>"` -- record the human-readable
+  *intent* of the plan, surfaced in `manifest.expectations[]`. This
+  is descriptive only -- nothing checks it. Machine-checkable
+  pass/fail records are in `manifest.checks[]`, populated by ops
+  like `*:uart_expect` (which writes `kind=uart_expect, status=hit`
+  on match or `status=timeout` on miss).
 - `inventory` -- return the bench poller's device list and supported
   ops as `bench.devices.json` and `bench.ops.json` files in the
   artefact tar. Always refreshes the device probe; for a full identity
@@ -224,8 +226,10 @@ One tarball at `<digest>.tar`. Clients poll completion with
 `GET` the tar.
 
 ```
-manifest.json         status, t0_wall_iso, runtime, streams,
+manifest.json         status, t0_wall_iso, runtime, streams, files,
                       n_ops, n_errors, required_devices, expectations,
+                      checks (machine-readable pass/fail), run_id,
+                      plan_digest, code_digest, blob_digests,
                       bench_id (from $TEST_SERV_BENCH_ID)
 timeline.log          merged human-sortable timeline (each row prefixed
                       by ISO wall-clock time + monotonic offset)
@@ -238,8 +242,17 @@ streams/NAME.bin      raw bytes per stream (uart, scope csv, prbs mismatches...)
 ```
 
 Read `manifest.json` first, then `timeline.log`. Pull `streams/*.bin`
-only when raw bytes are needed. `manifest.status` is one of `ok`,
-`errors`, `failed`, `canceled`.
+only when raw bytes are needed. `manifest.status` is one of:
+
+- `ok`       -- ran, no errors, at least one machine-checkable assertion
+                fired (a `*:uart_expect` hit, etc.)
+- `inert`    -- ran, no errors, but the plan made no machine-checkable
+                claim. The DUT had no chance to fail because nothing
+                was actually checked
+- `errors`   -- one or more ops raised
+- `failed`   -- the poller refused before the session even started
+                (parse error, validation, lease conflict)
+- `canceled` -- a DELETE /jobs/<digest> arrived mid-run
 
 ### device config
 

@@ -462,7 +462,15 @@ class Handler(BaseHTTPRequestHandler):
         meta = _meta_from_headers(self.headers)
         desc = plan.extract_description(body)
         if desc:
-            meta["description"] = desc
+            # Hard-clamp at 4 KiB before round-tripping through the
+            # /plan response header. http.client.MAXLINE is 64 KiB,
+            # so a 70 KiB description would wedge every poller's
+            # GET /plan with LineTooLong and stall the queue. Also
+            # strip CR/LF -- a newline in a header value would split
+            # the response and let the agent inject arbitrary
+            # X-Test-* headers downstream.
+            desc = desc.replace("\r", " ").replace("\n", " ")
+            meta["description"] = desc[:4096]
         digest, status = queue_job(body, meta)
 
         if status == "queue_full":
@@ -955,10 +963,14 @@ class Handler(BaseHTTPRequestHandler):
         (cancel arrives while a worker is mid-dispatch but hasn't
         registered the Session yet, so the next tick re-finds it).
         Markers are unlinked when the matching artefact arrives
-        (see _artefact). Old markers (>5 min) are GC'd here as a
-        safety net for jobs that never produced an artefact.
+        (see _artefact). Old markers are GC'd here as a safety net
+        for jobs that never produced an artefact. The TTL must be
+        longer than MAX_SESSION_S (3600s) plus upload buffer --
+        otherwise a long-running session that gets a cancel can
+        have the marker GC'd before the session even reaches a
+        check point. 90 minutes is conservative.
         """
-        cutoff = time.time() - 300.0
+        cutoff = time.time() - 5400.0
         try:
             names = [n for n in os.listdir(CANCEL) if SAFE_DIGEST_RE.match(n)]
         except FileNotFoundError:
@@ -1042,6 +1054,7 @@ class Handler(BaseHTTPRequestHandler):
         # at run time -- they'd have to read the artefact to find out
         # the example was incomplete.
         blobs = {}
+        cumulative = len(plan_text)
         for blob_name in sorted(wanted):
             if not SAFE_NAME_RE.match(blob_name):
                 self.send_response(400)
@@ -1056,6 +1069,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(
                     f"example {name!r} references @{blob_name} "
                     f"which is not in examples/".encode())
+                return
+            cumulative += len(data)
+            # Cap the resulting tar at MAX_PLAN_BYTES so a giant
+            # blob in examples/ can't be auto-packed into a
+            # multi-GiB response that OOMs the server. The agent who
+            # wants this can still pack manually via submit.py.
+            if cumulative > MAX_PLAN_BYTES:
+                self.send_response(413)
+                self.end_headers()
+                self.wfile.write(
+                    f"example {name!r} packed >{MAX_PLAN_BYTES}B "
+                    f"(blobs too large); use submit.py + --blob "
+                    f"manually".encode())
                 return
             blobs[blob_name] = data
         body = plan.pack_tar(plan_text.decode("utf-8"), blobs)

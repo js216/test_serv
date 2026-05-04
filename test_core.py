@@ -418,9 +418,18 @@ def test_lease_lifecycle():
     token = s1.lease_token
     assert token is not None and len(token) == 16, token
     assert not s1.errors, s1.errors
-    # Token also lands in the lease.token stream so the agent can
-    # read it back from the artefact.
-    assert token.encode() in s1.streams["lease.token"].snapshot_bytes()
+    # Token lands in manifest.lease_token (not in any stream/event)
+    # so a tunnel-side observer can't read it from /inflight while
+    # the session is live -- only whoever fetches the artefact tar
+    # sees it.
+    _, m1 = pack_artefact(s1)
+    m1 = json.loads(m1)
+    assert m1.get("lease_token") == token, m1
+    # And not in lease.token stream (which no longer exists) or in
+    # any timeline-event message.
+    assert "lease.token" not in s1.streams
+    for ev in s1.events:
+        assert token not in ev["msg"], ev
 
     # 2. Other agent (no token) is fast-rejected.
     p2 = plan.load_tar(plan.pack_tar('fake:noop k=2\n', {}))
@@ -466,7 +475,11 @@ def test_lease_lifecycle():
 
 
 def test_expect_lands_in_manifest():
-    """`expect "<claim>"` must surface in manifest.expectations[]."""
+    """`expect "<claim>"` must surface in manifest.expectations[].
+    A plan that records `expect` but never runs a *machine-checkable*
+    assertion (no *_expect, no scope summary) is "inert" -- it survived
+    but proved nothing. The new status discriminator catches this.
+    """
     parsed = plan.load_tar(plan.pack_tar(
         'expect "DUT boots in 30s"\nfake:noop k=1\n', {}))
     plugins = {"fake": FakePlugin()}
@@ -477,6 +490,41 @@ def test_expect_lands_in_manifest():
     _, mtxt = pack_artefact(session)
     m = json.loads(mtxt)
     assert m["expectations"] == ["DUT boots in 30s"]
+    # No checks ran (only expect + noop), so status is "inert" not "ok".
+    assert m["status"] == "inert", m["status"]
+    assert m["checks"] == []
+    # New manifest fields surface.
+    assert m["run_id"], m
+    assert "files" in m
+    assert "blob_digests" in m
+    reg.close_all()
+
+
+def test_check_record_lands_in_manifest():
+    """A plugin's session.record_check call must populate
+    manifest.checks[] with a structured pass/fail record."""
+    def _expect_op(session, h, args):
+        session.record_check("fake_check", "fake.0",
+                             "the test passed", "hit",
+                             {"observed": "yes"})
+
+    class CheckPlugin(FakePlugin):
+        name = "checker"
+        ops = {
+            "tick": Op(args={}, doc="record a check", run=_expect_op),
+        }
+
+    parsed = plan.load_tar(plan.pack_tar("checker:tick\n", {}))
+    plugins = {"checker": CheckPlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+    _, mtxt = pack_artefact(session)
+    m = json.loads(mtxt)
+    assert len(m["checks"]) == 1, m["checks"]
+    assert m["checks"][0]["status"] == "hit"
+    assert m["checks"][0]["kind"] == "fake_check"
+    # With at least one check that hit, status should be "ok" not "inert".
     assert m["status"] == "ok"
     reg.close_all()
 
@@ -502,6 +550,7 @@ def main():
         test_spool_unique_per_attempt,
         test_lease_lifecycle,
         test_expect_lands_in_manifest,
+        test_check_record_lands_in_manifest,
     ]
     failed = 0
     for t in tests:

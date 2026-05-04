@@ -10,6 +10,19 @@ import traceback
 from plugin import BusyError
 
 
+# Hard ceiling on the live lease count. Far above any legitimate
+# bench load (one operator, a handful of held devices), well below
+# what would noticeably slow lease_blocks_acquire's linear scan.
+MAX_LEASES = 256
+
+# Per-device open() wall-clock cap during verify_sweep. A device that
+# enumerates but hangs on first byte-write would otherwise stall
+# bench startup forever. 30s is long enough for slow USB enumeration
+# + a heavy plugin's identity handshake; short enough that the
+# operator doesn't think the bench is wedged.
+VERIFY_OPEN_TIMEOUT_S = 30.0
+
+
 class DeviceRegistry:
     """Tracks device specs and lends handles on demand.
 
@@ -206,18 +219,44 @@ class DeviceRegistry:
             t0 = time.monotonic()
             entry = {"t": time.time(), "ok": False, "verified": False,
                      "err": None, "latency_ms": 0.0}
-            try:
-                with self.acquire(key) as handle:
-                    entry["verified"] = bool(
-                        getattr(handle, "_identity_verified", False))
+            # Run each open() in a thread with a wall-clock timeout so
+            # a hung USB device (rare but does happen on bad cables /
+            # power-glitched chips) doesn't wedge poller startup
+            # forever. The thread is left running on timeout -- C-side
+            # blocking syscalls can't be interrupted from Python --
+            # but the sweep moves on; the per-device dev_lock the
+            # _Acquire grabbed eventually releases when the kernel
+            # times out the open syscall.
+            verified_box = [False]
+            err_box = [None]
+
+            def _do():
+                try:
+                    with self.acquire(key) as handle:
+                        verified_box[0] = bool(
+                            getattr(handle, "_identity_verified", False))
+                except Exception as e:
+                    err_box[0] = e
+
+            t = threading.Thread(target=_do, daemon=True)
+            t.start()
+            t.join(timeout=VERIFY_OPEN_TIMEOUT_S)
+            if t.is_alive():
+                entry["err"] = (f"open timed out after "
+                                f"{VERIFY_OPEN_TIMEOUT_S:.0f}s "
+                                f"(device hung; thread leaked, will "
+                                f"clean up when kernel times out)")
+            elif err_box[0] is not None:
+                e = err_box[0]
+                entry["err"] = f"{type(e).__name__}: {e}"
+            else:
+                entry["verified"] = verified_box[0]
                 entry["ok"] = True
                 # The sweep's whole point is "open it once and put it
                 # back as if untouched"; close before we move on so a
                 # multi-device sweep doesn't end with every device
                 # cached open.
                 self.release_now(key)
-            except Exception as e:
-                entry["err"] = f"{type(e).__name__}: {e}"
             entry["latency_ms"] = (time.monotonic() - t0) * 1e3
             with self.lock:
                 self.verify_results[key] = entry
@@ -255,10 +294,29 @@ class DeviceRegistry:
         the lease just gates *other* agents at lock-acquire time.
         """
         import uuid
+        # Validate device names against the live spec set so an agent
+        # can't claim an arbitrary string ("dsp.A,fakeval,etc"). This
+        # also caps the per-claim device list: if the spec set is
+        # bounded (it is -- one row per probed instance), so is the
+        # claim.
+        with self.lock:
+            valid = set(self.specs)
+        unknown = [k for k in devices if k not in valid]
+        if unknown:
+            raise BusyError(
+                f"lease:claim references unknown device(s): "
+                f"{sorted(unknown)}; known: {sorted(valid)}")
         token = uuid.uuid4().hex[:16]
         now = time.monotonic()
         with self._leases_lock:
             self._leases_evict_expired_locked(now)
+            # Cap the live lease count so a malicious or buggy agent
+            # can't fill memory + slow lease_blocks_acquire (which is
+            # O(N_leases) per device key).
+            if len(self.leases) >= MAX_LEASES:
+                raise BusyError(
+                    f"lease table full ({len(self.leases)} >= "
+                    f"{MAX_LEASES}); wait for some to expire")
             for k in devices:
                 holder = self._lease_holder_locked(k, now)
                 if holder is not None and holder != token:

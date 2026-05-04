@@ -41,30 +41,39 @@ def _op_exec(session, h, args):
     session.log_event("SSH", "ssh:exec", cmd)
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
+    try:
+        from poller import register_subprocess, unregister_subprocess
+        register_subprocess(proc)
+    except ImportError:
+        register_subprocess = unregister_subprocess = None
     deadline = time.monotonic() + SSH_TIMEOUT_S
     stdout = stderr = b""
-    while True:
-        try:
-            stdout, stderr = proc.communicate(timeout=0.2)
-            break
-        except subprocess.TimeoutExpired:
-            if session.canceled:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
-                raise RuntimeError(
-                    "ssh:exec canceled via DELETE /jobs/<digest>")
-            if time.monotonic() > deadline:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                raise TimeoutError(
-                    f"ssh:exec timed out ({SSH_TIMEOUT_S}s)")
+    try:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if session.canceled:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    raise RuntimeError(
+                        "ssh:exec canceled via DELETE /jobs/<digest>")
+                if time.monotonic() > deadline:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise TimeoutError(
+                        f"ssh:exec timed out ({SSH_TIMEOUT_S}s)")
+    finally:
+        if unregister_subprocess is not None:
+            unregister_subprocess(proc)
     if stdout:
         session.stream("ssh.exec").append(stdout)
     if stderr:
@@ -111,19 +120,28 @@ def _op_trust_host_key(session, h, args):
     proc = subprocess.Popen(
         ["ssh-keygen", "-R", h.ip, "-f", h.known_hosts],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    while True:
-        try:
-            proc.communicate(timeout=0.2)
-            break
-        except subprocess.TimeoutExpired:
-            if session.canceled:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                raise RuntimeError(
-                    "ssh:trust_host_key canceled mid-keygen")
+    try:
+        from poller import register_subprocess, unregister_subprocess
+        register_subprocess(proc)
+    except ImportError:
+        register_subprocess = unregister_subprocess = None
+    try:
+        while True:
+            try:
+                proc.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if session.canceled:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise RuntimeError(
+                        "ssh:trust_host_key canceled mid-keygen")
+    finally:
+        if unregister_subprocess is not None:
+            unregister_subprocess(proc)
     # Append the new entry IP-prefixed; ssh-keygen leaves the file
     # without a trailing newline, so emit one before our line.
     with open(h.known_hosts, "ab") as f:

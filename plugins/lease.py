@@ -44,20 +44,27 @@ def _op_claim(session, h, args):
     duration_s = args["duration_s"]
     token = session.registry.lease_claim(devices, duration_s)
     session.lease_token = token
-    session.stream("lease.token").append(
-        (token + "\n").encode())
+    session.lease_just_claimed = True
+    # The token is the credential. Don't write it to a stream or to
+    # event-msg text -- both surface in the live /inflight feed any
+    # other tunnel client can read every 2.5s, allowing trivial
+    # cross-agent lease hijack while the claiming session is still
+    # running. Manifest.lease_token (set by pack_artefact) is the
+    # one delivery path; only whoever fetches /outputs/<digest>.tar
+    # sees it. Event records claim WITHOUT the token.
     session.log_event(
         "LEASE", "lease:claim",
-        f"token={token} devices={sorted(devices)} "
-        f"duration_s={duration_s}")
+        f"devices={sorted(devices)} duration_s={duration_s} "
+        f"(token in manifest)")
 
 
 def _op_resume(session, h, args):
     # _prescan_lease_resume in session.py validates the token at
     # session start (before lock acquisition). At op time we just
-    # log -- the work is already done.
-    token = _lease_token_from(args)
-    session.log_event("LEASE", "lease:resume", f"token={token}")
+    # log -- and we redact the token in the log line for the same
+    # reason claim does (the resume-token would otherwise let a
+    # second tunnel client double-resume the same lease).
+    session.log_event("LEASE", "lease:resume", "(token redacted)")
 
 
 def _op_release(session, h, args):
@@ -69,14 +76,25 @@ def _op_release(session, h, args):
         session.log_event("LEASE", "lease:release", "no-op (no token)")
         return
     dropped = session.registry.lease_release(token)
+    # Don't emit token in the event -- a still-live token could be
+    # learned by a tunnel client from /inflight even on the release
+    # tick (a /inflight publish racing the unlink).
     session.log_event(
         "LEASE", "lease:release",
-        f"token={token} devices={sorted(dropped)}")
+        f"devices={sorted(dropped)}")
 
 
 def _op_list(session, h, args):
+    # Strip tokens from the listing -- the listing is published into
+    # the lease.list stream and that stream tail goes into /inflight.
+    # Keeping device sets + remaining-time exposes everything an
+    # operator needs to see "what's locked" without leaking a
+    # credential another agent could resume against.
     import json as _json
-    leases = session.registry.lease_list()
+    leases = [
+        {k: v for k, v in entry.items() if k != "token"}
+        for entry in session.registry.lease_list()
+    ]
     session.stream("lease.list").append(
         (_json.dumps(leases, indent=2) + "\n").encode())
     session.log_event("LEASE", "lease:list", f"n={len(leases)}")
@@ -95,9 +113,12 @@ class LeasePlugin(DevicePlugin):
         "claim": Op(
             args={"devices": "str", "duration_s": "int"},
             doc=("Claim devices=\"dsp.A,fpga.hx1k\" duration_s=600. "
-                 "The returned token is appended to the lease.token "
-                 "stream in the artefact; the agent reads it and "
-                 "passes it to subsequent `resume` ops."),
+                 "The issued token is delivered ONLY in the artefact's "
+                 "manifest.json under \"lease_token\" -- never in "
+                 "streams or timeline events, so it doesn't leak via "
+                 "the live /inflight feed to other tunnel clients. "
+                 "Fetch the artefact, read manifest.json, pass the "
+                 "token to subsequent `resume` ops."),
             run=_op_claim),
         "resume": Op(
             args={"token": "str"},

@@ -5,6 +5,7 @@
 import io
 import json
 import os
+import re
 import tarfile
 import threading
 import time
@@ -23,12 +24,29 @@ MAX_SESSION_S = 3600.0
 
 def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
                   streams, n_ops, n_errors, required_devices,
-                  expectations=None, message=None):
+                  expectations=None, message=None,
+                  files=None, run_id=None, plan_digest=None,
+                  code_digest=None, blob_digests=None,
+                  lease_token=None, checks=None):
     """Single source of truth for the artefact ``manifest.json``
     shape. Both the session's success path and the poller's failure-
     artefact path emit through here so the two never drift on field
-    names or types. ``status`` is the discriminator: "ok" / "errors"
-    / "failed" / "canceled".
+    names or types.
+
+    ``status`` is the discriminator:
+        "ok"        n_errors=0 and at least one check ran
+        "inert"     n_errors=0 but the plan made no machine-checkable
+                    claim (no *_expect, no scope:capture summary, no
+                    msc:verify, etc.) -- the run survived but proved
+                    nothing
+        "errors"    n_errors > 0
+        "failed"    poller refused before run_all even started
+                    (parse error, validation, lease conflict)
+        "canceled"  signal_cancel landed mid-run
+    ``checks[]`` carries machine-readable assertion records (hit /
+    miss / timeout per *_expect or similar), distinct from
+    ``expectations[]`` which is free-form claims set by the
+    ``expect`` plan verb.
     """
     iso = datetime.fromtimestamp(t0_wall).isoformat(timespec="milliseconds")
     out = {
@@ -38,12 +56,20 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
         "t0_wall_unix": t0_wall,
         "runtime_s": runtime_s,
         "streams": sorted(streams),
+        "files": sorted(files or []),
         "n_ops": n_ops,
         "n_errors": n_errors,
         "required_devices": sorted(required_devices),
         "expectations": list(expectations or []),
+        "checks": list(checks or []),
         "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
+        "run_id": run_id,
+        "plan_digest": plan_digest,
+        "code_digest": code_digest,
+        "blob_digests": dict(blob_digests or {}),
     }
+    if lease_token is not None:
+        out["lease_token"] = lease_token
     if message is not None:
         out["message"] = message
     return out
@@ -120,6 +146,27 @@ class Stream:
         with self.lock:
             return b"".join(d for _, d in self.records)
 
+    def tail_bytes(self, n):
+        """Return the last ``n`` bytes of this stream without
+        materializing the full payload first. _publish_inflight calls
+        this every 2.5s while a session is live; with a 64 MiB stream
+        the naive ``snapshot_bytes()[-n:]`` allocates 64 MiB per tick
+        and stalls UART drain threads on the lock for tens of ms.
+        """
+        out = []
+        remaining = n
+        with self.lock:
+            for _, data in reversed(self.records):
+                if remaining <= 0:
+                    break
+                if len(data) >= remaining:
+                    out.append(bytes(data[-remaining:]))
+                    remaining = 0
+                else:
+                    out.append(bytes(data))
+                    remaining -= len(data)
+        return b"".join(reversed(out))
+
     def snapshot_timestamped(self):
         with self.lock:
             return list(self.records)
@@ -166,6 +213,21 @@ class Session:
         # for our own token), and lease:claim sets this on success
         # so a same-plan release defaults to it.
         self.lease_token = None
+        # True iff lease_token was issued by THIS session (lease:claim);
+        # False if we just resumed someone else's claim. Only the
+        # claiming run's manifest publishes the token.
+        self.lease_just_claimed = False
+        # Plan/run identity, set by the dispatcher before run_all.
+        # Surfaces in manifest.json so an aggregator can group runs
+        # of the same plan without parsing plan.txt.
+        self.plan_digest = None
+        self.code_digest = None
+        # Machine-readable check records appended by *_expect ops
+        # and other plugins that want to assert something. Each entry
+        # is a dict {kind, target, claim, status, evidence}.
+        # Distinct from self.expectations (free-form prose set by the
+        # `expect` control verb).
+        self.checks = []
         self.lock = threading.Lock()
         self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
         # Set by signal_cancel(). _run_block tests it at op boundaries;
@@ -193,6 +255,32 @@ class Session:
                 s = Stream(name, self.t0)
                 self.streams[name] = s
         return s
+
+    def record_check(self, kind, target, claim, status, evidence=None):
+        """Append a structured check record. Plugins call this when an
+        op makes (or fails to make) a machine-checkable assertion.
+
+        ``kind`` -- short verb-like string, e.g. "uart_expect",
+            "scope_summary", "flash_verify".
+        ``target`` -- device key the check ran against, or "" for
+            session-global.
+        ``claim`` -- one-line text describing what we asserted.
+        ``status`` -- "hit" / "miss" / "timeout" / "ok" / "fail".
+        ``evidence`` -- optional small dict (matched bytes, count,
+            duty %), small enough to live in the manifest.
+        """
+        rec = {
+            "kind": kind, "target": target, "claim": claim,
+            "status": status,
+            "t": time.monotonic() - self.t0,
+        }
+        if evidence is not None:
+            rec["evidence"] = evidence
+        with self.lock:
+            self.checks.append(rec)
+        self.log_event(
+            "CHECK", f"{target}:{kind}" if target else kind,
+            f"{status}: {claim}")
 
     def signal_early_done(self, reason=""):
         # Plugins (uart_expect with end_session=true) raise this to
@@ -765,28 +853,70 @@ def render_timeline(session, bytes_budget_per_stream=8192):
     return "\n".join(lines) + "\n"
 
 
+_STREAM_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_stream_name(name):
+    # Defence in depth: stream names today come from hardcoded literals
+    # in plugins, but if a future op ever passed a user string into
+    # session.stream(name) we don't want artefact-tar path traversal.
+    safe = _STREAM_NAME_RE.sub("_", name).lstrip(".") or "_unnamed"
+    return safe
+
+
 def pack_artefact(session):
     """Build the .tar artefact. Returns (tar_bytes, manifest_text)."""
     buf = io.BytesIO()
+    import hashlib as _hashlib
     from plan import required_devices as _req_devs
     n_errors = len(session.errors)
-    # Inventory data + streams both contribute to the streams[] field
-    # so a reader knows what files exist in the tar without listing it.
-    streams = list(session.streams.keys())
+    # Top-level files in the tar that aren't streams.
+    files = ["manifest.json", "timeline.log", "ops.jsonl", "plan.txt"]
+    if n_errors:
+        files.append("errors.log")
     if session.bench_devices is not None:
-        streams.append("bench.devices.json")
+        files.append("bench.devices.json")
     if session.bench_ops is not None:
-        streams.append("bench.ops.json")
+        files.append("bench.ops.json")
+    # Per-blob digests so a six-month-old artefact is reproducible:
+    # plan.txt says `@blink.ldr`, manifest.blob_digests says which
+    # blink.ldr that was.
+    blob_digests = {
+        name: _hashlib.sha256(data).hexdigest()
+        for name, data in (getattr(session.plan, "blobs", {}) or {}).items()
+    }
+    # Status discriminator: "ok" vs "inert" vs "errors". A run that
+    # produced no machine-checkable claim (no *_expect, no scope
+    # summary, no msc:verify) is "inert" -- it survived but proved
+    # nothing. The reader who scripts on `status == "ok"` then knows
+    # the run actually checked something.
+    if n_errors:
+        status = "errors"
+    elif not session.checks:
+        status = "inert"
+    else:
+        status = "ok"
     manifest = make_manifest(
-        status="ok" if n_errors == 0 else "errors",
+        status=status,
         t0_monotonic=session.t0,
         t0_wall=session.t0_wall,
         runtime_s=time.monotonic() - session.t0,
-        streams=streams,
+        streams=list(session.streams.keys()),
+        files=files,
         n_ops=len(session.ops_log),
         n_errors=n_errors,
         required_devices=_req_devs(session.plan),
         expectations=session.expectations,
+        checks=session.checks,
+        run_id=session.session_id,
+        plan_digest=session.plan_digest,
+        code_digest=session.code_digest,
+        blob_digests=blob_digests,
+        # Only the *claiming* run publishes the lease token. A resume
+        # run wouldn't add anything an agent doesn't already know,
+        # but would re-expose the credential.
+        lease_token=(session.lease_token if session.lease_just_claimed
+                     else None),
     )
     manifest_text = json.dumps(manifest, indent=2) + "\n"
 
@@ -811,8 +941,8 @@ def pack_artefact(session):
                 session.bench_ops, indent=2, sort_keys=True)
                 + "\n").encode())
         for name, stream in session.streams.items():
-            safe = name.replace("/", "_")
-            _add(tf, f"streams/{safe}.bin", stream.snapshot_bytes())
+            _add(tf, f"streams/{_safe_stream_name(name)}.bin",
+                 stream.snapshot_bytes())
 
     return buf.getvalue(), manifest_text
 

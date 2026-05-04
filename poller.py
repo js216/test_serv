@@ -97,6 +97,94 @@ def _rotate_log_if_large(path):
         pass
 
 HTTP_PORT = int(os.environ.get("TEST_SERV_PORT", "8080"))
+
+
+def _compute_code_digest():
+    """sha256 of every .py file under the repo root + plugins/. Stamps
+    each artefact's manifest so a future reader can tell whether two
+    runs ran identical code (poller upgrades, plugin edits) without
+    relying on $git_rev tagging.
+    """
+    h = hashlib.sha256()
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    paths = []
+    for root, _dirs, files in os.walk(repo_root):
+        # Skip caches and venvs.
+        rel = os.path.relpath(root, repo_root)
+        if rel.startswith("__pycache__") or "/__pycache__" in rel:
+            continue
+        if rel.startswith(".") or "/.git" in rel:
+            continue
+        for f in files:
+            if f.endswith(".py"):
+                paths.append(os.path.join(root, f))
+    for p in sorted(paths):
+        try:
+            with open(p, "rb") as fh:
+                h.update(os.path.relpath(p, repo_root).encode())
+                h.update(b"\0")
+                h.update(fh.read())
+                h.update(b"\0")
+        except OSError:
+            continue
+    return h.hexdigest()
+
+
+_CODE_DIGEST = _compute_code_digest()
+
+
+_poller_lock_fd = None
+
+
+def _acquire_poller_lock():
+    """fcntl.flock on STATE_DIR/poller.lock; refuse to start if a
+    second poller already holds it. Without this, two pollers
+    sharing one STATE_DIR (operator mistake or systemd unit dup)
+    silently corrupt PENDING/ uploads + race on /pickup.
+    """
+    if os.name == "nt":
+        return  # fcntl unavailable on Windows; skip silently
+    global _poller_lock_fd
+    import fcntl
+    path = os.path.join(STATE_DIR, "poller.lock")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise SystemExit(
+            f"another poller already holds {path!r}; refusing to "
+            f"start. If you're sure no other poller is running, "
+            f"rm the lock file.")
+    # Hold the fd for the lifetime of the process.
+    _poller_lock_fd = fd
+    try:
+        os.write(fd, f"pid={os.getpid()}\n".encode())
+    except OSError:
+        pass
+
+
+# Subprocess registry: every plugin's Popen child is tracked here so
+# the SIGINT shutdown path can SIGKILL anything still alive after
+# the graceful 30s grace window. Without this, a Ctrl-C during a
+# cubeprog flash orphans the subprocess at PID 1.
+_active_subprocs = set()
+_subprocs_lock = threading.Lock()
+
+
+def register_subprocess(proc):
+    """Plugins call this immediately after Popen so the shutdown
+    path can find the child."""
+    with _subprocs_lock:
+        _active_subprocs.add(proc)
+
+
+def unregister_subprocess(proc):
+    """Plugins call this in their finally / after wait()."""
+    with _subprocs_lock:
+        _active_subprocs.discard(proc)
+
+
 POLL_INTERVAL_S = 2.5
 DEVICE_REFRESH_S = 15.0
 DEFAULT_UPLOAD_S = 600.0
@@ -228,6 +316,13 @@ def _meta_float(headers, key, default, hard_max):
         n = float(val)
     except (TypeError, ValueError):
         return default
+    # Reject NaN / inf explicitly. Today the clamp happens to handle
+    # NaN safely (max(1.0, NaN) returns 1.0 in CPython's first-arg
+    # tiebreaker), but that's a python-impl accident -- a future
+    # refactor that reorders min/max would silently expose a bypass.
+    import math
+    if not math.isfinite(n):
+        return default
     return max(1.0, min(n, hard_max))
 
 
@@ -284,10 +379,15 @@ def _snapshot_inflight():
                 stream_names = list(sess.streams.keys())
             stream_tails = {}
             for name in stream_names[:INFLIGHT_MAX_STREAMS]:
+                if name == "lease.list":
+                    # The lease listing already redacts tokens
+                    # plugin-side, but skip from inflight too as
+                    # belt-and-suspenders.
+                    continue
                 s = sess.streams.get(name)
                 if s is None:
                     continue
-                raw = s.snapshot_bytes()[-INFLIGHT_STREAM_BYTES:]
+                raw = s.tail_bytes(INFLIGHT_STREAM_BYTES)
                 stream_tails[name] = raw.decode(
                     "utf-8", errors="replace")
             out.append({
@@ -510,6 +610,12 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         return
 
     session = Session(registry, parsed, runtime_s=runtime_s)
+    # Stamp identity for the manifest. plan_digest = sha256 of the
+    # exact tar bytes the agent submitted (job_id is that already).
+    # code_digest is captured once at poller startup and shared
+    # across sessions.
+    session.plan_digest = job_id
+    session.code_digest = _CODE_DIGEST
     with _active_lock:
         _active_sessions[job_id] = session
     try:
@@ -681,6 +787,11 @@ def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):
 def main():
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     os.makedirs(PENDING, mode=0o700, exist_ok=True)
+    # Advisory lock on STATE_DIR so a second poller against the same
+    # state dir can't race on PENDING/ uploads or duplicate-pickup
+    # plans (rename gate handles the latter, but the cleaner
+    # behaviour is "refuse the second poller and tell the operator").
+    _acquire_poller_lock()
     _rotate_log_if_large(LOG)
     log_f = open(LOG, "a", buffering=1, encoding="utf-8", errors="replace")
     sys.stdout = _Tee(sys.__stdout__, log_f)
@@ -715,6 +826,8 @@ def main():
             plugins_by_name.update(new_plugins)
             registry.plugins = plugins_by_name
             registry.refresh()
+            global _CODE_DIGEST
+            _CODE_DIGEST = _compute_code_digest()
             _publish_status(registry, plugins_by_name)
         except Exception:
             traceback.print_exc()
@@ -808,8 +921,22 @@ def main():
             still = list(_active_sessions)
         if still:
             print(datetime.now(),
-                  f"SIGINT: {len(still)} session(s) still running; "
-                  f"forcing exit (subprocesses may be orphaned)")
+                  f"SIGINT: {len(still)} session(s) still running")
+        # SIGKILL any subprocess plugins registered during the run
+        # (cubeprog flash, ssh, etc.) so a Ctrl-C during a flash
+        # doesn't orphan them at PID 1 still holding USB handles.
+        with _subprocs_lock:
+            zombies = list(_active_subprocs)
+        if zombies:
+            print(datetime.now(),
+                  f"SIGINT: SIGKILLing {len(zombies)} child "
+                  f"subprocess(es)")
+            for p in zombies:
+                try:
+                    if p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
         # Try to drain any pending uploads one last time so a cancel
         # artefact lands on the server before we go.
         try:

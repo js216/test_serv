@@ -52,31 +52,40 @@ def _run_cubeprog(exe, argv_tail, timeout_s, session=None):
             raise TimeoutError(f"cubeprog timed out after {timeout_s}s")
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        from poller import register_subprocess, unregister_subprocess
+        register_subprocess(proc)
+    except ImportError:
+        register_subprocess = unregister_subprocess = None
     deadline = time.monotonic() + timeout_s
-    while True:
-        try:
-            stdout, stderr = proc.communicate(timeout=0.2)
-            return subprocess.CompletedProcess(
-                argv, proc.returncode, stdout, stderr)
-        except subprocess.TimeoutExpired:
-            if session.canceled:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                    proc.wait(timeout=2)
-                raise RuntimeError(
-                    "cubeprog canceled mid-flight via "
-                    "DELETE /jobs/<digest>")
-            if time.monotonic() > deadline:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                raise TimeoutError(
-                    f"cubeprog timed out after {timeout_s}s")
+    try:
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=0.2)
+                return subprocess.CompletedProcess(
+                    argv, proc.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                if session.canceled:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=2)
+                    raise RuntimeError(
+                        "cubeprog canceled mid-flight via "
+                        "DELETE /jobs/<digest>")
+                if time.monotonic() > deadline:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    raise TimeoutError(
+                        f"cubeprog timed out after {timeout_s}s")
+    finally:
+        if unregister_subprocess is not None:
+            unregister_subprocess(proc)
 
 
 def _parse_list_output(stdout):
@@ -236,6 +245,11 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     argv = [exe] + list(argv_tail)
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+    try:
+        from poller import register_subprocess
+        register_subprocess(proc)
+    except ImportError:
+        pass
 
     seen_running = [False]
     seen_reconnect = [False]
@@ -294,6 +308,14 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     if rest_stderr:
         session.stream("dfu.flash.stderr").append(rest_stderr)
     t.join(timeout=2)
+    # proc has fully exited and we're past every kill path; drop it
+    # from the shutdown registry so a SIGINT after this point doesn't
+    # try to SIGKILL an already-reaped pid.
+    try:
+        from poller import unregister_subprocess
+        unregister_subprocess(proc)
+    except ImportError:
+        pass
 
     if reader_err:
         session.log_event("DFU", "dfu:flash_layout",

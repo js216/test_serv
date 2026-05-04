@@ -248,16 +248,23 @@ def _op_uart_expect(session, h, args):
     end_session = bool(args.get("end_session"))
     stream = session.stream("dsp.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
+    claim = f"dsp.uart contains {sentinel!r} within {timeout_ms} ms"
     while time.monotonic() < deadline:
         if session.canceled:
             return
         if sentinel in stream.snapshot_bytes():
             session.log_event("EXPECT", "dsp:uart_expect",
                               f"HIT {sentinel!r}")
+            session.record_check(
+                "uart_expect", "dsp.uart", claim, "hit",
+                {"sentinel": sentinel.decode("utf-8", "replace")})
             if end_session:
                 session.signal_early_done(f"dsp.uart saw {sentinel!r}")
             return
         session.cancel_event.wait(0.01)
+    session.record_check(
+        "uart_expect", "dsp.uart", claim, "timeout",
+        {"sentinel": sentinel.decode("utf-8", "replace")})
     raise TimeoutError(expect_timeout_msg(
         "dsp.uart", sentinel, timeout_ms, stream.snapshot_bytes()))
 
