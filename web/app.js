@@ -1,7 +1,8 @@
 // test_serv web UI -- vanilla JS, no build step.
 // All status fetches are manual (refresh-now, run-inventory, or the
 // implicit refresh after a plan submit). Submits plans via
-// /submit-text and tracks artefacts at /outputs/<digest>.{txt,tar}.
+// /submit (which sniffs plain-text vs tar) and tracks artefacts at
+// /outputs/<digest>.{txt,tar}.
 
 const SUBMIT_POLL_MS = 1000;
 const SUBMIT_TIMEOUT_MS = 60_000;
@@ -342,7 +343,7 @@ async function submitPlanText(text, meta = {}, btn) {
     for (const [k, v] of Object.entries(meta)) {
       if (v != null && v !== "") headers[`X-Test-${k}`] = String(v);
     }
-    const r = await fetch("/submit-text", {
+    const r = await fetch("/submit", {
       method: "POST", headers, body: text,
     });
     const data = await r.json().catch(() => ({}));

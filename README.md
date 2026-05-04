@@ -132,19 +132,10 @@ DELETE /outputs/<digest>
 Discovery helpers:
 
 ```
-GET /help                # full job-control REST reference (text/plain)
 GET /examples
 GET /examples/<name>
 POST /sweep
 POST /devices/<device-id>/release
-```
-
-`GET /help` is the canonical reference for `/submit`, `/jobs`,
-`/outputs`, cancellation, and per-submission metadata. Fetch it
-once when learning the API:
-
-```
-curl http://localhost:8080/help
 ```
 
 ### discover what is available

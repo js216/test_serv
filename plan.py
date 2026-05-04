@@ -229,57 +229,59 @@ def load_tar(data):
     return Plan(ops=ops, blobs=blobs, text=plan_text)
 
 
-def extract_description(source):
+def looks_like_tar(data):
+    # ustar/POSIX magic at offset 257; many writers omit it. Fall back
+    # to: a real tar starts with a printable filename in offsets 0..99,
+    # padded with NUL. Plan text starts with non-NUL printable too --
+    # but the size field at offset 124 is 11 octal digits + space, not
+    # arbitrary text. Sniffing magic first and the size field next
+    # catches both PAX and old-ustar tars without false-positiving on
+    # plan.txt.
+    if len(data) < 512:
+        return False
+    if data[257:262] == b"ustar":
+        return True
+    try:
+        int(data[124:135].rstrip(b" \x00") or b"0", 8)
+        return data[100:108].rstrip(b" \x00").isdigit() or False
+    except (ValueError, AttributeError):
+        return False
+
+
+def extract_description(data):
     """Return the first top-level ``description "<text>"`` value from a
-    plan, or ``None`` if absent / unparseable. ``source`` may be:
+    plan, or ``None`` if absent / unparseable. ``data`` is the raw
+    submitted body -- bytes for a packed tar, bytes or str for a plain
+    plan.txt; the function sniffs the format, decodes, and parses.
 
-    * a parsed list of ``Op`` (top-level only -- nested ``description``
-      inside a fork is intentionally ignored, since meta is a
-      whole-plan attribute);
-    * a ``Plan`` instance;
-    * raw plan text (str or bytes), in which case parsing is run and
-      any ``PlanError`` is swallowed -- callers ask for the
-      description as a *labeling* convenience and don't want a malformed
-      plan to fail their request.
-
-    This is the single source of truth for "what is this plan called?";
-    server.py and any other meta-extractor should defer here rather
-    than re-implementing description detection.
+    Any ``PlanError`` / tar error is swallowed -- callers ask for the
+    description as a *labeling* convenience and don't want a malformed
+    plan to fail their request. Single source of truth for "what is
+    this plan called?".
     """
-    if isinstance(source, Plan):
-        ops = source.ops
-    elif isinstance(source, list):
-        ops = source
-    else:
-        if isinstance(source, bytes):
-            source = source.decode("utf-8", errors="replace")
+    if isinstance(data, str):
+        text = data
+    elif looks_like_tar(data):
         try:
-            ops = parse_text(source)
-        except PlanError:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tf:
+                f = tf.extractfile("plan.txt")
+                if f is None:
+                    return None
+                text = f.read().decode("utf-8", errors="replace")
+        except (tarfile.TarError, OSError, KeyError):
             return None
+    else:
+        text = data.decode("utf-8", errors="replace")
+    try:
+        ops = parse_text(text)
+    except PlanError:
+        return None
     for op in ops:
         if op.verb == "description":
             v = op.args.get("text")
             if v is not None:
                 return v.raw if hasattr(v, "raw") else v
     return None
-
-
-def extract_description_from_tar(data):
-    """Like ``extract_description`` but reads ``plan.txt`` out of a
-    submitted .plan tarball without running the full ``load_tar``
-    blob-validation pass. Returns ``None`` on any tar/parse failure --
-    the caller (server queue path) treats the description as a label
-    and tolerates absence.
-    """
-    try:
-        with tarfile.open(fileobj=io.BytesIO(data), mode="r") as tf:
-            f = tf.extractfile("plan.txt")
-            if f is None:
-                return None
-            return extract_description(f.read())
-    except (tarfile.TarError, OSError, KeyError):
-        return None
 
 
 def _check_blob_refs(ops, available):

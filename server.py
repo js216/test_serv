@@ -177,104 +177,6 @@ def delete_outputs(digest, ext=""):
     return removed
 
 
-JOBS_HELP = """\
-test_serv job-control REST API
-==============================
-
-These endpoints are how agents drive the queue. They're served by
-server.py on the test_serv host (typically reached over an SSH
-tunnel as http://localhost:8080).
-
-Submitting a plan
------------------
-  POST /submit         binary plan-tar (plan.txt + arbitrary blobs).
-  POST /submit-text    plain plan.txt body, no blobs. Convenience for
-                       agents that don't want to build a tar.
-
-  Both return JSON: {"status": "queued", "digest": "<sha256>"}.
-  413 if the body exceeds the per-call cap; 409 with status="duplicate"
-  if the same digest is already queued; 409 status="stale_outputs"
-  if outputs for the digest still exist (DELETE them first).
-
-Inspecting jobs
----------------
-  GET    /jobs           list every job server-side with status
-                         (queued, running, done), timestamps, and the
-                         per-submission meta dict (X-Test-* headers
-                         and the in-plan `description` line).
-  DELETE /jobs           prune stale-running entries (DONE/.plan with
-                         no corresponding artefact). Use after a poller
-                         crash to clean up the listing.
-  DELETE /jobs/all       wipe every job record (queued, running, done).
-                         NOT a force cancel of a running session.
-
-Cancellation
-------------
-  DELETE /jobs/<digest>  cancel.
-                         If still queued, the server unlinks the .plan
-                         before the poller picks it up; returns
-                         {"status": "canceled_queued"}.
-                         If in-flight, the server drops a marker;
-                         the poller signals the running session to
-                         abort at the next op boundary; returns
-                         {"status": "cancel_signaled"}. The artefact
-                         eventually lands in OUTPUTS with the cancel
-                         reason in errors.log.
-
-  Cancellation is between-op in v1: an op already mid-subprocess
-  (cubeprog flash, large MSC write) won't abort until that op
-  returns and the runner checks the flag. Long-running plugin ops
-  honour the flag at chunk/poll boundaries -- mid-op cancel is
-  responsive in seconds for the standard flash/UART/scope ops.
-
-Fetching artefacts
-------------------
-  GET    /outputs/<digest>.txt   sentinel manifest (small JSON).
-  GET    /outputs/<digest>.tar   full artefact tar (logs, traces, etc.).
-  GET    /outputs/<digest>/manifest        web UI: list tar members.
-  GET    /outputs/<digest>/file/<member>   web UI: extract one file.
-  DELETE /outputs/<digest>       remove .txt + .tar AND the DONE/.plan
-                                 record. Strongly recommended after a
-                                 successful fetch -- otherwise the
-                                 entry lingers in the listing.
-
-Per-submission metadata
------------------------
-In-plan: a top-level `description "<short summary>"` line is the
-recommended way to label the job. The server pre-extracts that line
-at submit time and exposes it in the meta dict of /jobs entries,
-so the dashboard and other agents can triage the queue without
-opening the artefact. The line is also a real control verb -- it
-logs to timeline -- so the artefact stays self-describing.
-
-Two HTTP headers are honoured at submit time:
-    X-Test-Runtime        per-session deadline in seconds; clamped
-                          to [1, 3600], default 600.
-    X-Test-Upload-Timeout artefact-POST timeout in seconds;
-                          clamped to [1, 3600], default 600.
-Other X-Test-* headers are ignored. Anything else an agent wants
-to convey about a job goes in the in-plan `description "..."`
-line, which the server extracts and surfaces in /jobs entries.
-
-Other useful endpoints
-----------------------
-  GET  /devices          poller's device-probe snapshot (cached).
-  GET  /ops              poller's bench.ops.json (full plugin/op map).
-  GET  /leases           current lease holders.
-  GET  /examples         list of bundled starter plan files.
-  GET  /examples/<name>  fetch one example plan as text/plain.
-  POST /devices/<id>/release    drop the lease on <id>.
-  POST /sweep                   trigger a probe + verify pass.
-
-Discovery for agents
---------------------
-The plan-grammar verbs and the per-plugin op signatures are
-returned by `inventory` in a plan, NOT by /help -- run a small
-plan with `inventory` to get bench.devices.json and
-bench.ops.json. /help only documents the HTTP surface above.
-"""
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "test_serv/2"
 
@@ -327,8 +229,6 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.lstrip("/")
         if path == "submit":
             return self._submit_job()
-        if path == "submit-text":
-            return self._submit_text_job()
         # /devices/<id>/release
         m = re.match(r"^devices/([A-Za-z0-9._-]+)/release$", path)
         if m:
@@ -358,6 +258,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # --- POST /submit ---
+    #
+    # Accepts either a packed plan tar (plan.txt + blobs) OR a plain
+    # plan.txt body for the no-blobs case. The server sniffs the body
+    # at submit time, packs a tar around plain text if needed, and
+    # queues the result. One endpoint, one URL.
 
     def _submit_job(self):
         n = int(self.headers.get("Content-Length") or 0)
@@ -366,55 +271,22 @@ class Handler(BaseHTTPRequestHandler):
                 json.dumps({"status": "too_large",
                             "limit": MAX_PLAN_BYTES}).encode(), status=413)
         body = self.rfile.read(n) if n else b""
-        meta = _meta_from_headers(self.headers)
-        desc = plan.extract_description_from_tar(body)
-        if desc:
-            meta["description"] = desc
-        digest, status = queue_job(body, meta)
-
-        if status == "stale_outputs":
-            return self._send_json(
-                json.dumps({
-                    "status": "stale_outputs",
-                    "digest": digest,
-                }).encode(), status=409)
-        if status == "duplicate":
-            return self._send_json(
-                json.dumps({
-                    "status": "duplicate",
-                    "digest": digest,
-                }).encode(), status=409)
-        return self._send_json(
-            json.dumps({
-                "status": "queued",
-                "digest": digest,
-            }).encode(), status=201)
-
-    # --- POST /submit-text -- pack a plain plan.txt body server-side.
-    # Convenience for the web UI and any agent that doesn't want to
-    # build a tar; no blobs supported. Equivalent to /submit with a
-    # `plan.txt`-only tarball.
-    def _submit_text_job(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if n < 0 or n > MAX_PLAN_BYTES:
-            return self._send_json(
-                json.dumps({"status": "too_large",
-                            "limit": MAX_PLAN_BYTES}).encode(), status=413)
-        text = self.rfile.read(n) if n else b""
-        if not text:
+        if not body:
             return self._send_json(
                 json.dumps({"status": "empty"}).encode(), status=400)
-        buf = io.BytesIO()
-        with tarfile.open(fileobj=buf, mode="w") as tf:
-            ti = tarfile.TarInfo("plan.txt")
-            ti.size = len(text)
-            tf.addfile(ti, io.BytesIO(text))
-        body = buf.getvalue()
+        if not plan.looks_like_tar(body):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w") as tf:
+                ti = tarfile.TarInfo("plan.txt")
+                ti.size = len(body)
+                tf.addfile(ti, io.BytesIO(body))
+            body = buf.getvalue()
         meta = _meta_from_headers(self.headers)
-        desc = plan.extract_description(text)
+        desc = plan.extract_description(body)
         if desc:
             meta["description"] = desc
         digest, status = queue_job(body, meta)
+
         if status == "stale_outputs":
             return self._send_json(
                 json.dumps({"status": "stale_outputs",
@@ -905,7 +777,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _help(self):
-        body = JOBS_HELP.encode()
+        body = (b"test_serv: see README.md for the REST API.\n"
+                b"Plan grammar + per-plugin op signatures: run a plan "
+                b"containing `inventory` and read bench.ops.json from "
+                b"the artefact.\n")
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
