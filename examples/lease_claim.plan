@@ -1,0 +1,20 @@
+description "Hold dsp.A across follow-up plans for an interactive debug session."
+
+# Cross-session device hold. Three-phase flow:
+#
+# 1. SUBMIT THIS PLAN. The poller runs `lease:claim` and writes the
+#    issued token into the artefact's lease.token stream. Read it:
+#       python3 submit.py examples/lease_claim.plan \
+#         --wait 5 --extract /tmp/lease
+#       cat /tmp/lease/streams/lease.token.bin
+#
+# 2. ANY NUMBER OF RESUME PLANS while the lease is live (10 min by
+#    default below). Use examples/lease_resume.plan as a template,
+#    or write your own that starts with `lease:resume token="..."`.
+#    Other agents trying to acquire dsp.A during the window get a
+#    fast BusyError instead of grabbing it.
+#
+# 3. RELEASE WHEN DONE. examples/lease_release.plan or just let the
+#    duration expire.
+
+lease:claim devices="dsp.A" duration_s=600

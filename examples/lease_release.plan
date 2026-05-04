@@ -1,0 +1,8 @@
+description "Release a lease early, freeing the held devices for other agents."
+
+# After substituting your token (see lease_claim.plan), submit:
+#
+#   python3 submit.py examples/lease_release.plan --wait 5
+
+lease:resume token="REPLACE_WITH_YOUR_TOKEN"
+lease:release token="REPLACE_WITH_YOUR_TOKEN"

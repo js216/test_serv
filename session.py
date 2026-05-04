@@ -160,6 +160,12 @@ class Session:
         # for one caller; that's gone now.
         self.bench_devices = None
         self.bench_ops = None
+        # If the plan starts with `lease:resume token=...`, the
+        # session's lock-acquire phase treats the token's held
+        # devices as owned (so lease_blocks_acquire returns None
+        # for our own token), and lease:claim sets this on success
+        # so a same-plan release defaults to it.
+        self.lease_token = None
         self.lock = threading.Lock()
         self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
         # Set by signal_cancel(). _run_block tests it at op boundaries;
@@ -214,6 +220,32 @@ class Session:
         self.cancel_event.set()
         self.log_event("CTRL", "session", "cancel requested")
 
+    def _prescan_lease_resume(self):
+        """If the plan starts with ``lease:resume token=...``, validate
+        the token against the registry's live lease table and bind
+        ``self.lease_token`` BEFORE the eager-acquire path runs. The
+        binding makes ``lease_blocks_acquire`` return None for our
+        own held devices, so we can re-acquire the locks the previous
+        session released. A bad / expired token raises ``BusyError``.
+
+        Anything past op 0 is ignored to keep the contract simple:
+        resume must be the first op.
+        """
+        if not self.plan.ops:
+            return
+        op = self.plan.ops[0]
+        if op.device != "lease" or op.verb != "resume":
+            return
+        v = op.args.get("token")
+        if v is None:
+            raise BusyError("lease:resume requires token=...")
+        token = v.raw if hasattr(v, "raw") else str(v)
+        held = self.registry.lease_resume(token)  # raises on bad token
+        self.lease_token = token
+        self.log_event(
+            "LEASE", "session",
+            f"resume token={token!r} devices={sorted(held)}")
+
     # --- execution ---
 
     def run_all(self, plugins):
@@ -221,6 +253,19 @@ class Session:
         # MAX_SESSION_S so a rogue agent can't camp on a device.
         budget_s = min(self.runtime_s or DEFAULT_SESSION_S, MAX_SESSION_S)
         deadline = self.t0 + budget_s
+        # If the plan starts with `lease:resume token=...`, validate
+        # the token now so the eager-acquire path treats the lease's
+        # devices as ours. A bad/expired token fails the session
+        # before any locks are touched, and other agents racing to
+        # grab the held device fast-fail via lease_blocks_acquire.
+        try:
+            self._prescan_lease_resume()
+        except BusyError as e:
+            self.errors.append(traceback.format_exc())
+            self.log_event("ERROR", "session", f"lease: {e}")
+            for s in self.streams.values():
+                s.close()
+            return
         # Job-atomic device locking: grab every device the plan
         # references up front and hold the locks for the whole session.
         # A job that needs {dsp, fpga} therefore pauses any other job
@@ -269,6 +314,27 @@ class Session:
             f"acquire now={eager_keys}  "
             f"deferred={sorted(self._deferred_names)}"
             if eager_keys or self._deferred_names else "(no devices)")
+        # Lease check: if any eager key is leased to a different
+        # token, fast-fail before acquiring locks. A competing plan
+        # gets a clean BusyError instead of blocking on the per-
+        # device RLock for the whole lease window.
+        for k in eager_keys:
+            blocker = self.registry.lease_blocks_acquire(k, self.lease_token)
+            if blocker is not None:
+                msg = (f"{k} is leased to {blocker!r}; "
+                       f"resume that lease or wait for it to expire")
+                self.errors.append(msg + "\n")
+                self.log_event("ERROR", "session", msg)
+                with self.registry.lock:
+                    for kk in self._pinned_specs:
+                        n = self.registry.pinned_specs.get(kk, 0) - 1
+                        if n > 0:
+                            self.registry.pinned_specs[kk] = n
+                        else:
+                            self.registry.pinned_specs.pop(kk, None)
+                for s in self.streams.values():
+                    s.close()
+                return
         eager_acquired = []
         try:
             for lk in eager_locks:
@@ -427,6 +493,12 @@ class Session:
             key = self.registry.resolve(plugin_name, spec_id)
 
         if plugin_name in getattr(self, "_deferred_names", set()):
+            blocker = self.registry.lease_blocks_acquire(
+                key, self.lease_token)
+            if blocker is not None:
+                raise BusyError(
+                    f"{key} is leased to {blocker!r}; resume that "
+                    f"lease or wait for it to expire")
             with self.registry.lock:
                 lk = self.registry.per_dev_lock.setdefault(
                     key, threading.RLock())

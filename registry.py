@@ -40,6 +40,16 @@ class DeviceRegistry:
         # same key don't share one membership entry that the first
         # one to finish can revoke for the still-running peer.
         self.pinned_specs = collections.Counter()
+        # Cross-session leases. token -> {"devices": set(keys),
+        #   "expires_at": monotonic deadline}.
+        # A lease promises that the listed devices won't be acquired
+        # by another agent until expires_at -- so the holder can
+        # close one plan and submit a follow-up "resume" plan
+        # without losing the device to a competing claimant. State
+        # is in-memory; a poller restart loses all leases (the
+        # operator can re-claim).
+        self.leases = {}
+        self._leases_lock = threading.Lock()
 
     def stop(self):
         # Kept for API compatibility with the older TTL-reaper version;
@@ -235,6 +245,93 @@ class DeviceRegistry:
         with self.lock:
             for key in list(self.cache):
                 self._close_if_cached_locked(key)
+
+    # --- leases ---
+
+    def lease_claim(self, devices, duration_s):
+        """Reserve ``devices`` for the next ``duration_s`` seconds.
+        Returns the token. Caller (session) is expected to acquire
+        the per-device locks for the rest of THIS session as usual;
+        the lease just gates *other* agents at lock-acquire time.
+        """
+        import uuid
+        token = uuid.uuid4().hex[:16]
+        now = time.monotonic()
+        with self._leases_lock:
+            self._leases_evict_expired_locked(now)
+            for k in devices:
+                holder = self._lease_holder_locked(k, now)
+                if holder is not None and holder != token:
+                    raise BusyError(
+                        f"{k} is leased to another token "
+                        f"(expires in "
+                        f"{self.leases[holder]['expires_at']-now:.0f}s)")
+            self.leases[token] = {
+                "devices": set(devices),
+                "expires_at": now + max(1.0, float(duration_s)),
+            }
+        return token
+
+    def lease_resume(self, token):
+        """Validate ``token`` against the live lease table. Returns
+        the held device set, or raises ``BusyError`` if the lease
+        is unknown or expired.
+        """
+        now = time.monotonic()
+        with self._leases_lock:
+            self._leases_evict_expired_locked(now)
+            entry = self.leases.get(token)
+            if entry is None:
+                raise BusyError(f"lease {token!r} unknown or expired")
+            return set(entry["devices"])
+
+    def lease_release(self, token):
+        """Drop a lease early. Returns the device set that was held
+        (empty if the token wasn't live).
+        """
+        with self._leases_lock:
+            entry = self.leases.pop(token, None)
+            return set(entry["devices"]) if entry else set()
+
+    def lease_blocks_acquire(self, key, my_token):
+        """Return the holding-token if some *other* agent has a
+        live lease on ``key``, else ``None``. Called from
+        session.run_all's eager-acquire path so a competing plan
+        fast-fails instead of blocking on the per-device lock.
+        """
+        now = time.monotonic()
+        with self._leases_lock:
+            self._leases_evict_expired_locked(now)
+            holder = self._lease_holder_locked(key, now)
+            return None if (holder is None or holder == my_token) else holder
+
+    def lease_list(self):
+        """Snapshot of live leases for inspection. Returns a list of
+        ``{token, devices, expires_in_s}`` dicts.
+        """
+        now = time.monotonic()
+        with self._leases_lock:
+            self._leases_evict_expired_locked(now)
+            return [
+                {
+                    "token": t,
+                    "devices": sorted(e["devices"]),
+                    "expires_in_s": e["expires_at"] - now,
+                }
+                for t, e in self.leases.items()
+            ]
+
+    def _leases_evict_expired_locked(self, now):
+        dead = [t for t, e in self.leases.items()
+                if e["expires_at"] < now]
+        for t in dead:
+            self.leases.pop(t, None)
+
+    def _lease_holder_locked(self, key, now):
+        for t, e in self.leases.items():
+            if e["expires_at"] >= now and key in e["devices"]:
+                return t
+        return None
 
     # --- internals ---
 

@@ -395,6 +395,76 @@ def test_spool_unique_per_attempt():
             poller.PENDING = old_pending
 
 
+def test_lease_lifecycle():
+    """Full lease flow: claim -> resume from another session ->
+    blocks_acquire rejects an unrelated session -> release.
+
+    This is the regression that brings back the old `lease` subsystem
+    we cut in round 2 (D1) -- the test plus the example plan plus
+    the README section are the three guards against it being cut
+    again on the same "no users" reasoning.
+    """
+    from plugins.lease import LeasePlugin
+    fake = FakePlugin()
+    plugins = {"fake": fake, "lease": LeasePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+
+    # 1. First plan claims fake.0 for 60 s.
+    p1 = plan.load_tar(plan.pack_tar(
+        'lease:claim devices="fake.0" duration_s=60\n'
+        'fake:noop k=1\n', {}))
+    s1 = Session(reg, p1)
+    s1.run_all(plugins)
+    token = s1.lease_token
+    assert token is not None and len(token) == 16, token
+    assert not s1.errors, s1.errors
+    # Token also lands in the lease.token stream so the agent can
+    # read it back from the artefact.
+    assert token.encode() in s1.streams["lease.token"].snapshot_bytes()
+
+    # 2. Other agent (no token) is fast-rejected.
+    p2 = plan.load_tar(plan.pack_tar('fake:noop k=2\n', {}))
+    s2 = Session(reg, p2)
+    s2.run_all(plugins)
+    assert s2.errors, "lease should have blocked the unleased session"
+    assert "leased to" in s2.errors[0], s2.errors[0]
+    # fake.opens count didn't increment for s2.
+    opens_before_resume = fake.opens
+
+    # 3. Resume from a follow-up plan with the right token: works.
+    p3 = plan.load_tar(plan.pack_tar(
+        f'lease:resume token="{token}"\n'
+        'fake:noop k=3\n', {}))
+    s3 = Session(reg, p3)
+    s3.run_all(plugins)
+    assert not s3.errors, s3.errors
+    assert fake.opens > opens_before_resume
+
+    # 4. Wrong token: rejected.
+    p4 = plan.load_tar(plan.pack_tar(
+        'lease:resume token="not-a-real-token"\n'
+        'fake:noop k=4\n', {}))
+    s4 = Session(reg, p4)
+    s4.run_all(plugins)
+    assert s4.errors and "lease" in s4.errors[0].lower(), s4.errors
+
+    # 5. Release lets unleased sessions through again.
+    p5 = plan.load_tar(plan.pack_tar(
+        f'lease:resume token="{token}"\n'
+        f'lease:release token="{token}"\n', {}))
+    s5 = Session(reg, p5)
+    s5.run_all(plugins)
+    assert not s5.errors, s5.errors
+
+    p6 = plan.load_tar(plan.pack_tar('fake:noop k=6\n', {}))
+    s6 = Session(reg, p6)
+    s6.run_all(plugins)
+    assert not s6.errors, ("after release, unleased session should run; "
+                           f"got {s6.errors}")
+
+    reg.close_all()
+
+
 def test_expect_lands_in_manifest():
     """`expect "<claim>"` must surface in manifest.expectations[]."""
     parsed = plan.load_tar(plan.pack_tar(
@@ -430,6 +500,7 @@ def main():
         test_refresh_does_not_evict_pinned,
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
+        test_lease_lifecycle,
         test_expect_lands_in_manifest,
     ]
     failed = 0

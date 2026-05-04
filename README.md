@@ -188,6 +188,35 @@ Control verbs:
 Unknown device, op, arg, or arg type is rejected before any hardware
 is touched.
 
+### holding a device across plans
+
+The `lease` plugin is the way to keep a device pinned across multiple
+plan submissions -- typical use case is an interactive debug window
+where each plan reads previous output before deciding what to do
+next, or a multi-agent bench where another agent must not grab the
+device between two of your submissions.
+
+```
+# plan 1: claim dsp.A for ten minutes; the token is written to the
+# artefact's streams/lease.token.bin
+lease:claim devices="dsp.A" duration_s=600
+
+# plan 2..N: resume and do work; other agents get fast BusyError if
+# they try to acquire dsp.A while the lease is live
+lease:resume token="abc1234..."
+dsp.A:uart_open
+...
+
+# plan N+1: release early (or just let the duration expire)
+lease:resume token="abc1234..."
+lease:release token="abc1234..."
+```
+
+Lease state is in-memory on the poller. A poller restart drops every
+live lease (the operator can re-claim). See
+`examples/lease_{claim,resume,release}.plan` and
+`test_lease_lifecycle` in `test_core.py` for the canonical flow.
+
 ### artefact layout
 
 One tarball at `<digest>.tar`. Clients poll completion with

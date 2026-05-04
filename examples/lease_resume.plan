@@ -1,0 +1,15 @@
+description "Resume an existing lease and read DSP UART briefly."
+
+# Replace TOKEN with the value you pulled out of
+# examples/lease_claim.plan's lease.token stream:
+#
+#   python3 submit.py examples/lease_resume.plan \
+#     --wait 10 --extract /tmp/dsp-uart
+#
+# After substituting the token, of course. The plan as-shipped will
+# fail with "lease unknown or expired" until you do.
+
+lease:resume token="REPLACE_WITH_YOUR_TOKEN"
+dsp.A:uart_open
+delay ms=2000
+dsp.A:uart_close
