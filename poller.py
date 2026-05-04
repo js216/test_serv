@@ -355,13 +355,20 @@ def _push_status(name, body):
     short-circuit instead of each waiting the full 10s for the same
     failure. Without this a wedged SSH tunnel slowed the main poll
     loop from 2.5s/tick to 12.5s+, delaying cancel responsiveness.
+
+    Returns True iff the push actually landed. Callers that key state
+    on whether the server saw the snapshot (e.g. the busy->idle edge
+    in _publish_inflight) need to distinguish landed vs short-circuit
+    -- otherwise a tunnel blip during the transition leaves the
+    server's snapshot stale forever.
     """
     global _push_circuit_until
     if time.monotonic() < _push_circuit_until:
-        return
+        return False
     base = f"http://localhost:{HTTP_PORT}"
     try:
         _post(f"{base}/status/{name}", body, timeout=10.0)
+        return True
     except Exception:
         # Don't traceback-spam the log on every refresh tick if the
         # server is offline; one line is enough.
@@ -369,6 +376,7 @@ def _push_status(name, body):
         print(datetime.now(),
               f"status/{name} push failed (server unreachable?); "
               f"backing off {_PUSH_CIRCUIT_OPEN_S:.0f}s")
+        return False
 
 
 def _snapshot_inflight():
@@ -440,9 +448,17 @@ def _publish_inflight():
     inflight = json.dumps(_snapshot_inflight()).encode()
     os.makedirs(STATUS, mode=0o700, exist_ok=True)
     _write_atomic(os.path.join(STATUS, "inflight.json"), inflight)
+    pushed = True
     if any_active or _was_active_inflight:
-        _push_status("inflight.json", inflight)
-    _was_active_inflight = any_active
+        pushed = _push_status("inflight.json", inflight)
+    # Only retire the busy edge if the push actually landed. If the
+    # tunnel was open earlier (last tick had any_active=True so we
+    # were marked busy) and goes flaky right at the busy->idle
+    # transition, the next tick must retry the empty snapshot --
+    # otherwise the server's inflight feed keeps the just-finished
+    # session's tail forever.
+    if pushed:
+        _was_active_inflight = any_active
 
 
 def _publish_status(registry, plugins_by_name):

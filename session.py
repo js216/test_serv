@@ -465,6 +465,18 @@ class Session:
             for s in self.streams.values():
                 s.close()
             return
+        # Track which RESOLVED KEYS are currently locked for the whole
+        # session. Eager keys are in by definition; deferred resolves
+        # add to this set as ops fire. Gating on resolved keys (not on
+        # plugin names) is what makes a multi-instance plan like
+        # `fpga.hx1k:program` then `fpga.hx8k:program` actually hold
+        # both dev_locks for the run. The previous implementation
+        # discarded the plugin NAME after the first deferred resolve,
+        # so any second instance of the same plugin only had its
+        # dev_lock for the duration of each individual op -- a parallel
+        # session could win the lock between ops, breaking the
+        # job-atomic invariant the README promises.
+        self._session_locked_keys = set(eager_keys)
         self.log_event("LOCK", "session", "acquired; running ops")
         try:
             self._run_block(self.plan.ops, plugins, deadline)
@@ -617,7 +629,11 @@ class Session:
             self.registry.refresh_plugin(plugin_name)
             key = self.registry.resolve(plugin_name, spec_id)
 
-        if plugin_name in getattr(self, "_deferred_names", set()):
+        # Gate on the resolved KEY, not the plugin name. A plan that
+        # touches two instances of the same plugin (e.g. fpga.hx1k +
+        # fpga.hx8k) hits this path twice with different keys; both
+        # need session-long locks to keep the job-atomic invariant.
+        if key not in getattr(self, "_session_locked_keys", set()):
             blocker = self.registry.lease_blocks_acquire(
                 key, self.lease_token)
             if blocker is not None:
@@ -634,6 +650,7 @@ class Session:
                 self.registry.pinned_specs[key] += 1
             lk.acquire()
             self._deferred_locks.append(lk)
+            self._session_locked_keys.add(key)
             self._deferred_names.discard(plugin_name)
             self.log_event("LOCK", "session",
                            f"deferred acquire {key}")
@@ -814,6 +831,17 @@ class Session:
         self.log_event(
             "INVENTORY", "ctrl",
             f"devices={len(devices)} plugins={len(ops_map)}")
+        # Record a check so the canonical first-plan walkthrough
+        # (which is just `inventory`) produces manifest.status="ok"
+        # rather than the operator-hostile "inert" badge. The probe
+        # itself is a real assertion -- we proved that the bench's
+        # plugin layer answered without error. Status uses the same
+        # "hit"/"miss" vocabulary as *_expect ops.
+        self.record_check(
+            "inventory", "ctrl",
+            "device probe ran without error",
+            "hit",
+            {"n_devices": len(devices), "n_plugins": len(ops_map)})
 
 
 # ---- artefact packing ----

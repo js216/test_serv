@@ -107,13 +107,15 @@ def decode_args(op_schema, raw_args, blobs):
     out = {}
     optional = op_schema.optional_args or {}
     combined = {**op_schema.args, **optional}
+    known = sorted(combined.keys())
     for k, v in raw_args.items():
         if k not in combined:
-            raise ValueError(f"unknown arg {k!r}")
+            raise ValueError(f"unknown arg {k!r}; known: {known}")
         out[k] = _decode_one(k, combined[k], v, blobs)
     for name in op_schema.args:
         if name not in out:
-            raise ValueError(f"missing arg {name!r}")
+            raise ValueError(
+                f"missing arg {name!r}; required: {sorted(op_schema.args)}")
     for name in optional:
         out.setdefault(name, None)
     return out

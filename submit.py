@@ -43,8 +43,20 @@ def _url(base, path):
 def _request(method, url, data=None, headers=None):
     req = urllib.request.Request(
         url, data=data, headers=headers or {}, method=method)
-    with urllib.request.urlopen(req) as r:
-        return r.status, r.read(), dict(r.headers)
+    try:
+        with urllib.request.urlopen(req) as r:
+            return r.status, r.read(), dict(r.headers)
+    except urllib.error.URLError as e:
+        # HTTPError is a subclass of URLError; let it propagate so
+        # _submit can decode the structured 4xx body. Plain URLError
+        # (connection refused, DNS failure, SSH tunnel closed) is the
+        # operator-runs-submit-before-server-is-up trap; surface it
+        # as a one-line RuntimeError instead of an opaque traceback.
+        if isinstance(e, urllib.error.HTTPError):
+            raise
+        reason = getattr(e, "reason", e)
+        raise RuntimeError(
+            f"cannot reach test_serv at {url}: {reason}") from None
 
 
 def _http_json(method, url, data=None, headers=None):

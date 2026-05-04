@@ -660,6 +660,49 @@ def test_prune_skips_inflight_digests():
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
 
 
+def test_multi_instance_plan_holds_all_dev_locks_for_session():
+    """Round-11 U1: a plan that touches two instances of the same
+    plugin (e.g. fake.A and fake.B) must hold per-device dev_locks
+    for BOTH instances across the whole session, not just for the
+    duration of each op.
+
+    Before this fix, _resolve_device gated on plugin NAME, discarded
+    "fake" from _deferred_names after the first deferred resolve, and
+    silently skipped the deferred lock acquisition for the second
+    instance. A parallel session could win the lock between ops on
+    fake.B, breaking the job-atomic invariant.
+    """
+    import threading as _th
+
+    class TwoInstancePlugin(FakePlugin):
+        name = "twoinst"
+        ops = {"tick": Op(args={}, doc="no-op", run=_noop)}
+
+        def probe(self):
+            return [{"id": "A"}, {"id": "B"}]
+
+    plugins = {"twoinst": TwoInstancePlugin()}
+    reg = DeviceRegistry(plugins)
+    reg.refresh()
+
+    parsed = plan.load_tar(plan.pack_tar(
+        "twoinst.A:tick\ntwoinst.B:tick\n", {}))
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+
+    # Both keys must be in the session-locked set after the run.
+    locked = getattr(session, "_session_locked_keys", set())
+    assert "twoinst.A" in locked, locked
+    assert "twoinst.B" in locked, locked
+    # The per-device RLocks must be the same identity that's now
+    # tracked in _deferred_locks (so the session's finally-release
+    # actually drops them on exit). Both instances should appear.
+    deferred = getattr(session, "_deferred_locks", [])
+    expected = {reg.per_dev_lock["twoinst.A"], reg.per_dev_lock["twoinst.B"]}
+    assert set(deferred) == expected, (deferred, expected)
+    reg.close_all()
+
+
 def test_check_record_lands_in_manifest():
     """A plugin's session.record_check call must populate
     manifest.checks[] with a structured pass/fail record."""
@@ -715,6 +758,7 @@ def main():
         test_lease_claim_rejects_lease_pseudo_device,
         test_failure_artefact_carries_identity_fields,
         test_prune_skips_inflight_digests,
+        test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,
     ]
     failed = 0

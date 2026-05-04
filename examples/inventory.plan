@@ -2,9 +2,9 @@ description "Probe the bench and dump device + op tables."
 
 # Zero-hardware "hello world": the inventory control verb refreshes
 # the poller's device probe and writes bench.devices.json + bench.ops.json
-# into the artefact's streams/ dir. Useful as a smoke test that the
-# server, poller, and SSH tunnel are all wired up before you trust any
-# real test. Submit with:
+# into the artefact tar (top-level, alongside manifest.json). Useful
+# as a smoke test that the server, poller, and SSH tunnel are all
+# wired up before you trust any real test. Submit with:
 #
 #   python3 submit.py examples/inventory.plan --wait 30 --extract /tmp/inv
 #
