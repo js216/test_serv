@@ -176,6 +176,12 @@ class Session:
             eager_locks = [
                 self.registry.per_dev_lock.setdefault(k, threading.RLock())
                 for k in eager_keys]
+            # Pin the eager keys so background refresh can't drop the
+            # spec mid-session if the device transiently disappears
+            # from probe (USB blip, mode change). Deferred keys are
+            # added in _resolve_device when they show up.
+            self._pinned_specs = set(eager_keys)
+            self.registry.pinned_specs.update(self._pinned_specs)
         self._deferred_locks = []     # filled by _run_device_op
 
         self.log_event(
@@ -229,6 +235,12 @@ class Session:
                         self.log_event("CLOSE", "session", key)
                 except Exception:
                     traceback.print_exc()
+            # Drop the spec-pin so a later refresh can finally evict
+            # any device that vanished. Done after release_now so the
+            # eviction path doesn't race with our close.
+            with self.registry.lock:
+                self.registry.pinned_specs.difference_update(
+                    getattr(self, "_pinned_specs", set()))
             for s in self.streams.values():
                 s.close()
             # Release deferred locks (acquired mid-session) first, then
@@ -275,6 +287,17 @@ class Session:
                 self._run_control(op, plugins, deadline)
             else:
                 self._run_device_op(op, plugins)
+        except StopSession:
+            # Plan asked to short-circuit (uart_expect end_session=true).
+            # Record the op as ok and let the exception propagate to
+            # _run_block / run_all so the rest of the plan stops cleanly.
+            rec["t_end"] = time.monotonic() - self.t0
+            self.ops_log.append(rec)
+            self.log_event(
+                "OP", f"{op.device or 'ctrl'}:{op.verb}",
+                f"ok ({(rec['t_end']-rec['t_start'])*1e3:.1f} ms) "
+                f"[end_session]")
+            raise
         except Exception as e:
             rec["status"] = "error"
             rec["err"] = f"{type(e).__name__}: {e}"
@@ -320,6 +343,11 @@ class Session:
             with self.registry.lock:
                 lk = self.registry.per_dev_lock.setdefault(
                     key, threading.RLock())
+                # Pin the spec for the rest of the session, same as
+                # eager keys, so refresh can't evict it on a transient
+                # disappearance.
+                self._pinned_specs.add(key)
+                self.registry.pinned_specs.add(key)
             lk.acquire()
             self._deferred_locks.append(lk)
             self._deferred_names.discard(plugin_name)

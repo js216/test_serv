@@ -441,21 +441,23 @@ def _validate_against_plugins(parsed, plugins_by_name, registry):
     via session._run_device_op, which does a targeted re-probe of the
     relevant plugin before giving up.
     """
-    def walk(ops):
-        for op in ops:
-            if op.device is not None:
-                plugin_name, _ = plan.split_device_ref(op.device)
-                if plugin_name not in plugins_by_name:
-                    raise ValueError(f"line {op.lineno}: unknown device "
-                                     f"{op.device!r}")
-                pl = plugins_by_name[plugin_name]
-                if op.verb in ("open", "close"):
-                    pass
-                elif op.verb not in pl.ops:
-                    raise ValueError(f"line {op.lineno}: {op.device!r} has "
-                                     f"no op {op.verb!r}")
-            walk(op.body)
-    walk(parsed.ops)
+    for op in parsed.ops:
+        if op.device is None:
+            continue
+        plugin_name, _ = plan.split_device_ref(op.device)
+        if plugin_name not in plugins_by_name:
+            known = ", ".join(sorted(plugins_by_name)) or "(none)"
+            raise ValueError(
+                f"line {op.lineno}: unknown device {op.device!r}; "
+                f"known plugins: {known}")
+        pl = plugins_by_name[plugin_name]
+        if op.verb in ("open", "close"):
+            continue
+        if op.verb not in pl.ops:
+            ops_known = ", ".join(sorted(pl.ops)) or "(none)"
+            raise ValueError(
+                f"line {op.lineno}: {op.device!r} has no op "
+                f"{op.verb!r}; known ops: {ops_known}")
 
 
 def _failure_artefact(job_id, message):

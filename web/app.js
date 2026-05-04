@@ -2,7 +2,7 @@
 // All status fetches are manual (refresh-now, run-inventory, or the
 // implicit refresh after a plan submit). Submits plans via
 // /submit (which sniffs plain-text vs tar) and tracks artefacts at
-// /outputs/<digest>.{txt,tar}.
+// /outputs/<digest>.tar.
 
 const SUBMIT_POLL_MS = 1000;
 const SUBMIT_TIMEOUT_MS = 60_000;
@@ -332,17 +332,15 @@ async function submitPlanText(text, meta = {}, btn) {
   }
 }
 
-// Poll for the .txt sentinel. Does NOT delete -- the artefact stays on
-// the server so the user can browse files in the tarball afterwards.
-// They can click the "delete" button in the result panel to clean up.
+// HEAD-poll the artefact tar. Does NOT delete -- the tarball stays
+// on the server so the user can browse files in it afterwards. They
+// can click the "delete" button in the result panel to clean up.
 async function waitForArtefact(digest) {
   const deadline = Date.now() + SUBMIT_TIMEOUT_MS;
   while (Date.now() < deadline) {
-    const r = await fetch(`/outputs/${digest}.txt`, { cache: "no-store" });
-    if (r.ok) {
-      const txt = await r.text();
-      return { status: "done", txt };
-    }
+    const r = await fetch(`/outputs/${digest}.tar`,
+                          { method: "HEAD", cache: "no-store" });
+    if (r.ok) return { status: "done" };
     if (r.status !== 404) {
       throw new Error(`artefact poll: ${r.status}`);
     }
@@ -379,13 +377,6 @@ async function renderArtefact(digest, result) {
     }, "delete"),
   );
   out.appendChild(header);
-
-  if (result.txt) {
-    const sentinelDetails = el("details", { open: "" });
-    sentinelDetails.appendChild(el("summary", {}, "sentinel"));
-    sentinelDetails.appendChild(el("pre", { class: "artefact-text" }, result.txt));
-    out.appendChild(sentinelDetails);
-  }
 
   const filesDetails = el("details", { open: "" });
   filesDetails.appendChild(el("summary", {}, "files in tar"));

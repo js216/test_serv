@@ -30,6 +30,13 @@ class DeviceRegistry:
         self.cache = {}
         self.per_dev_lock = {} # "dsp.A" -> threading.RLock
         self.verify_results = {}  # "dsp.A" -> {t, ok, err, latency_ms}
+        # Set of keys currently claimed by an active session for the
+        # whole session lifetime. Refresh checks this in addition to
+        # cache refs before dropping a vanished spec, so a USB blip
+        # mid-session can't yank a device out from under the session
+        # while ops are still scheduled to run on it. Session adds
+        # eagerly at run_all entry, removes in run_all's finally.
+        self.pinned_specs = set()
 
     def stop(self):
         # Kept for API compatibility with the older TTL-reaper version;
@@ -54,7 +61,7 @@ class DeviceRegistry:
         with self.lock:
             # drop specs for devices that have vanished *and* are not in use
             for key in list(self.specs):
-                if key not in found:
+                if key not in found and key not in self.pinned_specs:
                     entry = self.cache.get(key)
                     if entry is None or entry[1] == 0:
                         self.specs.pop(key, None)
@@ -93,7 +100,7 @@ class DeviceRegistry:
                 plugin_name, _ = self.specs[key]
                 if plugin_name != name:
                     continue
-                if key not in found:
+                if key not in found and key not in self.pinned_specs:
                     entry = self.cache.get(key)
                     if entry is None or entry[1] == 0:
                         self.specs.pop(key, None)
