@@ -290,23 +290,12 @@ def required_devices(plan):
     Strips the ``.spec_id`` suffix off ``plugin.id:op`` references --
     the session's locking and refresh paths key on plugin names, while
     spec_id resolution happens later in ``registry.resolve``.
-
-    ``lease:claim device=foo.bar duration_s=...`` also pulls ``foo``
-    into the set so the session pre-locks it; the lease op needs to
-    hold that device's per_dev_lock when it adds the entry to the
-    registry's lease table.
     """
     out = set()
     for op in plan.ops:
         plugin_name, _ = split_device_ref(op.device)
         if plugin_name is not None:
             out.add(plugin_name)
-        if op.device == "lease" and op.verb == "claim":
-            d = op.args.get("device")
-            if d is not None:
-                raw = d.raw if hasattr(d, "raw") else str(d)
-                if "." in raw:
-                    out.add(raw.split(".", 1)[0])
     return out
 
 

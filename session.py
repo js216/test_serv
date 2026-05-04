@@ -83,10 +83,6 @@ class Session:
         self.errors = []
         self.lock = threading.Lock()
         self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
-        # Set by a leading lease:resume op or minted by the first lease:claim;
-        # gates session lock acquisition against the registry's lease registry
-        # so other agents can't acquire devices we're holding across sessions.
-        self.lease_token = None
         # Set by signal_cancel(). _run_block tests it at op boundaries;
         # long-blocking ops (delay, *_expect polling loops) wait on
         # cancel_event so they wake up immediately on cancel instead
@@ -139,30 +135,6 @@ class Session:
         self.cancel_event.set()
         self.log_event("CTRL", "session", "cancel requested")
 
-    def _prescan_lease_resume(self):
-        """If the plan starts with ``lease:resume token=...``, take over
-        that token's lease before any locks are acquired so the lease
-        gate treats us as the owner.  Anything past op 0 is ignored to
-        keep the contract simple: resume must be the first op.
-        """
-        if not self.plan.ops:
-            return
-        op = self.plan.ops[0]
-        if op.device != "lease" or op.verb != "resume":
-            return
-        tok = op.args.get("token")
-        if tok is None:
-            raise PlanError("lease:resume requires token=...")
-        token = tok.raw if hasattr(tok, "raw") else str(tok)
-        held = self.registry.lease_resume(token)
-        if held is None:
-            raise BusyError(
-                f"lease {token!r} is unknown or expired; cannot resume")
-        self.lease_token = token
-        self.log_event(
-            "LEASE", "session",
-            f"resume token={token!r} devices={sorted(held)}")
-
     # --- execution ---
 
     def run_all(self, plugins):
@@ -170,21 +142,6 @@ class Session:
         # MAX_SESSION_S so a rogue agent can't camp on a device.
         budget_s = min(self.runtime_s or DEFAULT_SESSION_S, MAX_SESSION_S)
         deadline = self.t0 + budget_s
-        # Pre-scan for `lease:resume token=...` so the lease gate below
-        # treats this session as the lease's owner. Validation (token
-        # exists / not expired) runs again at op time as a safety net.
-        # Failures land in self.errors so the agent gets an errors.log
-        # artefact rather than the worker thread crashing with no trace.
-        try:
-            self._prescan_lease_resume()
-        except Exception:
-            self.errors.append(traceback.format_exc())
-            self.log_event(
-                "ERROR", "session",
-                f"prescan: {self.errors[-1].splitlines()[-1]}")
-            for s in self.streams.values():
-                s.close()
-            return
         # Job-atomic device locking: grab every device the plan
         # references up front and hold the locks for the whole session.
         # A job that needs {dsp, fpga} therefore pauses any other job
@@ -226,26 +183,11 @@ class Session:
             f"acquire now={eager_keys}  "
             f"deferred={sorted(self._deferred_names)}"
             if eager_keys or self._deferred_names else "(no devices)")
-        # Pre-flight lease check: refuse fast if any required device is
-        # leased to a different agent. Cheap; the post-acquire re-check
-        # below closes the race window where someone leases between
-        # this peek and our lock grab.
         eager_acquired = []
         try:
-            for k in eager_keys:
-                blocker = self.registry.lease_blocks_us(k, self.lease_token)
-                if blocker is not None:
-                    raise BusyError(
-                        f"{k} is leased to {blocker!r}; resume that lease "
-                        f"or wait for it to expire")
-            for lk, k in zip(eager_locks, eager_keys):
+            for lk in eager_locks:
                 lk.acquire()
                 eager_acquired.append(lk)
-                blocker = self.registry.lease_blocks_us(k, self.lease_token)
-                if blocker is not None:
-                    raise BusyError(
-                        f"{k} was leased to {blocker!r} between pre-flight "
-                        f"and lock acquire")
         except Exception:
             for held in reversed(eager_acquired):
                 held.release()
@@ -363,21 +305,10 @@ class Session:
             key = self.registry.resolve(plugin_name, spec_id)
 
         if plugin_name in getattr(self, "_deferred_names", set()):
-            blocker = self.registry.lease_blocks_us(key, self.lease_token)
-            if blocker is not None:
-                raise BusyError(
-                    f"{key} is leased to {blocker!r}; resume that lease "
-                    f"or wait for it to expire")
             with self.registry.lock:
                 lk = self.registry.per_dev_lock.setdefault(
                     key, threading.RLock())
             lk.acquire()
-            blocker = self.registry.lease_blocks_us(key, self.lease_token)
-            if blocker is not None:
-                lk.release()
-                raise BusyError(
-                    f"{key} was leased to {blocker!r} between pre-flight "
-                    f"and lock acquire")
             self._deferred_locks.append(lk)
             self._deferred_names.discard(plugin_name)
             self.log_event("LOCK", "session",

@@ -10,8 +10,8 @@
     <h1>test_serv</h1>
     <div class="status">
       <span id="poll-status" class="poll-ok">poll: --</span>
-      <button id="refresh-now" type="button" title="Re-fetch /devices /leases /ops from the server. Cheap; no bench work. Shows the latest snapshot the poller has pushed.">refresh now</button>
-      <button id="run-inventory" type="button" title="Submit `inventory verify=true`. Forces the poller to re-probe USB and identity-verify every device, then push fresh status. Slower; actually exercises the bench. Use after plug/unplug.">run inventory</button>
+      <button id="refresh-now" type="button" title="Re-fetch /devices and /ops from the server. Cheap; no bench work. Shows the latest snapshot the poller has pushed.">refresh now</button>
+      <button id="run-inventory" type="button" title="POST /sweep + run an `inventory` plan. Forces the poller to re-probe USB and identity-verify every device, then push fresh status. Slower; actually exercises the bench. Use after plug/unplug.">run inventory</button>
     </div>
   </header>
 
@@ -26,41 +26,11 @@
           <th>verify</th>
           <th>latency</th>
           <th>handle</th>
-          <th>lease</th>
         </tr>
       </thead>
       <tbody></tbody>
     </table>
     <div id="devices-empty" class="empty hidden">no devices reported</div>
-  </section>
-
-  <section id="leases-section">
-    <h2>Leases</h2>
-    <table id="leases-table">
-      <thead>
-        <tr>
-          <th>token</th>
-          <th>devices</th>
-          <th>remaining</th>
-          <th>actions</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-    <div id="leases-empty" class="empty">no active leases</div>
-
-    <details id="claim-form-wrap">
-      <summary>+ new lease</summary>
-      <form id="claim-form">
-        <label>devices (comma-separated, e.g. <code>mp135.0,msc.mp135</code>)
-          <input id="claim-devices" type="text" required>
-        </label>
-        <label>duration (seconds, max 3600)
-          <input id="claim-duration" type="number" min="1" max="3600" value="600">
-        </label>
-        <button type="submit">claim</button>
-      </form>
-    </details>
   </section>
 
   <section id="jobs-section">
@@ -101,7 +71,7 @@
       </label>
     </div>
     <textarea id="plan-text" rows="8"
-              placeholder='description "short summary of what this plan does"&#10;lease:list&#10;# or any multi-op plan'></textarea>
+              placeholder='description "short summary of what this plan does"&#10;inventory&#10;# or any multi-op plan'></textarea>
     <div class="row">
       <label>X-Test-Runtime (s)
         <input id="meta-runtime" type="number" min="1" max="3600" placeholder="default: 600">

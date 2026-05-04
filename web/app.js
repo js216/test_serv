@@ -62,7 +62,6 @@ function describeLoc(spec) {
 
 const state = {
   devices: [],
-  leases: [],
   ops: {},
   jobs: [],
   lastFetch: 0,
@@ -78,14 +77,12 @@ async function jget(path) {
 
 async function refresh() {
   try {
-    const [devices, leases, ops, jobs] = await Promise.all([
+    const [devices, ops, jobs] = await Promise.all([
       jget("/devices"),
-      jget("/leases"),
       jget("/ops"),
       jget("/jobs"),
     ]);
     state.devices = devices;
-    state.leases = leases;
     state.ops = ops;
     state.jobs = jobs;
     state.lastFetch = Date.now();
@@ -112,7 +109,6 @@ function setPollStatus(kind, msg) {
 
 function renderAll() {
   renderDevices();
-  renderLeases();
   renderJobs();
   renderInventory();
 }
@@ -224,21 +220,11 @@ function renderDevices() {
   }
   $("#devices-empty").classList.add("hidden");
 
-  // Build a quick {key -> token} map from leases for the lease column.
-  const leaseFor = {};
-  for (const l of state.leases) {
-    for (const k of l.devices || []) leaseFor[k] = l.token;
-  }
-
   for (const d of state.devices) {
     const v = d.verify || null;
     const lat = v && v.latency_ms != null
       ? `${Number(v.latency_ms).toFixed(1)}ms` : "—";
     const handle = d.status || "—";
-    const leaseTok = leaseFor[d.id];
-    const leaseEl = leaseTok
-      ? el("span", { class: "tag-warn", title: leaseTok }, "leased")
-      : el("span", { class: "tag-unset" }, "—");
 
     const desc = d.spec && d.spec.description;
     const trAttrs = desc ? { title: desc, class: "has-tooltip" } : {};
@@ -249,51 +235,9 @@ function renderDevices() {
       el("td", {}, verifyCell(v)),
       el("td", {}, lat),
       el("td", {}, handle),
-      el("td", {}, leaseEl),
     ));
   }
 }
-
-function renderLeases() {
-  const tbody = $("#leases-table tbody");
-  tbody.innerHTML = "";
-  if (!state.leases.length) {
-    $("#leases-empty").classList.remove("hidden");
-    return;
-  }
-  $("#leases-empty").classList.add("hidden");
-
-  const now = Date.now() / 1000;
-  for (const l of state.leases) {
-    const remaining = (l.expires_at_walltime != null)
-      ? l.expires_at_walltime - now
-      : l.expires_in_s;
-
-    tbody.appendChild(el("tr", {},
-      el("td", { class: "mono", title: l.token }, l.token),
-      el("td", { class: "mono" }, (l.devices || []).join(", ")),
-      el("td", { class: "remaining mono",
-                 "data-walltime": String(l.expires_at_walltime || 0) },
-        fmtRemaining(remaining)),
-      el("td", {},
-        el("button", {
-          type: "button",
-          onclick: () => releaseLease(l.token),
-        }, "release")),
-    ));
-  }
-}
-
-// 1Hz local countdown so leases tick every second without a backend
-// roundtrip; values get re-synced on each refresh().
-setInterval(() => {
-  const now = Date.now() / 1000;
-  for (const e of document.querySelectorAll(".remaining")) {
-    const w = Number(e.dataset.walltime);
-    if (!w) continue;
-    e.textContent = fmtRemaining(w - now);
-  }
-}, 1000);
 
 function renderInventory() {
   const c = $("#inventory");
@@ -493,27 +437,7 @@ function escapeHtml(s) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function releaseLease(token) {
-  if (!confirm(`Release lease ${token}?`)) return;
-  await submitPlanText(
-    `description "dashboard: release lease ${token.slice(0, 12)}…"\n` +
-    `lease:release token="${token}"\n`);
-}
-
 // --- form wiring -----------------------------------------------------
-
-$("#claim-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const devs = $("#claim-devices").value.trim();
-  const dur = Number($("#claim-duration").value || 600);
-  if (!devs) return;
-  const lines = [
-    `description "dashboard: claim ${devs} for ${dur}s"`,
-    ...devs.split(",").map((s) => s.trim()).filter(Boolean)
-      .map((d) => `lease:claim device=${d} duration_s=${dur}`),
-  ];
-  await submitPlanText(lines.join("\n") + "\n");
-});
 
 // Populate the example-picker dropdown from GET /examples and load
 // the chosen plan into the textarea on change. Plain text fetch --

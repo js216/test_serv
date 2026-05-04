@@ -230,10 +230,6 @@ def _publish_status(registry, plugins_by_name):
     _write_atomic(os.path.join(STATUS, "devices.json"), devices)
     _push_status("devices.json", devices)
 
-    leases = json.dumps(registry.lease_list(), indent=2).encode()
-    _write_atomic(os.path.join(STATUS, "leases.json"), leases)
-    _push_status("leases.json", leases)
-
     ops_map = {}
     for name, pl in plugins_by_name.items():
         ops_map[name] = {
