@@ -23,6 +23,35 @@ cat /tmp/test-serv-inventory/streams/bench.ops.json.bin
 Use `inventory verify=true` to make the bench poller run an identity
 sweep before returning the device list. That can take longer.
 
+### install
+
+The server (`server.py`) and the agent clients (`submit.py`,
+`run_md.py`) are pure-stdlib and need no third-party deps. The
+poller (`poller.py`) needs hardware drivers; install them on the
+bench host:
+
+```
+pip install -r requirements.txt
+```
+
+Bench-host system tools (not pip):
+
+- `STM32_Programmer_CLI` -- needed by `dfu` plugin if you flash STM32
+  parts. Install ST's STM32CubeProgrammer and put the binary on PATH.
+- `ssh` client -- needed by `ssh` plugin. Standard OpenSSH works.
+- udev rules -- run `sudo sh do.sh` once on Linux to grant non-root
+  access to the FTDI / DFU / scope / MSC USB devices the plugins
+  drive. The script writes `/etc/udev/rules.d/99-bench-usb.rules`
+  and reloads. Replug devices afterwards.
+
+### environment
+
+| variable           | purpose                                      | default                                |
+|--------------------|----------------------------------------------|----------------------------------------|
+| `TEST_SERV_DIR`    | state dir for inputs/outputs/done/status     | `<tmp>/test_serv-<user>`               |
+| `TEST_SERV_CONFIG` | absolute path to `config.json`               | `$TEST_SERV_DIR/config.json` then repo |
+| `TEST_SERV_URL`    | base URL the agent clients post against      | `http://localhost:8080`                |
+
 ### running
 
 ```
@@ -31,7 +60,8 @@ python3 poller.py                      # bench host
 ```
 
 `poller.py` must be able to reach `server.py` at `localhost:8080`
-from the bench host, typically via an operator-managed tunnel.
+from the bench host, typically via an operator-managed SSH tunnel
+(`ssh -R 8080:localhost:8080 bench-host`).
 
 ### submit a job
 
@@ -102,11 +132,20 @@ DELETE /outputs/<digest>
 Discovery helpers:
 
 ```
+GET /help                # full job-control REST reference (text/plain)
 GET /examples
 GET /examples/<name>
 GET /scope/signals
 POST /sweep
 POST /devices/<device-id>/release
+```
+
+`GET /help` is the canonical reference for `/submit`, `/jobs`,
+`/outputs`, cancellation, and per-submission metadata. Fetch it
+once when learning the API:
+
+```
+curl http://localhost:8080/help
 ```
 
 ### discover what is available
