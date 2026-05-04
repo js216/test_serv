@@ -191,11 +191,11 @@ textarea {
   font-size: 12px;
 }
 
-#inventory details {
+#ops-catalog details {
   margin-bottom: 4px;
 }
 
-#inventory > details > summary {
+#ops-catalog > details > summary {
   font-size: 13px;
   color: var(--accent);
   cursor: pointer;

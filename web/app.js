@@ -125,7 +125,7 @@ function setPollStatus(kind, msg) {
 function renderAll() {
   renderDevices();
   renderJobs();
-  renderInventory();
+  renderOps();
 }
 
 function fmtAge(secondsAgo) {
@@ -293,19 +293,29 @@ function renderDevices() {
   }
 }
 
-function renderInventory() {
-  const c = $("#inventory");
+// Set of plugin names whose <details> the user has expanded. Survives
+// re-renders so a refresh tick (manual or the 3s in-flight tick)
+// doesn't collapse the section the operator was just reading.
+const _opsOpen = new Set();
+
+function renderOps() {
+  const c = $("#ops-catalog");
   c.innerHTML = "";
   const names = Object.keys(state.ops).sort();
   if (!names.length) {
     c.appendChild(el("div", { class: "empty" },
-      "no inventory (poller offline?)"));
+      "no ops catalog (poller offline?)"));
     return;
   }
   for (const name of names) {
     const plugin = state.ops[name] || {};
     const ops = plugin.ops || {};
-    const det = el("details", {});
+    const wasOpen = _opsOpen.has(name);
+    const det = el("details", wasOpen ? { open: "" } : {});
+    det.addEventListener("toggle", () => {
+      if (det.open) _opsOpen.add(name);
+      else _opsOpen.delete(name);
+    });
     const opCount = Object.keys(ops).length;
     det.appendChild(el("summary", {},
       `${name} (${opCount} op${opCount === 1 ? "" : "s"})`));
