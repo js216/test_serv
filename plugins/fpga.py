@@ -126,8 +126,15 @@ def _wait_wip(dev):
         time.sleep(0.001)
 
 
-def _erase(dev, nbytes):
+def _bail_if_canceled(session, where):
+    if session is not None and session.canceled:
+        raise RuntimeError(
+            f"{where} canceled via DELETE /jobs/<digest>")
+
+
+def _erase(dev, nbytes, session=None):
     for addr in range(0, nbytes, SECTOR):
+        _bail_if_canceled(session, f"fpga:erase @ {addr}/{nbytes}B")
         _cmd(dev, [0x06])
         _cmd(dev, [0xD8,
                    (addr >> 16) & 0xff,
@@ -136,8 +143,9 @@ def _erase(dev, nbytes):
         _wait_wip(dev)
 
 
-def _write(dev, buf):
+def _write(dev, buf, session=None):
     for off in range(0, len(buf), PAGE):
+        _bail_if_canceled(session, f"fpga:write @ {off}/{len(buf)}B")
         chunk = bytes(buf[off:off + PAGE])
         _cmd(dev, [0x06])
         _cmd(dev, [0x02,
@@ -147,7 +155,8 @@ def _write(dev, buf):
         _wait_wip(dev)
 
 
-def _verify(dev, buf):
+def _verify(dev, buf, session=None):
+    _bail_if_canceled(session, "fpga:verify (read-back)")
     got = _xfer(dev, [0x03, 0, 0, 0], len(buf))
     if got == buf:
         return
@@ -158,7 +167,7 @@ def _verify(dev, buf):
             )
 
 
-def _program_flash(bitstream, ft2232h_desc):
+def _program_flash(bitstream, ft2232h_desc, session=None):
     ftd2xx = _lazy_ftd2xx()
     dev = ftd2xx.openEx(ft2232h_desc.encode() if isinstance(ft2232h_desc, str)
                         else ft2232h_desc, 2)
@@ -171,9 +180,9 @@ def _program_flash(bitstream, ft2232h_desc):
         ident = _xfer(dev, [0x9F], 3)
         if ident[0] != 0x20:
             raise RuntimeError(f"bad flash ID: {ident.hex()}")
-        _erase(dev, len(bitstream))
-        _write(dev, bitstream)
-        _verify(dev, bitstream)
+        _erase(dev, len(bitstream), session=session)
+        _write(dev, bitstream, session=session)
+        _verify(dev, bitstream, session=session)
         _set_low(dev, IDLE_RUN)
     finally:
         dev.setBitMode(0, 0)
@@ -277,7 +286,7 @@ class FpgaHandle:
 # --- ops ---
 
 def _op_program(session, h, args):
-    _program_flash(bytes(args["bin"]), h.ft2232h_desc)
+    _program_flash(bytes(args["bin"]), h.ft2232h_desc, session=session)
 
 
 def _op_uart_open(session, h, args):

@@ -30,13 +30,48 @@ SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # --- shared helpers ---
 
-def _run_cubeprog(exe, argv_tail, timeout_s):
+def _run_cubeprog(exe, argv_tail, timeout_s, session=None):
+    """Run cubeprog and capture stdout/stderr. If `session` is given
+    and session.canceled fires while cubeprog is still running, the
+    child is SIGTERM'd then SIGKILL'd, and a RuntimeError raises so
+    the op aborts cleanly. Without `session` (probe-time invocation
+    from the registry, no cancel context), behaves like the previous
+    blocking subprocess.run.
+    """
     argv = [exe] + list(argv_tail)
-    try:
-        return subprocess.run(argv, capture_output=True,
-                              timeout=timeout_s, check=False)
-    except subprocess.TimeoutExpired:
-        raise TimeoutError(f"cubeprog timed out after {timeout_s}s")
+    if session is None:
+        try:
+            return subprocess.run(argv, capture_output=True,
+                                  timeout=timeout_s, check=False)
+        except subprocess.TimeoutExpired:
+            raise TimeoutError(f"cubeprog timed out after {timeout_s}s")
+    proc = subprocess.Popen(
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=0.2)
+            return subprocess.CompletedProcess(
+                argv, proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            if session.canceled:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                raise RuntimeError(
+                    "cubeprog canceled mid-flight via "
+                    "DELETE /jobs/<digest>")
+            if time.monotonic() > deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise TimeoutError(
+                    f"cubeprog timed out after {timeout_s}s")
 
 
 def _parse_list_output(stdout):
@@ -161,7 +196,8 @@ def _op_flash_layout(session, h, args):
             _run_with_early_kill(
                 session, h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
         else:
-            result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
+            result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S,
+                                   session=session)
             if result.stdout:
                 session.stream("dfu.flash.stdout").append(result.stdout)
             if result.stderr:
@@ -220,12 +256,16 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     t = threading.Thread(target=_reader, daemon=True)
     t.start()
 
-    # Wait for either the reader to signal reconnect, for cubeprog to
-    # exit on its own, or for the overall timeout to expire.
+    # Wait for either the reader to signal reconnect, cubeprog to
+    # exit, the session to be canceled, or the overall timeout.
+    canceled = False
     while time.monotonic() < deadline:
         if seen_reconnect[0]:
             break
         if proc.poll() is not None:
+            break
+        if session.canceled:
+            canceled = True
             break
         time.sleep(0.05)
 
@@ -253,6 +293,9 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
         session.log_event("DFU", "dfu:flash_layout",
                           f"reader errors: {reader_err}")
 
+    if canceled:
+        raise RuntimeError(
+            "cubeprog canceled mid-flight via DELETE /jobs/<digest>")
     if seen_reconnect[0] and not seen_running[0]:
         raise RuntimeError(
             "cubeprog reached reconnect phase without RUNNING Program "
@@ -286,7 +329,8 @@ def _op_flash(session, h, args):
             "DFU", "dfu:flash",
             f"cubeprog -c port={h.usb_index} -w <{len(image)}B> "
             f"0x{address:08x}")
-        result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
+        result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S,
+                               session=session)
         if result.stdout:
             session.stream("dfu.stdout").append(result.stdout)
         if result.stderr:

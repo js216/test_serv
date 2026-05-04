@@ -5,6 +5,7 @@
 import os
 import shutil
 import subprocess
+import time
 
 import config
 from plugin import DevicePlugin, Op
@@ -32,22 +33,42 @@ def _op_exec(session, h, args):
     cmd = args["command"]
     argv = _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd]
     session.log_event("SSH", "ssh:exec", cmd)
-    try:
-        result = subprocess.run(
-            argv, capture_output=True,
-            timeout=SSH_TIMEOUT_S, check=False)
-    except subprocess.TimeoutExpired:
-        raise TimeoutError(f"ssh:exec timed out ({SSH_TIMEOUT_S}s)")
-    if result.stdout:
-        session.stream("ssh.exec").append(result.stdout)
-    if result.stderr:
-        session.stream("ssh.exec.stderr").append(result.stderr)
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    deadline = time.monotonic() + SSH_TIMEOUT_S
+    stdout = stderr = b""
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=0.2)
+            break
+        except subprocess.TimeoutExpired:
+            if session.canceled:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                raise RuntimeError(
+                    "ssh:exec canceled via DELETE /jobs/<digest>")
+            if time.monotonic() > deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise TimeoutError(
+                    f"ssh:exec timed out ({SSH_TIMEOUT_S}s)")
+    if stdout:
+        session.stream("ssh.exec").append(stdout)
+    if stderr:
+        session.stream("ssh.exec.stderr").append(stderr)
     session.log_event("SSH", "ssh:exec",
-                      f"exit={result.returncode} "
-                      f"stdout={len(result.stdout)}B "
-                      f"stderr={len(result.stderr)}B")
-    if result.returncode != 0:
-        raise RuntimeError(f"ssh:exec exit={result.returncode}")
+                      f"exit={proc.returncode} "
+                      f"stdout={len(stdout)}B "
+                      f"stderr={len(stderr)}B")
+    if proc.returncode != 0:
+        raise RuntimeError(f"ssh:exec exit={proc.returncode}")
 
 
 def _op_pubkey(session, h, args):
