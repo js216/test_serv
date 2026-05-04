@@ -148,6 +148,19 @@ def _op_capture(session, h, args):
     h._inst.write("TRIG:MODE AUTO")
     csv_text = _traces_to_csv(traces)
     session.stream("scope.csv").append(csv_text.encode())
+    # Record one machine-checkable claim per captured channel: "we
+    # got non-empty samples back". Without this, a plan whose only
+    # assertion is scope:capture would land manifest.status="inert"
+    # despite the README listing scope:capture as a check-producing
+    # op. The dashboard-facing inert badge then mis-labels valid
+    # capture-only plans.
+    for ch, samples in traces.items():
+        n = len(samples) if samples is not None else 0
+        session.record_check(
+            "scope_capture", ch,
+            f"channel {ch}: captured >0 samples",
+            "hit" if n > 0 else "miss",
+            {"samples": n})
 
     # Signal-level analysis per config.json scope.signals table.
     signal_cfg = config.section("scope").get("signals") or {}

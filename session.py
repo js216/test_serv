@@ -328,20 +328,24 @@ class Session:
         self.log_event("CTRL", "session", "cancel requested")
 
     def _prescan_lease_resume(self):
-        """If the plan starts with ``lease:resume token=...``, validate
-        the token against the registry's live lease table and bind
-        ``self.lease_token`` BEFORE the eager-acquire path runs. The
-        binding makes ``lease_blocks_acquire`` return None for our
+        """If the plan contains ``lease:resume token=...`` anywhere,
+        validate the token against the registry's live lease table and
+        bind ``self.lease_token`` BEFORE the eager-acquire path runs.
+        The binding makes ``lease_blocks_acquire`` return None for our
         own held devices, so we can re-acquire the locks the previous
         session released. A bad / expired token raises ``BusyError``.
 
-        Anything past op 0 is ignored to keep the contract simple:
-        resume must be the first op.
+        We scan the whole plan, not just op[0], so a natural
+        ``description "..."`` line above ``lease:resume`` doesn't
+        silently skip the binding -- which would then fail eager
+        acquire with a confusing "device is leased to '...'" error.
+        Only the first ``lease:resume`` is honored; subsequent ones
+        are no-ops at op time anyway.
         """
-        if not self.plan.ops:
-            return
-        op = self.plan.ops[0]
-        if op.device != "lease" or op.verb != "resume":
+        op = next((o for o in self.plan.ops
+                   if o.device == "lease" and o.verb == "resume"),
+                  None)
+        if op is None:
             return
         v = op.args.get("token")
         if v is None:

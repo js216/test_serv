@@ -153,12 +153,25 @@ def _op_verify(session, h, args):
     if got == expected:
         session.log_event("MSC", "msc:verify",
                           f"OK {total}B @ LBA {offset_lba}")
+        # Record machine-checkable pass so manifest.status doesn't
+        # land as "inert" for a verify-only plan.
+        session.record_check(
+            "msc_verify", h.device,
+            f"{total}B match at LBA {offset_lba}",
+            "hit",
+            {"bytes": total, "offset_lba": offset_lba})
         return
     mism = sum(1 for a, b in zip(expected, got) if a != b)
     first = next((i for i, (a, b) in enumerate(zip(expected, got)) if a != b),
                  -1)
     session.stream("msc.verify_mismatch").append(
         b"--MISMATCH--" + got[max(0, first - 64):first + 192])
+    session.record_check(
+        "msc_verify", h.device,
+        f"{total}B match at LBA {offset_lba}",
+        "miss",
+        {"bytes": total, "offset_lba": offset_lba,
+         "mismatched": mism, "first_diff": first})
     raise ValueError(
         f"msc verify mismatch: {mism}B differ, first at {first}")
 

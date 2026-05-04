@@ -11,8 +11,9 @@ agent might otherwise grab the device between two of your plans).
 
 Lifecycle:
     plan 1:  lease:claim devices="dsp.A,fpga.hx1k" duration_s=600
-                --> emits the token to the lease.token stream so the
-                    agent can read it from the artefact.
+                --> writes the token to manifest.lease_token (NOT to
+                    any stream or timeline event, since /inflight is
+                    readable by any tunnel client every 2.5s).
     plan 2:  lease:resume token="abc..."
              dsp.A:read_serial   # works; the lease blocks other agents
              ...

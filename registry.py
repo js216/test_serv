@@ -63,6 +63,14 @@ class DeviceRegistry:
         # operator can re-claim).
         self.leases = {}
         self._leases_lock = threading.Lock()
+        # Keys whose plugin.open() hung in verify_sweep. The sweep
+        # thread is still inside _Acquire holding dev_lock and there's
+        # no way to interrupt a C-level USB syscall from Python -- so
+        # subsequent acquires on this key would block forever on the
+        # held RLock. _Acquire short-circuits with BusyError instead.
+        # Cleared only by a poller restart; the operator gets a clear
+        # "replug + restart" signal in /devices verify column.
+        self.quarantined = set()
 
     def stop(self):
         # Kept for API compatibility with the older TTL-reaper version;
@@ -223,10 +231,10 @@ class DeviceRegistry:
             # a hung USB device (rare but does happen on bad cables /
             # power-glitched chips) doesn't wedge poller startup
             # forever. The thread is left running on timeout -- C-side
-            # blocking syscalls can't be interrupted from Python --
-            # but the sweep moves on; the per-device dev_lock the
-            # _Acquire grabbed eventually releases when the kernel
-            # times out the open syscall.
+            # blocking syscalls can't be interrupted from Python -- so
+            # we mark the key quarantined; subsequent acquires fail
+            # fast with BusyError instead of hanging on the dev_lock
+            # the leaked thread is still holding.
             verified_box = [False]
             err_box = [None]
 
@@ -242,10 +250,12 @@ class DeviceRegistry:
             t.start()
             t.join(timeout=VERIFY_OPEN_TIMEOUT_S)
             if t.is_alive():
+                with self.lock:
+                    self.quarantined.add(key)
                 entry["err"] = (f"open timed out after "
                                 f"{VERIFY_OPEN_TIMEOUT_S:.0f}s "
-                                f"(device hung; thread leaked, will "
-                                f"clean up when kernel times out)")
+                                f"(device hung; key quarantined -- "
+                                f"replug + restart poller to clear)")
             elif err_box[0] is not None:
                 e = err_box[0]
                 entry["err"] = f"{type(e).__name__}: {e}"
@@ -436,6 +446,11 @@ class _Acquire:
         with reg.lock:
             if key not in reg.specs:
                 raise LookupError(f"device {key!r} not present")
+            if key in reg.quarantined:
+                raise BusyError(
+                    f"device {key!r} quarantined: open hung in a "
+                    f"prior verify sweep, the dev_lock is leaked. "
+                    f"Replug the device and restart the poller.")
             dev_lock = reg.per_dev_lock.setdefault(key, threading.RLock())
         # Take per-device lock *outside* the registry lock so different
         # devices can be acquired concurrently.

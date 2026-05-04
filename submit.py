@@ -60,12 +60,26 @@ def _submit(data, meta, server):
         _status, body, _hdrs = _http_json(
             "POST", _url(server, "submit"), data=data, headers=headers)
     except urllib.error.HTTPError as e:
-        err = json.loads(e.read().decode() or "{}")
+        try:
+            err = json.loads(e.read().decode() or "{}")
+        except ValueError:
+            err = {}
         digest = err.get("digest", "")
         if e.code == 409 and err.get("status") == "stale_outputs":
             raise StaleOutputsError(digest)
         if e.code == 409 and err.get("status") == "duplicate":
             raise FileExistsError(digest)
+        # The server tags 4xx/5xx responses with a structured status
+        # (too_large/queue_full/disk_full/empty/...). Surface it as a
+        # one-line RuntimeError instead of an opaque urllib traceback,
+        # which is what an operator running submit.py from a shell
+        # actually wants to see.
+        status = err.get("status")
+        limit = err.get("limit")
+        if status:
+            tail = f" (limit={limit})" if limit is not None else ""
+            raise RuntimeError(
+                f"submit refused: {e.code} {status}{tail}")
         raise
     return body["digest"]
 

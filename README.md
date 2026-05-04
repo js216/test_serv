@@ -47,7 +47,7 @@ from the bench host, typically via an operator-managed SSH tunnel
 | `TEST_SERV_CONFIG`    | absolute path to `config.json`               | `$TEST_SERV_DIR/config.json` then repo |
 | `TEST_SERV_URL`       | base URL the agent clients post against      | `http://localhost:8080`                |
 | `TEST_SERV_BENCH_ID`  | label embedded in every artefact's manifest  | unset (manifest field stays `null`)    |
-| `TEST_SERV_PORT`      | port the poller connects to (and server binds, via --port) | `8080`                   |
+| `TEST_SERV_PORT`      | port the server binds and the poller connects to | `8080`                             |
 
 ### first plan
 
@@ -312,8 +312,15 @@ Security-relevant server endpoints available to agents:
 - `POST /devices/<device-id>/release` asks the poller to close an idle
   cached handle.
 
-SSH access, when enabled, is exposed only as fixed plugin ops such as
-`ssh:run_uname`; there is no free-form SSH command op.
+SSH access, when enabled (any non-empty `ssh.instances` in
+`config.json`), exposes `ssh:exec command="..."` — a free-form shell
+command run on the configured target as the configured user (root in
+the shipped config). For an R&D bench this is intentional: plans
+already grant arbitrary device control, and a shell on the system
+under test is part of the same trust boundary. But submitting a plan
+is then equivalent to interactive root SSH on every box listed under
+`ssh.instances`. Treat the SSH tunnel correspondingly trusted, and
+remove `ssh.instances` entirely on benches where this is too broad.
 
 ### adding a device
 
@@ -340,16 +347,18 @@ job reopens the device.
 
 `run_md.py` looks for this heading by default, runs the fenced plan(s)
 below it through the same REST API as `submit.py`, and checks each
-bullet against the resulting artefact via a sibling `verify.py` the
-operator writes per-bench. The shipped block is a smoke test:
+bullet against the resulting artefact via a sibling `verify.py`. The
+shipped block is a smoke test:
 
 ```
 description "smoke: probe the bench"
 inventory
 ```
 
-- `bench.devices.json` exists in the artefact
+- `bench.devices.json`
 
 Run with `python3 run_md.py --server http://localhost:8080`. The
-default `verify.py` in this repo just checks that the named file
-appears in `streams/` -- replace it for real bench tests.
+shipped `verify.py` treats each bullet's first token as a path and
+passes if that file is in the artefact -- enough to fail loudly if the
+poller didn't post something usable, but no more. Replace it for real
+bench tests (manifest status checks, scope.summary thresholds, ...).

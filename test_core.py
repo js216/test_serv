@@ -2,6 +2,7 @@
 # test_core.py --- Stdlib smoke test: parse, run, artefact shape
 # Copyright (c) 2026 Jakob Kastelic
 
+import hashlib
 import io
 import json
 import os
@@ -232,6 +233,53 @@ def test_server_rest_queue_helpers():
             assert server.parse_output_name(f"{digest}.txt") == (
                 digest, ".txt")
             assert server.delete_outputs(digest) == 1
+        finally:
+            (server.INPUTS, server.OUTPUTS, server.DONE,
+             server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
+
+
+def test_queue_job_rejects_resubmit_while_inflight():
+    """Round-9 Q2: queue_job must refuse a digest that's already
+    mid-flight (in DONE/.plan or in inflight.json). Without this gate
+    a doubled-up submit would dispatch two sessions for the same
+    digest; the second one's _active_sessions[digest] = session2 would
+    clobber the first, and two real bench runs collapse into one
+    observable artefact at upload time.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dirs = (server.INPUTS, server.OUTPUTS, server.DONE,
+                    server.STATUS, server.RELEASE, server.SWEEP)
+        server.INPUTS = os.path.join(tmp, "inputs")
+        server.OUTPUTS = os.path.join(tmp, "outputs")
+        server.DONE = os.path.join(tmp, "done")
+        server.STATUS = os.path.join(tmp, "status")
+        server.RELEASE = os.path.join(tmp, "release")
+        server.SWEEP = os.path.join(tmp, "sweep")
+        for d in (server.INPUTS, server.OUTPUTS, server.DONE,
+                  server.STATUS, server.RELEASE, server.SWEEP):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            body = plan.pack_tar("mark tag=q2\n", {})
+            digest = hashlib.sha256(body).hexdigest()
+            # (1) DONE/.plan present -> "duplicate"
+            with open(os.path.join(server.DONE, f"{digest}.plan"),
+                      "wb") as f:
+                f.write(b"x")
+            d2, status = server.queue_job(body)
+            assert d2 == digest and status == "duplicate", (d2, status)
+            os.unlink(os.path.join(server.DONE, f"{digest}.plan"))
+
+            # (2) inflight.json lists digest -> "duplicate"
+            with open(os.path.join(server.STATUS, "inflight.json"),
+                      "wb") as f:
+                f.write(json.dumps([{"digest": digest}]).encode())
+            d2, status = server.queue_job(body)
+            assert d2 == digest and status == "duplicate", (d2, status)
+            os.unlink(os.path.join(server.STATUS, "inflight.json"))
+
+            # (3) clean state -> queued
+            d2, status = server.queue_job(body)
+            assert d2 == digest and status == "queued", (d2, status)
         finally:
             (server.INPUTS, server.OUTPUTS, server.DONE,
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
@@ -649,6 +697,7 @@ def main():
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
         test_server_rest_queue_helpers,
+        test_queue_job_rejects_resubmit_while_inflight,
         test_lazy_handle_cache_and_release,
         test_bounded_sizes,
         test_stop_session_clean_termination,

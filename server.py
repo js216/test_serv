@@ -291,6 +291,16 @@ def queue_job(body, meta=None):
             return digest, "stale_outputs"
         if os.path.exists(dst):
             return digest, "duplicate"
+        # Also reject if the same digest is already mid-flight: the
+        # .plan is in DONE (poller picked it up), or the poller's
+        # inflight feed still lists it. Without this, two identical
+        # bodies submitted seconds apart would both dispatch, and
+        # _active_sessions[digest] gets clobbered -- two real runs
+        # collapse into one observable artefact in OUTPUTS.
+        if os.path.exists(os.path.join(DONE, f"{digest}.plan")):
+            return digest, "duplicate"
+        if digest in _inflight_digests():
+            return digest, "duplicate"
         # Write meta first so a poller racing to pick up the .plan
         # never sees an empty/old meta file -- pickup keys off .plan
         # presence.
@@ -989,15 +999,24 @@ class Handler(BaseHTTPRequestHandler):
         cancel reason in errors.log.
         """
         # 1) queued? unlink immediately.
+        # Only the .plan unlink drives the canceled_queued signal.
+        # _pickup renames .plan first then .meta, so there's a brief
+        # window where INPUTS has only .meta left -- if we counted a
+        # .meta unlink as a successful cancel, we'd lie to the operator
+        # when in fact the poller has already taken the .plan from
+        # under us and is about to dispatch.
         queued_path = os.path.join(INPUTS, f"{digest}.plan")
         meta_path = queued_path + ".meta"
         canceled_queued = False
-        for p in (queued_path, meta_path):
-            try:
-                os.unlink(p)
-                canceled_queued = True
-            except FileNotFoundError:
-                pass
+        try:
+            os.unlink(queued_path)
+            canceled_queued = True
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(meta_path)
+        except FileNotFoundError:
+            pass
         if canceled_queued:
             return self._send_json(
                 json.dumps({"status": "canceled_queued",
@@ -1203,8 +1222,12 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    # Default port honours $TEST_SERV_PORT so a single shell-level env
+    # can drive both server and poller (poller already reads the same
+    # var). --port still wins if explicitly passed.
+    default_port = int(os.environ.get("TEST_SERV_PORT", "8080"))
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=default_port)
     args = ap.parse_args()
     for d in (INPUTS, OUTPUTS, DONE, STATUS, RELEASE, SWEEP, CANCEL):
         os.makedirs(d, mode=0o700, exist_ok=True)

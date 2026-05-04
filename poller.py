@@ -757,6 +757,25 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
     try:
         _post(f"{base}/{digest}.tar", body, timeout=timeout_s)
     except urllib.error.HTTPError as e:
+        if e.code == 409:
+            # No matching job record on the server (e.g. the operator
+            # clicked "delete all" between session-end and our retry).
+            # Don't unlink: the spool is the only on-bench evidence
+            # the run happened. Park it under refused/ so the operator
+            # can re-POST it manually after re-queueing.
+            refused = os.path.join(PENDING, "refused")
+            os.makedirs(refused, mode=0o700, exist_ok=True)
+            try:
+                os.replace(spool_path, os.path.join(refused, name))
+                print(datetime.now(),
+                      f"POST {name} refused 409; parked under "
+                      f"{refused} (resubmit the digest, then move "
+                      f"the file back into {PENDING} to retry).")
+            except OSError as move_err:
+                print(datetime.now(),
+                      f"POST {name} refused 409 + park failed: "
+                      f"{move_err} (leaving spool in place)")
+            return False
         if 400 <= e.code < 500:
             print(datetime.now(),
                   f"POST {name} refused with {e.code} (giving up): {e}")
