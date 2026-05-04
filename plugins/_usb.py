@@ -97,6 +97,41 @@ def ftd2xx_descriptors():
             for d in descs}
 
 
+def ftd2xx_devices():
+    """Return a list of ``{serial, description}`` dicts for every
+    currently enumerated FTDI device, or ``None`` if the driver is
+    unavailable. Used by plugins that need to disambiguate one of
+    several physically-identical FTDI parts on the same bench --
+    description alone (e.g. "Dual RS232-HS A") is shared across all
+    FT2232H units, so an iSerial pin is the only way to be sure
+    which one we're about to program.
+    """
+    try:
+        import ftd2xx
+    except ImportError:
+        return None
+    try:
+        n = ftd2xx.createDeviceInfoList()
+    except Exception:
+        return None
+    out = []
+    for i in range(n):
+        try:
+            d = ftd2xx.getDeviceInfoDetail(i)
+        except Exception:
+            continue
+        ser = d.get("serial")
+        desc = d.get("description")
+        if isinstance(ser, bytes):
+            ser = ser.decode(errors="replace")
+        if isinstance(desc, bytes):
+            desc = desc.decode(errors="replace")
+        out.append({"index": i,
+                    "serial": ser or "",
+                    "description": desc or ""})
+    return out
+
+
 def winusb_device_present(vid, pid, serial=None):
     """Check whether a WinUSB / libusb device with the given VID/PID
     (and optional iSerial) is currently enumerated.

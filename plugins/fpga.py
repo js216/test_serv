@@ -175,10 +175,20 @@ def _verify(dev, buf, session=None):
             )
 
 
-def _program_flash(bitstream, ft2232h_desc, session=None):
+def _program_flash(bitstream, ft2232h_desc, ft2232h_serial, session=None):
     ftd2xx = _lazy_ftd2xx()
-    dev = ftd2xx.openEx(ft2232h_desc.encode() if isinstance(ft2232h_desc, str)
-                        else ft2232h_desc, 2)
+    # Pinned-serial path is the safe one: opening by the FTDI iSerial
+    # picks exactly one device even when several FT2232H boards on
+    # the same bench all advertise "Dual RS232-HS A". flag=1 ==
+    # OPEN_BY_SERIAL_NUMBER, flag=2 == OPEN_BY_DESCRIPTION.
+    if ft2232h_serial:
+        dev = ftd2xx.openEx(
+            ft2232h_serial.encode()
+            if isinstance(ft2232h_serial, str) else ft2232h_serial, 1)
+    else:
+        dev = ftd2xx.openEx(
+            ft2232h_desc.encode()
+            if isinstance(ft2232h_desc, str) else ft2232h_desc, 2)
     try:
         _mpsse_init(dev)
         _set_low(dev, IDLE_RESET)
@@ -219,10 +229,15 @@ def _find_icestick_uart(uart_desc, auto):
 # --- plugin handle ---
 
 class FpgaHandle:
-    def __init__(self, serial_port, baud, ft2232h_desc):
+    def __init__(self, serial_port, baud, ft2232h_desc, ft2232h_serial=None):
         self.serial_port = serial_port
         self.baud = baud
         self.ft2232h_desc = ft2232h_desc
+        # When set, _program_flash opens the MPSSE channel by FTDI
+        # iSerial (channel-A serial: e.g. "ICESTICK_42A") rather than
+        # by the shared "Dual RS232-HS A" description -- mandatory if
+        # you have more than one FT2232H board on the bench.
+        self.ft2232h_serial = ft2232h_serial
         self._ser = None
         self._thread = None
         self._stop = None
@@ -294,7 +309,8 @@ class FpgaHandle:
 # --- ops ---
 
 def _op_program(session, h, args):
-    _program_flash(bytes(args["bin"]), h.ft2232h_desc, session=session)
+    _program_flash(bytes(args["bin"]), h.ft2232h_desc, h.ft2232h_serial,
+                   session=session)
 
 
 def _op_uart_open(session, h, args):
@@ -355,13 +371,30 @@ class FpgaPlugin(DevicePlugin):
     }
 
     def probe(self):
-        descs = _usb.ftd2xx_descriptors()
-        if descs is None:
+        devs = _usb.ftd2xx_devices()
+        if devs is None:
             return []
         out = []
         for inst in config.instances(self.name):
             ft_desc = inst.get("ft2232h_desc") or FT2232H_DESC_A_DEFAULT
-            if ft_desc not in descs:
+            want_serial = inst.get("ft2232h_serial") or None
+            # Find the MPSSE channel-A device that matches both the
+            # description and (if pinned) the iSerial. FTDI auto-
+            # appends "A"/"B" to the per-channel serials, so a config
+            # value of "ICESTICK_42" matches an enumerated serial of
+            # "ICESTICK_42A". Accept either form so operators can
+            # write the bare base serial in config.
+            match = None
+            for d in devs:
+                if d["description"] != ft_desc:
+                    continue
+                if want_serial:
+                    s = d["serial"]
+                    if s != want_serial and s != f"{want_serial}A":
+                        continue
+                match = d
+                break
+            if match is None:
                 continue
             uart_desc = inst.get("ft2232h_uart_desc") or FT2232H_DESC_B_DEFAULT
             auto = inst.get("uart_autodetect") or {}
@@ -370,6 +403,12 @@ class FpgaPlugin(DevicePlugin):
             out.append({
                 "id": inst.get("id", "0"),
                 "ft2232h_desc": ft_desc,
+                # Always carry the *enumerated* serial forward (e.g.
+                # "ICESTICK_42A") so open() can openEx by serial.
+                # Empty string when the chip has no programmed iSerial
+                # and the operator chose not to pin -- in that case
+                # we fall back to opening by description.
+                "ft2232h_serial": match["serial"] if want_serial else "",
                 "serial_port": uart_port,
                 "baudrate": int(inst.get("baudrate", FPGA_BAUD_DEFAULT)),
                 "description": inst.get("description"),
@@ -379,7 +418,8 @@ class FpgaPlugin(DevicePlugin):
     def open(self, spec):
         return FpgaHandle(serial_port=spec.get("serial_port"),
                           baud=spec["baudrate"],
-                          ft2232h_desc=spec["ft2232h_desc"])
+                          ft2232h_desc=spec["ft2232h_desc"],
+                          ft2232h_serial=spec.get("ft2232h_serial") or None)
 
     def close(self, handle):
         handle.uart_close()
