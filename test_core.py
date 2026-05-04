@@ -376,6 +376,49 @@ def test_cancel_propagates_to_session():
     reg.close_all()
 
 
+def test_signal_cancel_sigkills_session_subprocs():
+    """A DELETE /jobs/<digest> against a session that's running a
+    subprocess (cubeprog flash, ssh:exec, ...) should SIGKILL that
+    subprocess immediately rather than waiting on the op's
+    200ms-poll loop. Without this, the operator sees "delivered
+    but not honored" -- the cancel marker arrives, signal_cancel
+    runs, but the subprocess keeps going for seconds-to-minutes.
+    """
+    import subprocess as _sp
+    import poller
+    parsed = plan.load_tar(plan.pack_tar("delay ms=1\n", {}))
+    reg = DeviceRegistry({}); reg.refresh()
+    s1 = Session(reg, parsed)
+    s2 = Session(reg, parsed)
+    # Spawn one subproc owned by each session, plus one unowned.
+    p1 = _sp.Popen(["sleep", "60"])
+    p2 = _sp.Popen(["sleep", "60"])
+    p_other = _sp.Popen(["sleep", "60"])
+    poller.register_subprocess(p1, session=s1)
+    poller.register_subprocess(p2, session=s2)
+    poller.register_subprocess(p_other, session=None)
+    try:
+        s1.signal_cancel()
+        # p1 should die almost immediately; p2 and p_other untouched.
+        rc1 = p1.wait(timeout=2.0)
+        assert rc1 != 0, "p1 should have been killed by signal_cancel"
+        assert p2.poll() is None, (
+            "another session's subproc must not be killed when s1 is "
+            "canceled")
+        assert p_other.poll() is None, (
+            "unowned subproc must not be killed by a session cancel")
+    finally:
+        for p in (p1, p2, p_other):
+            try:
+                if p.poll() is None:
+                    p.kill()
+                    p.wait(timeout=2.0)
+            except Exception:
+                pass
+            poller.unregister_subprocess(p)
+    reg.close_all()
+
+
 def test_refresh_does_not_evict_pinned():
     """If a session has acquired a device and refresh runs while
     that device is transiently absent from probe(), the spec must
@@ -773,6 +816,7 @@ def main():
         test_bounded_sizes,
         test_stop_session_clean_termination,
         test_cancel_propagates_to_session,
+        test_signal_cancel_sigkills_session_subprocs,
         test_refresh_does_not_evict_pinned,
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,

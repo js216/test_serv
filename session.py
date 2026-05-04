@@ -322,10 +322,21 @@ class Session:
         _run_block tests at op boundaries) and self.cancel_event
         (which long-blocking ops should wait on instead of using
         plain time.sleep, so they wake immediately on cancel).
+        Also SIGKILLs any Popen children registered to this session
+        so a cancel issued mid-cubeprog-flash or mid-ssh:exec aborts
+        the child immediately rather than waiting on the op's
+        200ms-poll loop. Idempotent on the kill path too.
         """
         self.canceled = True
         self.cancel_event.set()
         self.log_event("CTRL", "session", "cancel requested")
+        try:
+            from poller import kill_session_subprocs
+            kill_session_subprocs(self)
+        except ImportError:
+            pass
+        except Exception:
+            pass
 
     def _prescan_lease_resume(self):
         """If the plan contains ``lease:resume token=...`` anywhere,

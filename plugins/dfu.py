@@ -14,15 +14,16 @@ from plugin import DevicePlugin, Op
 from . import _usb
 
 
-def _track_subproc(proc):
-    """Register a Popen so the poller's SIGINT shutdown can SIGKILL
-    it. Imported at first call so this module stays importable
-    without poller.py (e.g. plain `python -c "import plugins.dfu"`
-    in a debug session).
+def _track_subproc(proc, session=None):
+    """Register a Popen so the poller's SIGINT shutdown AND
+    session.signal_cancel can SIGKILL it. Pass ``session`` so a
+    cancel issued mid-flash actually kills the cubeprog child
+    rather than waiting on the op's 200ms-poll loop. Imported at
+    first call so this module stays importable without poller.py.
     """
     try:
         from poller import register_subprocess
-        register_subprocess(proc)
+        register_subprocess(proc, session=session)
     except Exception:
         pass
 
@@ -73,7 +74,7 @@ def _run_cubeprog(exe, argv_tail, timeout_s, session=None):
             raise TimeoutError(f"cubeprog timed out after {timeout_s}s")
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _track_subproc(proc)
+    _track_subproc(proc, session=session)
     deadline = time.monotonic() + timeout_s
     try:
         while True:
@@ -261,7 +262,7 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     argv = [exe] + list(argv_tail)
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    _track_subproc(proc)
+    _track_subproc(proc, session=session)
     try:
         seen_running = [False]
         seen_reconnect = [False]

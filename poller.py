@@ -168,24 +168,48 @@ def _acquire_poller_lock():
 
 
 # Subprocess registry: every plugin's Popen child is tracked here so
-# the SIGINT shutdown path can SIGKILL anything still alive after
-# the graceful 30s grace window. Without this, a Ctrl-C during a
-# cubeprog flash orphans the subprocess at PID 1.
-_active_subprocs = set()
+# (a) the SIGINT shutdown path can SIGKILL anything still alive after
+# the graceful grace window, and (b) signal_cancel can SIGKILL a
+# session's own subprocesses immediately rather than depending on
+# each op's poll loop to notice session.canceled. Without (b), a
+# DELETE /jobs/<digest> against a session that's mid-cubeprog-flash
+# took up to the cubeprog timeout to actually stop -- "delivered
+# but not honored" from the operator's perspective.
+_active_subprocs = {}  # proc -> session_or_None
 _subprocs_lock = threading.Lock()
 
 
-def register_subprocess(proc):
-    """Plugins call this immediately after Popen so the shutdown
-    path can find the child."""
+def register_subprocess(proc, session=None):
+    """Plugins call this immediately after Popen so the shutdown +
+    cancel paths can find the child. Pass `session` whenever it's
+    available so signal_cancel knows to SIGKILL this proc."""
     with _subprocs_lock:
-        _active_subprocs.add(proc)
+        _active_subprocs[proc] = session
 
 
 def unregister_subprocess(proc):
     """Plugins call this in their finally / after wait()."""
     with _subprocs_lock:
-        _active_subprocs.discard(proc)
+        _active_subprocs.pop(proc, None)
+
+
+def kill_session_subprocs(session):
+    """Called from session.signal_cancel: SIGKILL every Popen
+    registered to this session so a cancel issued mid-cubeprog or
+    mid-ssh:exec aborts the child immediately, rather than waiting
+    on each op's 200ms-poll loop to notice session.canceled.
+
+    Idempotent (proc.kill on a dead pid is safe). Doesn't unregister
+    -- the op's own finally / unregister_subprocess does that.
+    """
+    with _subprocs_lock:
+        owned = [p for p, s in _active_subprocs.items() if s is session]
+    for p in owned:
+        try:
+            if p.poll() is None:
+                p.kill()
+        except Exception:
+            pass
 
 
 POLL_INTERVAL_S = 2.5
@@ -821,6 +845,14 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
                       f"POST {name} refused 409; parked under "
                       f"{refused} (resubmit the digest, then move "
                       f"the file back into {PENDING} to retry).")
+            except FileNotFoundError:
+                # A concurrent _post_spooled call (most likely the
+                # main-loop drain racing the session's own _post_
+                # artefact) already handled the same spool first --
+                # either POSTed it 200 + unlinked, or parked it
+                # under refused/ before we got here. Either way the
+                # artefact is accounted for; nothing to do.
+                pass
             except OSError as move_err:
                 print(datetime.now(),
                       f"POST {name} refused 409 + park failed: "

@@ -11,10 +11,10 @@ import config
 from plugin import DevicePlugin, Op
 
 
-def _track_subproc(proc):
+def _track_subproc(proc, session=None):
     try:
         from poller import register_subprocess
-        register_subprocess(proc)
+        register_subprocess(proc, session=session)
     except Exception:
         pass
 
@@ -57,7 +57,7 @@ def _op_exec(session, h, args):
     session.log_event("SSH", "ssh:exec", cmd)
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
-    _track_subproc(proc)
+    _track_subproc(proc, session=session)
     deadline = time.monotonic() + SSH_TIMEOUT_S
     stdout = stderr = b""
     try:
@@ -131,7 +131,7 @@ def _op_trust_host_key(session, h, args):
     proc = subprocess.Popen(
         ["ssh-keygen", "-R", h.ip, "-f", h.known_hosts],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    _track_subproc(proc)
+    _track_subproc(proc, session=session)
     try:
         while True:
             try:
