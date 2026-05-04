@@ -60,9 +60,11 @@ SAFE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 # the cap is the right knob to bump rather than letting the poller
 # OOM the server with a runaway body.
 MAX_ARTEFACT_BYTES = 256 * 1024 * 1024
-# Plan tarballs are small -- plan.txt + a few KB of blobs. Anything
-# larger is almost certainly a mistake or abuse.
-MAX_PLAN_BYTES = 16 * 1024 * 1024
+# Cap on /submit body size (the whole packed tar -- plan.txt plus
+# every blob it ships). 64 MiB comfortably covers FPGA bitstream +
+# DSP loader + STM32 firmware + sdcard image families; anything
+# larger should chunk via dfu:flash_layout pulling separate blobs.
+MAX_PLAN_BYTES = 64 * 1024 * 1024
 # Status snapshots are small JSON.
 MAX_STATUS_BYTES = 4 * 1024 * 1024
 
