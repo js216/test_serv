@@ -74,6 +74,10 @@ class ScopeHandle:
         pyvisa = _lazy_pyvisa()
         self._rm = pyvisa.ResourceManager()
         self._inst = self._rm.open_resource(self.resource)
+        # Cap each pyvisa call at 1 s. SCPI round-trips are well under
+        # that on a healthy bench; the explicit cap means a cancel
+        # signal lands at most one VISA call later (~1 s worst case).
+        self._inst.timeout = 1000
 
     def close(self):
         try:

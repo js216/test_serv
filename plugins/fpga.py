@@ -40,7 +40,12 @@ SECTOR = 64 * 1024
 
 
 def _mpsse_init(dev):
-    dev.setTimeouts(3000, 3000)
+    # Read timeout 500 ms instead of 3 s -- MPSSE setup replies are
+    # immediate (<1 ms) when the chip is healthy; if it doesn't
+    # respond within 500 ms the wiring is wrong anyway. Caps the
+    # blocking time of the dev.read(2) sync probe so a cancel
+    # request observes within 500 ms.
+    dev.setTimeouts(500, 3000)
     dev.setLatencyTimer(1)
     dev.resetDevice()
     dev.purge(3)

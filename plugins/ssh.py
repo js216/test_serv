@@ -12,6 +12,12 @@ from plugin import DevicePlugin, Op
 
 
 SSH_TIMEOUT_S = 60
+# `open()`'s identity probe runs `ssh ... uname -a` synchronously --
+# session.canceled is unreachable from there. Cap that probe at a
+# short wall-clock so cancel observed at the next op's open is within
+# this window. uname is sub-second on a reachable target; ssh's own
+# ConnectTimeout=5 in _ssh_argv handles unreachable.
+IDENTITY_TIMEOUT_S = 8
 
 
 def _ssh_argv(ip, user, key, known_hosts):
@@ -256,10 +262,11 @@ class SshPlugin(DevicePlugin):
                     + ["uname -a"])
             try:
                 res = subprocess.run(argv, capture_output=True,
-                                     timeout=SSH_TIMEOUT_S, check=False)
+                                     timeout=IDENTITY_TIMEOUT_S, check=False)
             except subprocess.TimeoutExpired:
                 raise RuntimeError(
-                    f"ssh identity check timed out against {h.ip}")
+                    f"ssh identity check timed out against {h.ip} "
+                    f"(>{IDENTITY_TIMEOUT_S}s)")
             uname = (res.stdout or b"").decode(errors="replace")
             if expected not in uname:
                 raise RuntimeError(

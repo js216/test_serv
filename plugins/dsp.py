@@ -127,14 +127,20 @@ class _Expander:
         finally:
             dev.close()
 
-    def pulse_reset(self):
+    def pulse_reset(self, session=None):
         """DS8 is repurposed as eval-board reset; toggle it briefly."""
         ft = _lazy_ft4222()
         dev = ft.openByDescription(self.desc)
         dev.i2cMaster_Init(100)
         try:
             self._wr(dev, [(0x30, 0x18, 0b0001_1011)])
-            time.sleep(0.25)
+            if session is not None:
+                session.cancel_event.wait(0.25)
+                if session.canceled:
+                    raise RuntimeError(
+                        "dsp:reset canceled mid-pulse")
+            else:
+                time.sleep(0.25)
             self._wr(dev, [(0x30, 0x18, 0b1001_1111)])
         finally:
             dev.close()
@@ -192,7 +198,9 @@ def _open_master(desc, clk_div=8, mode=1, flags=0):
 # ---- op implementations ----
 
 def _op_reset(session, h, args):
-    _Expander(h.ft4222_desc).pulse_reset()
+    _bail_if_canceled(session, "dsp:reset before pulse")
+    _Expander(h.ft4222_desc).pulse_reset(session=session)
+    _bail_if_canceled(session, "dsp:reset before init")
     _Expander(h.ft4222_desc).init_and_reset()
 
 
