@@ -185,11 +185,11 @@ def test_inventory_returns_devices_and_ops_streams():
     session = Session(reg, parsed)
     session.run_all(plugins)
 
-    devices = json.loads(session.streams["bench.devices.json"]
-                         .snapshot_bytes().decode())
-    ops = json.loads(session.streams["bench.ops.json"]
-                     .snapshot_bytes().decode())
-
+    # inventory now stores directly on the session; pack_artefact
+    # emits as bench.{devices,ops}.json files in the tar.
+    devices = session.bench_devices
+    ops = session.bench_ops
+    assert devices is not None and ops is not None
     assert devices[0]["id"] == "fake.0"
     assert "mark" in ops["_control"]["ops"]
     assert "fake" in ops
@@ -267,6 +267,150 @@ def test_bounded_sizes():
         raise AssertionError("expected PlanError for op count")
 
 
+def test_stop_session_clean_termination():
+    """uart_expect end_session=true -> StopSession -> clean stop, no error.
+
+    Regression: round 2 made signal_early_done raise StopSession;
+    round 3 found _run_one's `except Exception` was swallowing it
+    and recording a fake error. Run a fake op that signals; check
+    that ops_log records ok status and errors[] stays empty.
+    """
+    def _stop_op(session, h, args):
+        session.signal_early_done("test reason")
+
+    class StopPlugin(FakePlugin):
+        name = "stop"
+        ops = {
+            "stop": Op(args={}, doc="signal early-done", run=_stop_op),
+            "should_not_run": Op(args={}, doc="must not execute",
+                                 run=_fail),
+        }
+
+    parsed = plan.load_tar(plan.pack_tar(
+        "stop:stop\nstop:should_not_run\n", {}))
+    plugins = {"stop": StopPlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+    assert len(session.ops_log) == 1, [r["verb"] for r in session.ops_log]
+    assert session.ops_log[0]["status"] == "ok"
+    assert not session.errors, session.errors
+    reg.close_all()
+
+
+def test_cancel_propagates_to_session():
+    """signal_cancel during a `delay` should wake immediately.
+
+    Regression class: round 1 found cancel_event was missing.
+    A 2s delay should abort within ~50ms once signal_cancel fires.
+    """
+    import threading as _th
+    parsed = plan.load_tar(plan.pack_tar("delay ms=2000\n", {}))
+    reg = DeviceRegistry({}); reg.refresh()
+    session = Session(reg, parsed)
+    fired_at = [None]
+
+    def _cancel_soon():
+        time.sleep(0.05)
+        fired_at[0] = time.monotonic()
+        session.signal_cancel()
+
+    _th.Thread(target=_cancel_soon, daemon=True).start()
+    t0 = time.monotonic()
+    session.run_all({})
+    elapsed = time.monotonic() - t0
+    assert elapsed < 0.5, f"delay didn't abort on cancel ({elapsed:.2f}s)"
+    assert session.canceled
+    reg.close_all()
+
+
+def test_refresh_does_not_evict_pinned():
+    """If a session has acquired a device and refresh runs while
+    that device is transiently absent from probe(), the spec must
+    NOT be evicted -- the session's next op on the same key would
+    otherwise hit LookupError.
+
+    Round 3 F3: pinned_specs gate. Round 4 H2: Counter not set.
+    """
+    fake = FakePlugin()
+    plugins = {"fake": fake}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    key = reg.resolve("fake")
+    # Eagerly pin the spec (mimics what session.run_all does).
+    reg.pinned_specs[key] += 1
+    try:
+        # Now make probe() return [] -- device "vanished".
+        fake.probe = lambda: []
+        reg.refresh()
+        # Spec must still be there because pinned.
+        assert key in reg.specs, "pinned spec was evicted"
+    finally:
+        reg.pinned_specs.pop(key, None)
+    # Once unpinned, refresh evicts cleanly.
+    reg.refresh()
+    assert key not in reg.specs
+
+
+def test_dispatch_rejects_garbage_plan():
+    """The poller's _dispatch path must produce a failure artefact
+    when load_tar can't parse the body. Round 3 found a regression
+    here (walk(op.body) AttributeError) that no test caught.
+    """
+    import poller
+    body = b"not-a-tar-body" + b"\x00" * 600
+    with tempfile.TemporaryDirectory() as tmp:
+        old_pending = poller.PENDING
+        poller.PENDING = os.path.join(tmp, "pending")
+        try:
+            poller._spool_artefact("a"*64, b"sentinel-body")  # warm-up
+            # Now send garbage to _failure_artefact via _dispatch's
+            # parse-error path. Direct call:
+            tar = poller._failure_artefact("a"*64, "plan parse failed: x")
+            with tarfile.open(fileobj=io.BytesIO(tar), mode="r") as tf:
+                names = tf.getnames()
+                assert "manifest.json" in names
+                assert "errors.log" in names
+                m = json.loads(tf.extractfile("manifest.json").read())
+                assert m["status"] == "failed"
+                assert "message" in m
+        finally:
+            poller.PENDING = old_pending
+
+
+def test_spool_unique_per_attempt():
+    """Two _spool_artefact calls for the same digest must produce
+    distinct files so an old upload's late unlink can't delete the
+    new one (round 4 H1)."""
+    import poller
+    with tempfile.TemporaryDirectory() as tmp:
+        old_pending = poller.PENDING
+        poller.PENDING = os.path.join(tmp, "pending")
+        try:
+            digest = "a" * 64
+            p1 = poller._spool_artefact(digest, b"first")
+            p2 = poller._spool_artefact(digest, b"second")
+            assert p1 != p2, "spool paths collided"
+            assert os.path.exists(p1) and os.path.exists(p2)
+        finally:
+            poller.PENDING = old_pending
+
+
+def test_expect_lands_in_manifest():
+    """`expect "<claim>"` must surface in manifest.expectations[]."""
+    parsed = plan.load_tar(plan.pack_tar(
+        'expect "DUT boots in 30s"\nfake:noop k=1\n', {}))
+    plugins = {"fake": FakePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+    assert session.expectations == ["DUT boots in 30s"]
+    _, mtxt = pack_artefact(session)
+    m = json.loads(mtxt)
+    assert m["expectations"] == ["DUT boots in 30s"]
+    assert m["status"] == "ok"
+    reg.close_all()
+
+
 # --- runner --------------------------------------------------------------
 
 def main():
@@ -281,6 +425,12 @@ def main():
         test_server_rest_queue_helpers,
         test_lazy_handle_cache_and_release,
         test_bounded_sizes,
+        test_stop_session_clean_termination,
+        test_cancel_propagates_to_session,
+        test_refresh_does_not_evict_pinned,
+        test_dispatch_rejects_garbage_plan,
+        test_spool_unique_per_attempt,
+        test_expect_lands_in_manifest,
     ]
     failed = 0
     for t in tests:

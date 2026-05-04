@@ -152,8 +152,9 @@ One op per line. Blank lines and `# comments` ignored.
 
 ```
 device:op k=v k=v ...          # device op, args typed per plugin
+device:open / device:close     # pin the handle across ops
 ctrl-verb    k=v ...           # control: mark, delay, inventory,
-                               # description, open, close
+                               # description, expect
 ```
 
 Values are parsed as:
@@ -172,9 +173,13 @@ Control verbs:
 - `delay ms=N`
 - `mark tag=NAME` -- named checkpoint in the timeline
 - `description "<short summary>"` -- label for the dashboard + meta
+- `expect "<plain-text claim>"` -- record what the plan asserts,
+  surfaced in `manifest.expectations[]`. Doesn't run anything; lets a
+  future reader see the test's intent (`expect "DUT boots to login
+  within 60s"`) instead of reverse-engineering it from sentinel matches.
 - `inventory` -- return the bench poller's device list and supported
-  ops as `bench.devices.json` and `bench.ops.json` streams in the
-  artefact. Always refreshes the device probe; for a full identity
+  ops as `bench.devices.json` and `bench.ops.json` files in the
+  artefact tar. Always refreshes the device probe; for a full identity
   sweep, `POST /sweep` first.
 - `open` / `close` on any device -- pin the handle across multiple
   ops in the same session (avoids paying the open cost per op for
@@ -190,15 +195,22 @@ One tarball at `<digest>.tar`. Clients poll completion with
 `GET` the tar.
 
 ```
-manifest.json         status, streams list, runtime, n_ops, n_errors
-timeline.log          merged human-sortable timeline of events + streams
+manifest.json         status, t0_wall_iso, runtime, streams,
+                      n_ops, n_errors, required_devices, expectations,
+                      bench_id (from $TEST_SERV_BENCH_ID)
+timeline.log          merged human-sortable timeline (each row prefixed
+                      by ISO wall-clock time + monotonic offset)
 ops.jsonl             one JSON record per op: verb, start, end, status
 errors.log            tracebacks, only when something failed
+plan.txt              echo of the plan body the poller actually ran
+bench.devices.json    poller's device map (only when `inventory` ran)
+bench.ops.json        per-plugin op signatures (only when `inventory` ran)
 streams/NAME.bin      raw bytes per stream (uart, scope csv, prbs mismatches...)
 ```
 
 Read `manifest.json` first, then `timeline.log`. Pull `streams/*.bin`
-only when raw bytes are needed.
+only when raw bytes are needed. `manifest.status` is one of `ok`,
+`errors`, `failed`, `canceled`.
 
 ### device config
 

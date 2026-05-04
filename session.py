@@ -21,6 +21,34 @@ DEFAULT_SESSION_S = 600.0
 MAX_SESSION_S = 3600.0
 
 
+def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
+                  streams, n_ops, n_errors, required_devices,
+                  expectations=None, message=None):
+    """Single source of truth for the artefact ``manifest.json``
+    shape. Both the session's success path and the poller's failure-
+    artefact path emit through here so the two never drift on field
+    names or types. ``status`` is the discriminator: "ok" / "errors"
+    / "failed" / "canceled".
+    """
+    iso = datetime.fromtimestamp(t0_wall).isoformat(timespec="milliseconds")
+    out = {
+        "status": status,
+        "t0_monotonic": t0_monotonic,
+        "t0_wall_iso": iso,
+        "t0_wall_unix": t0_wall,
+        "runtime_s": runtime_s,
+        "streams": sorted(streams),
+        "n_ops": n_ops,
+        "n_errors": n_errors,
+        "required_devices": sorted(required_devices),
+        "expectations": list(expectations or []),
+        "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
+    }
+    if message is not None:
+        out["message"] = message
+    return out
+
+
 class StopSession(Exception):
     """Raised by a plan op (currently uart_expect with end_session=true)
     to terminate the rest of the plan cleanly. _run_block catches it
@@ -29,12 +57,26 @@ class StopSession(Exception):
     """
 
 
+# Per-stream cap: a runaway UART (kernel-panic loop, baud-rate flood)
+# could otherwise grow Stream.records without bound and OOM the bench
+# host before the session deadline expires. 64 MiB is well above any
+# legitimate per-stream payload (scope.csv at 5000 points, full DSP
+# UART bursts, big PRBS mismatch logs) and keeps a multi-stream
+# session under the 256 MiB artefact upload cap.
+STREAM_MAX_BYTES = 64 * 1024 * 1024
+
+
 class Stream:
     """A time-stamped byte stream.
 
     Background-filler threads append ``(t_ns, bytes)`` records via
     ``append()``; ``snapshot()`` copies out the current contents
     without stopping collection. ``close()`` seals further appends.
+
+    Capped at STREAM_MAX_BYTES total per stream; once the cap is
+    hit, oldest records are dropped to make room for new ones, with
+    a one-shot ``[STREAM TRUNCATED, dropped Nb]`` marker injected so
+    a reader knows what happened.
     """
     def __init__(self, name, t0):
         self.name = name
@@ -42,27 +84,33 @@ class Stream:
         self.records = []
         self.lock = threading.Lock()
         self.closed = False
+        # Running byte total to avoid an O(n) sum on every append.
+        self._size = 0
+        self._dropped = 0
+        self._truncation_warned = False
 
     def append(self, data):
         if not data:
             return
         t = time.monotonic() - self.t0
         with self.lock:
-            if not self.closed:
-                self.records.append((t, bytes(data)))
-
-    def replace(self, data):
-        """Drop all prior records and replace with a single payload.
-        Used by control verbs (inventory) that produce one self-
-        contained JSON document per call -- two calls in one plan
-        would otherwise concatenate two JSON blobs into an
-        unparseable stream.
-        """
-        t = time.monotonic() - self.t0
-        with self.lock:
             if self.closed:
                 return
-            self.records = [(t, bytes(data))]
+            self.records.append((t, bytes(data)))
+            self._size += len(data)
+            while self._size > STREAM_MAX_BYTES and len(self.records) > 1:
+                _, dropped = self.records.pop(0)
+                self._size -= len(dropped)
+                self._dropped += len(dropped)
+            if self._dropped and not self._truncation_warned:
+                marker = (
+                    f"[STREAM TRUNCATED: dropped oldest bytes; cap="
+                    f"{STREAM_MAX_BYTES}B]\n").encode()
+                # Insert at position 0 so render_timeline sees the
+                # marker before the surviving payload.
+                self.records.insert(0, (0.0, marker))
+                self._size += len(marker)
+                self._truncation_warned = True
 
     def close(self):
         with self.lock:
@@ -100,6 +148,18 @@ class Session:
         self.pinned = {}       # device_key -> context manager (for open/close)
         self.touched_keys = set()
         self.errors = []
+        # Plan-level claims recorded by the `expect "<text>"` control
+        # verb. Surface as manifest.expectations[] so a future operator
+        # reading an artefact can see what the plan was *asserting*,
+        # not just what bytes happened to flow.
+        self.expectations = []
+        # Inventory snapshots: when an `inventory` op runs it sets
+        # these dicts; pack_artefact emits them as bench.devices.json
+        # and bench.ops.json files in the tar. Old code wrote them
+        # into Stream objects, which forced Stream.replace() to exist
+        # for one caller; that's gone now.
+        self.bench_devices = None
+        self.bench_ops = None
         self.lock = threading.Lock()
         self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
         # Set by signal_cancel(). _run_block tests it at op boundaries;
@@ -200,7 +260,8 @@ class Session:
             # from probe (USB blip, mode change). Deferred keys are
             # added in _resolve_device when they show up.
             self._pinned_specs = set(eager_keys)
-            self.registry.pinned_specs.update(self._pinned_specs)
+            for k in self._pinned_specs:
+                self.registry.pinned_specs[k] += 1
         self._deferred_locks = []     # filled by _run_device_op
 
         self.log_event(
@@ -258,8 +319,15 @@ class Session:
             # any device that vanished. Done after release_now so the
             # eviction path doesn't race with our close.
             with self.registry.lock:
-                self.registry.pinned_specs.difference_update(
-                    getattr(self, "_pinned_specs", set()))
+                for k in getattr(self, "_pinned_specs", set()):
+                    n = self.registry.pinned_specs.get(k, 0) - 1
+                    if n > 0:
+                        self.registry.pinned_specs[k] = n
+                    else:
+                        # Drop the key entirely so refresh's
+                        # `key not in pinned_specs` check is true,
+                        # not just zero-but-present.
+                        self.registry.pinned_specs.pop(k, None)
             for s in self.streams.values():
                 s.close()
             # Release deferred locks (acquired mid-session) first, then
@@ -366,7 +434,7 @@ class Session:
                 # eager keys, so refresh can't evict it on a transient
                 # disappearance.
                 self._pinned_specs.add(key)
-                self.registry.pinned_specs.add(key)
+                self.registry.pinned_specs[key] += 1
             lk.acquire()
             self._deferred_locks.append(lk)
             self._deferred_names.discard(plugin_name)
@@ -451,6 +519,15 @@ class Session:
             self.log_event(
                 "DESC", "ctrl",
                 text.raw if (text and hasattr(text, "raw")) else "")
+        elif v == "expect":
+            # Records a human-readable claim about what this plan
+            # asserts. Surfaces in manifest.expectations[] so future
+            # readers see the test's intent, not just the byte flow.
+            text = op.args.get("text")
+            claim = text.raw if (text and hasattr(text, "raw")) else ""
+            if claim:
+                self.expectations.append(claim)
+            self.log_event("EXPECT", "ctrl", claim)
         else:
             raise PlanError(f"unknown control verb {v!r}")
 
@@ -526,6 +603,18 @@ class Session:
                             "identity-verified sweep, POST /sweep instead."
                         ),
                     },
+                    "expect": {
+                        "args": {},
+                        "optional_args": {"text": "str"},
+                        "doc": (
+                            "Record a plan-time assertion in the "
+                            "artefact's manifest.expectations[] so a "
+                            "future reader sees what the plan was "
+                            "asserting (\"the DUT boots to login within "
+                            "60s\"), not just the bytes that flowed. "
+                            "Canonical form: positional, free-form."
+                        ),
+                    },
                     "mark": {
                         "args": {},
                         "optional_args": {"tag": "ident"},
@@ -551,13 +640,14 @@ class Session:
                 },
             }
 
-        # replace() instead of append(): a plan calling `inventory`
-        # twice should leave one JSON document per stream, not two
-        # concatenated blobs that the artefact-reader can't parse.
-        self.stream("bench.devices.json").replace(
-            (json.dumps(devices, indent=2, sort_keys=True) + "\n").encode())
-        self.stream("bench.ops.json").replace(
-            (json.dumps(ops_map, indent=2, sort_keys=True) + "\n").encode())
+        # Stash on the session; pack_artefact emits as bench.devices.json
+        # and bench.ops.json files in the artefact tar. (Old code wrote
+        # them into Stream objects and required a Stream.replace path
+        # for one caller; that special case is gone now.) A second
+        # `inventory` op overwrites these with the latest snapshot,
+        # which is the intended semantics.
+        self.bench_devices = devices
+        self.bench_ops = ops_map
         self.log_event(
             "INVENTORY", "ctrl",
             f"devices={len(devices)} plugins={len(ops_map)}")
@@ -582,9 +672,12 @@ def render_timeline(session, bytes_budget_per_stream=8192):
             take = min(len(data), bytes_budget_per_stream - inlined)
             chunk = data[:take]
             inlined += take
-            printable = chunk.decode("utf-8", errors="replace").replace(
-                "\n", "\\n").replace("\r", "\\r")
-            all_rows.append((t, f"STREAM   {name:<20} {printable!r}"))
+            # Single repr() round so a literal backslash and a real
+            # newline render distinguishably -- the manual
+            # replace("\n","\\n") then repr() collapsed both 0x5C 0x6E
+            # and 0x0A to the same characters in the timeline.
+            printable = repr(chunk.decode("utf-8", errors="replace"))
+            all_rows.append((t, f"STREAM   {name:<20} {printable}"))
 
     all_rows.sort(key=lambda r: r[0])
     # Render every row twice: a session-relative seconds offset (cheap
@@ -604,22 +697,25 @@ def pack_artefact(session):
     """Build the .tar artefact. Returns (tar_bytes, manifest_text)."""
     buf = io.BytesIO()
     from plan import required_devices as _req_devs
-    bench_id = os.environ.get("TEST_SERV_BENCH_ID")
-    t0_wall_iso = datetime.fromtimestamp(session.t0_wall).isoformat(
-        timespec="milliseconds")
     n_errors = len(session.errors)
-    manifest = {
-        "status": "ok" if n_errors == 0 else "errors",
-        "t0_monotonic": session.t0,
-        "t0_wall_iso": t0_wall_iso,
-        "t0_wall_unix": session.t0_wall,
-        "runtime_s": time.monotonic() - session.t0,
-        "streams": sorted(session.streams.keys()),
-        "n_ops": len(session.ops_log),
-        "n_errors": n_errors,
-        "required_devices": sorted(_req_devs(session.plan)),
-        "bench_id": bench_id,
-    }
+    # Inventory data + streams both contribute to the streams[] field
+    # so a reader knows what files exist in the tar without listing it.
+    streams = list(session.streams.keys())
+    if session.bench_devices is not None:
+        streams.append("bench.devices.json")
+    if session.bench_ops is not None:
+        streams.append("bench.ops.json")
+    manifest = make_manifest(
+        status="ok" if n_errors == 0 else "errors",
+        t0_monotonic=session.t0,
+        t0_wall=session.t0_wall,
+        runtime_s=time.monotonic() - session.t0,
+        streams=streams,
+        n_ops=len(session.ops_log),
+        n_errors=n_errors,
+        required_devices=_req_devs(session.plan),
+        expectations=session.expectations,
+    )
     manifest_text = json.dumps(manifest, indent=2) + "\n"
 
     with tarfile.open(fileobj=buf, mode="w") as tf:
@@ -634,6 +730,14 @@ def pack_artefact(session):
         if session.errors:
             _add(tf, "errors.log",
                  ("\n\n".join(session.errors) + "\n").encode())
+        if session.bench_devices is not None:
+            _add(tf, "bench.devices.json", (json.dumps(
+                session.bench_devices, indent=2, sort_keys=True)
+                + "\n").encode())
+        if session.bench_ops is not None:
+            _add(tf, "bench.ops.json", (json.dumps(
+                session.bench_ops, indent=2, sort_keys=True)
+                + "\n").encode())
         for name, stream in session.streams.items():
             safe = name.replace("/", "_")
             _add(tf, f"streams/{safe}.bin", stream.snapshot_bytes())

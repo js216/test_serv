@@ -2,6 +2,7 @@
 # registry.py --- Device-handle cache with explicit release
 # Copyright (c) 2026 Jakob Kastelic
 
+import collections
 import threading
 import time
 import traceback
@@ -30,13 +31,15 @@ class DeviceRegistry:
         self.cache = {}
         self.per_dev_lock = {} # "dsp.A" -> threading.RLock
         self.verify_results = {}  # "dsp.A" -> {t, ok, err, latency_ms}
-        # Set of keys currently claimed by an active session for the
-        # whole session lifetime. Refresh checks this in addition to
-        # cache refs before dropping a vanished spec, so a USB blip
-        # mid-session can't yank a device out from under the session
-        # while ops are still scheduled to run on it. Session adds
-        # eagerly at run_all entry, removes in run_all's finally.
-        self.pinned_specs = set()
+        # Counter of keys currently claimed by active sessions for
+        # the whole session lifetime. Refresh checks counter[key] > 0
+        # in addition to cache refs before dropping a vanished spec,
+        # so a USB blip mid-session can't yank a device out from
+        # under the session while ops are still scheduled to run on
+        # it. Counter (not set) so two concurrent sessions on the
+        # same key don't share one membership entry that the first
+        # one to finish can revoke for the still-running peer.
+        self.pinned_specs = collections.Counter()
 
     def stop(self):
         # Kept for API compatibility with the older TTL-reaper version;
@@ -45,6 +48,16 @@ class DeviceRegistry:
 
     def refresh(self):
         """Rescan every plugin's probe() and update specs."""
+        # Drop any cached config snapshot so all plugins probe()d in
+        # this single tick see one coherent view of config.json. A
+        # mid-tick non-atomic editor save would otherwise let plugin
+        # A see the old config and plugin B the new (or briefly the
+        # empty fallback while the file's being rewritten).
+        try:
+            import config as _config
+            _config.load_invalidate()
+        except Exception:
+            pass
         found = {}
         for pname, pl in self.plugins.items():
             try:
@@ -61,7 +74,8 @@ class DeviceRegistry:
         with self.lock:
             # drop specs for devices that have vanished *and* are not in use
             for key in list(self.specs):
-                if key not in found and key not in self.pinned_specs:
+                if (key not in found
+                        and self.pinned_specs.get(key, 0) <= 0):
                     entry = self.cache.get(key)
                     if entry is None or entry[1] == 0:
                         self.specs.pop(key, None)
@@ -78,6 +92,11 @@ class DeviceRegistry:
         mode after a bench_mcu:reset_dut) become visible to later ops
         without waiting for the background 15 s refresh tick.
         """
+        try:
+            import config as _config
+            _config.load_invalidate()
+        except Exception:
+            pass
         pl = self.plugins.get(name)
         if pl is None:
             return
@@ -100,7 +119,8 @@ class DeviceRegistry:
                 plugin_name, _ = self.specs[key]
                 if plugin_name != name:
                     continue
-                if key not in found and key not in self.pinned_specs:
+                if (key not in found
+                        and self.pinned_specs.get(key, 0) <= 0):
                     entry = self.cache.get(key)
                     if entry is None or entry[1] == 0:
                         self.specs.pop(key, None)

@@ -6,6 +6,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import signal
 import sys
 import tempfile
@@ -15,6 +16,7 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime
 
 import paths
@@ -232,21 +234,33 @@ def _meta_float(headers, key, default, hard_max):
 _write_atomic = paths.write_atomic
 
 
+_PUSH_CIRCUIT_OPEN_S = 30.0
+_push_circuit_until = 0.0  # monotonic; pushes skipped while > now
+
+
 def _push_status(name, body):
     """Push a status snapshot to the server. Best-effort -- the bench
     keeps running if the server is unreachable; the local copy under
     STATE_DIR/status/ is still authoritative for tail/inspection.
-    Short timeout: status pushes are tiny and a wedged tunnel
-    shouldn't block the refresh loop.
+    Circuit-breaker: a push that hits a connection error / timeout
+    opens the circuit for _PUSH_CIRCUIT_OPEN_S so subsequent pushes
+    short-circuit instead of each waiting the full 10s for the same
+    failure. Without this a wedged SSH tunnel slowed the main poll
+    loop from 2.5s/tick to 12.5s+, delaying cancel responsiveness.
     """
+    global _push_circuit_until
+    if time.monotonic() < _push_circuit_until:
+        return
     base = f"http://localhost:{HTTP_PORT}"
     try:
         _post(f"{base}/status/{name}", body, timeout=10.0)
     except Exception:
         # Don't traceback-spam the log on every refresh tick if the
         # server is offline; one line is enough.
+        _push_circuit_until = time.monotonic() + _PUSH_CIRCUIT_OPEN_S
         print(datetime.now(),
-              f"status/{name} push failed (server unreachable?)")
+              f"status/{name} push failed (server unreachable?); "
+              f"backing off {_PUSH_CIRCUIT_OPEN_S:.0f}s")
 
 
 def _snapshot_inflight():
@@ -541,27 +555,25 @@ def _validate_against_plugins(parsed, plugins_by_name, registry):
 def _failure_artefact(job_id, message):
     import io
     import tarfile
+    from session import make_manifest
     buf = io.BytesIO()
-    now_wall = time.time()
-    iso = datetime.fromtimestamp(now_wall).isoformat(timespec="milliseconds")
-    # Mirror the success-path manifest shape so a script reading
-    # /outputs/<digest>.tar's manifest.json sees the same keys
-    # whether the run succeeded, errored, or never started. status
-    # is the discriminator.
-    manifest = {
-        "status": "failed",
-        "message": message,
-        "job_id": job_id,
-        "t0_monotonic": time.monotonic(),
-        "t0_wall_iso": iso,
-        "t0_wall_unix": now_wall,
-        "runtime_s": 0.0,
-        "streams": [],
-        "n_ops": 0,
-        "n_errors": 1,
-        "required_devices": [],
-        "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
-    }
+    # Same shape as session.pack_artefact's manifest (one schema, one
+    # builder) so anything reading manifest.json sees consistent keys
+    # whether the run succeeded, errored, or never started. status is
+    # the discriminator.
+    manifest = make_manifest(
+        status="failed",
+        t0_monotonic=time.monotonic(),
+        t0_wall=time.time(),
+        runtime_s=0.0,
+        streams=[],
+        n_ops=0,
+        n_errors=1,
+        required_devices=[],
+        expectations=[],
+        message=message,
+    )
+    manifest["job_id"] = job_id
     manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
     with tarfile.open(fileobj=buf, mode="w") as tf:
         ti = tarfile.TarInfo("manifest.json")
@@ -574,27 +586,43 @@ def _failure_artefact(job_id, message):
     return buf.getvalue()
 
 
-def _spool_artefact(job_id, tar_bytes):
-    """Write the artefact to PENDING/<digest>.tar atomically.
+_SPOOL_NAME_RE = re.compile(r"^([0-9a-f]{64})\.[0-9a-f]+\.tar$")
 
-    Returns the spool path. The next main-loop tick (or the immediate
-    upload attempt) reads from this path; on success the file is
-    unlinked. On failure the file stays so a later tick can retry.
+
+def _spool_artefact(job_id, tar_bytes):
+    """Write the artefact atomically to ``PENDING/<digest>.<run>.tar``.
+
+    The trailing run-id is uuid-derived so each spool attempt has a
+    unique filename. Without it, a re-submit of the same digest while
+    an old upload was retrying would create two callers racing on
+    the same path: ``_spool_artefact`` would ``os.replace`` the file
+    inode out from under the old caller's already-open fd, and the
+    OLD caller's later ``os.unlink`` would silently delete the NEW
+    caller's tar. Net result: the agent fetches the previous run's
+    bytes labelled as the new digest. The unique-name scheme makes
+    each spool file owned by exactly one in-flight upload; the digest
+    survives in the prefix so _drain_pending_uploads can post each
+    one to ``/<digest>.tar``.
     """
     os.makedirs(PENDING, mode=0o700, exist_ok=True)
-    path = os.path.join(PENDING, f"{job_id}.tar")
+    run = uuid.uuid4().hex[:12]
+    path = os.path.join(PENDING, f"{job_id}.{run}.tar")
     paths.write_atomic(path, tar_bytes)
     return path
 
 
 def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
-    """Try POSTing one spooled artefact. On 2xx, unlink it. On 4xx
-    (permanent refusal -- e.g. server returns 409 because the agent
-    already cleaned up that digest) also unlink: a retry would just
-    fail the same way. On 5xx / connection errors leave the file
+    """Try POSTing one spooled artefact. On 2xx or 4xx (permanent
+    refusal), unlink it. On 5xx / connection errors leave the file
     and log; the next main-loop tick will retry.
     """
     name = os.path.basename(spool_path)
+    m = _SPOOL_NAME_RE.match(name)
+    if not m:
+        # Stray file, not one of ours. Leave it; a later operator
+        # cleanup is safer than blindly deleting.
+        return False
+    digest = m.group(1)
     base = f"http://localhost:{HTTP_PORT}"
     try:
         with open(spool_path, "rb") as f:
@@ -602,7 +630,7 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
     except FileNotFoundError:
         return False
     try:
-        _post(f"{base}/{name}", body, timeout=timeout_s)
+        _post(f"{base}/{digest}.tar", body, timeout=timeout_s)
     except urllib.error.HTTPError as e:
         if 400 <= e.code < 500:
             print(datetime.now(),
@@ -755,13 +783,49 @@ def main():
                 continue
 
             t = threading.Thread(target=_worker, args=(body, headers),
-                                 daemon=True)
+                                 daemon=True, name=f"job-{job_id_short(body)}")
             t.start()
     except KeyboardInterrupt:
-        pass
+        # Operator pressed Ctrl-C. Try to give in-flight workers a
+        # graceful shot at finishing -- so cubeprog flashes etc.
+        # don't get orphaned at PID 1 mid-write -- before the
+        # daemon-thread reaper bites at interpreter exit.
+        print(datetime.now(),
+              "SIGINT: cancelling active sessions, waiting up to 30s")
+        with _active_lock:
+            for sess in list(_active_sessions.values()):
+                try:
+                    sess.signal_cancel()
+                except Exception:
+                    pass
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            with _active_lock:
+                if not _active_sessions:
+                    break
+            time.sleep(0.1)
+        with _active_lock:
+            still = list(_active_sessions)
+        if still:
+            print(datetime.now(),
+                  f"SIGINT: {len(still)} session(s) still running; "
+                  f"forcing exit (subprocesses may be orphaned)")
+        # Try to drain any pending uploads one last time so a cancel
+        # artefact lands on the server before we go.
+        try:
+            _drain_pending_uploads(timeout_s=5.0)
+        except Exception:
+            pass
     finally:
         registry.stop()
         registry.close_all()
+
+
+def job_id_short(body):
+    try:
+        return hashlib.sha256(body).hexdigest()[:8]
+    except Exception:
+        return "????????"
 
 
 if __name__ == "__main__":

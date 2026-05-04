@@ -19,8 +19,15 @@ MAX_BLOBS = 64
 MAX_OPS = 4096
 
 CONTROL_VERBS = {
-    "mark", "delay", "inventory", "description", "open", "close",
+    "mark", "delay", "inventory", "description", "expect",
 }
+# `open` and `close` are device-only verbs (always written as
+# `device:open` / `device:close`) -- they live in the device-op
+# branch of plan parsing and session execution, never as bare
+# control verbs. Kept out of CONTROL_VERBS so a stray `open` line
+# without a `device:` prefix fails at parse time with the helpful
+# "expected device:op or control verb" error rather than silently
+# tokenising and crashing later.
 
 
 class PlanError(Exception):
@@ -120,11 +127,17 @@ def parse_text(text):
         # quoted string isn't treated as the start of a comment.
         # Plain `raw.split("#", 1)[0]` ate any '#' regardless of
         # quoting, which broke `description "see issue #123"` and
-        # any URL embedded in an arg.
+        # any URL embedded in an arg. lex.escape="" disables
+        # backslash-as-shell-escape: a literal `\` in an arg passes
+        # through to decode_escapes (the canonical escape path) so
+        # `data=\r` and Windows-style `data=C:\Users\foo` survive
+        # tokenization intact. Without this, posix-mode shlex eats
+        # the backslash silently.
         try:
             lex = shlex.shlex(raw, posix=True)
             lex.commenters = "#"
             lex.whitespace_split = True
+            lex.escape = ""
             toks = list(lex)
         except ValueError as e:
             raise PlanError(f"line {lineno}: tokenize: {e}")
@@ -140,15 +153,15 @@ def parse_text(text):
                 raise PlanError(f"line {lineno}: bad device:op {head!r}")
             ops.append(Op(lineno=lineno, device=device, verb=verb,
                           args=_parse_args(rest, lineno)))
-        elif head == "description":
-            # Single supported form: `description "<free text>"`.
-            # The previous parser also accepted `description text="..."`
-            # for k=v symmetry, but that branch was indistinguishable
-            # from `description "x=1"` after shlex tokenization and
-            # silently swallowed the user's text. Free-form positional
-            # is the only form now.
+        elif head in ("description", "expect"):
+            # Free-form positional verbs: the rest of the line is the
+            # human-readable claim. `description "<short summary>"` is
+            # the dashboard label; `expect "<assertion>"` records a
+            # plan-time claim in the artefact's manifest.expectations
+            # so a reader sees what the plan was *asserting*, not
+            # just the bytes that happened to flow.
             args = {"text": Value("str", " ".join(rest))}
-            ops.append(Op(lineno=lineno, device=None, verb="description",
+            ops.append(Op(lineno=lineno, device=None, verb=head,
                           args=args))
         elif head in CONTROL_VERBS:
             ops.append(Op(lineno=lineno, device=None, verb=head,

@@ -15,6 +15,25 @@ DEFAULT_PATHS = [
 ]
 
 
+# Cached config snapshot. Cleared at the top of each registry refresh
+# so plugin probes within one tick see a single coherent view of
+# config.json, without re-reading the file (which can fail mid-edit
+# if the operator's editor isn't atomic). load_invalidate() drops
+# the cache before the next read.
+_cached = None
+_cached_lock = __import__("threading").Lock()
+
+
+def load_invalidate():
+    """Drop any cached config snapshot. Called from the poller's
+    refresh tick + SIGHUP path so subsequent ``load()`` calls re-read
+    the file from disk.
+    """
+    global _cached
+    with _cached_lock:
+        _cached = None
+
+
 def load():
     """Return the merged config dict.
 
@@ -30,15 +49,24 @@ def load():
     file's directory; later entries shallow-merge over earlier ones,
     and the including file's keys win over included ones.
     """
+    global _cached
+    with _cached_lock:
+        if _cached is not None:
+            return _cached
     for p in DEFAULT_PATHS:
         if not p:
             continue
         try:
-            return _load_with_includes(p)
+            data = _load_with_includes(p)
         except FileNotFoundError:
             continue
         except Exception as e:
             raise RuntimeError(f"bad config {p!r}: {e}")
+        with _cached_lock:
+            _cached = data
+        return data
+    with _cached_lock:
+        _cached = {}
     return {}
 
 

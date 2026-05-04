@@ -222,6 +222,17 @@ def queue_job(body, meta=None):
             except FileNotFoundError:
                 pass
         _write_atomic(dst, body)
+        # If a stale CANCEL/<digest> marker survives from a prior
+        # poller crash (the artefact-upload path that normally
+        # unlinks it never ran), unlink it now. Otherwise the next
+        # poller pickup of this freshly-queued plan would have
+        # _drain_cancels find the old marker and signal_cancel the
+        # newborn session 2.5s in -- a phantom cancel with no
+        # DELETE issued.
+        try:
+            os.unlink(os.path.join(CANCEL, digest))
+        except FileNotFoundError:
+            pass
     return digest, "queued"
 
 
@@ -267,8 +278,62 @@ def delete_outputs(digest, ext=""):
     return removed
 
 
+# Per-request socket timeout. A handler that reads a body or writes a
+# response over a stalled connection holds a thread; without a cap one
+# misbehaving client can pin a thread until the OS TCP keepalive
+# notices, which can be minutes.
+REQUEST_TIMEOUT_S = 600.0
+
+
+class _BoundedThreadingServer(ThreadingHTTPServer):
+    """ThreadingHTTPServer with a bounded worker pool.
+
+    The stdlib version spawns one daemon thread per request, unbounded.
+    With a misbehaving agent uploading hundreds of MB to a slow disk,
+    each thread holds the body in RAM. Cap the spawn rate so the
+    server can't blow up under bad load.
+    """
+    daemon_threads = True
+    request_queue_size = 64
+    # The base class spawns a thread per request via process_request_-
+    # thread; we're keeping that shape but capping concurrency. A
+    # busier shape (futures.ThreadPoolExecutor) is overkill for a
+    # single-bench tool.
+    _max_workers = 16
+    _active_workers = 0
+    _worker_lock = threading.Lock()
+
+    def process_request(self, request, client_address):
+        # If we're at the cap, refuse the connection (close it
+        # cleanly) rather than letting the queue grow without bound.
+        with self._worker_lock:
+            if self._active_workers >= self._max_workers:
+                try:
+                    request.sendall(
+                        b"HTTP/1.1 503 Service Unavailable\r\n"
+                        b"Retry-After: 5\r\n"
+                        b"Content-Length: 0\r\n\r\n")
+                except Exception:
+                    pass
+                self.shutdown_request(request)
+                return
+            self._active_workers += 1
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            request.settimeout(REQUEST_TIMEOUT_S)
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._worker_lock:
+                self._active_workers -= 1
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "test_serv/2"
+    # Cap idle-keep-alive read; without this a half-closed connection
+    # can hang on rfile.readline() for the OS TCP keepalive interval.
+    timeout = REQUEST_TIMEOUT_S
 
     # Silence the default request log; keep errors only.
     def log_message(self, fmt, *args):
@@ -965,7 +1030,7 @@ def main():
     print(f"state dir: {STATE_DIR}")
     print(f"listening on 127.0.0.1:{args.port}")
     threading.Thread(target=_gc_loop, daemon=True).start()
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    _BoundedThreadingServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 
 if __name__ == "__main__":
