@@ -99,13 +99,17 @@ def _op_uart_expect(session, h, args):
     stream = session.stream("mp135.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
+        if session.canceled:
+            return
         if sentinel in stream.snapshot_bytes():
             session.log_event("EXPECT", "mp135:uart_expect",
                               f"HIT {sentinel!r}")
             if end_session:
                 session.signal_early_done(f"mp135.uart saw {sentinel!r}")
             return
-        time.sleep(0.01)
+        # cancel_event wakes us instantly on cancel; otherwise tick at
+        # 10 ms like the original poll loop.
+        session.cancel_event.wait(0.01)
     raise TimeoutError(
         f"mp135.uart did not contain {sentinel!r} within {timeout_ms} ms")
 

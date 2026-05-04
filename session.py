@@ -80,11 +80,15 @@ class Session:
         # gates session lock acquisition against the registry's lease registry
         # so other agents can't acquire devices we're holding across sessions.
         self.lease_token = None
-        # Set by signal_cancel(); checked by _run_block at op boundaries.
-        # A long-running subprocess op (e.g. dfu cubeprog flash) won't
-        # observe it until the op returns; v1 cancel is between-op only.
+        # Set by signal_cancel(). _run_block tests it at op boundaries;
+        # long-blocking ops (delay, *_expect polling loops) wait on
+        # cancel_event so they wake up immediately on cancel instead
+        # of running their full timeout. Subprocess-based ops
+        # (dfu cubeprog flash, large msc/fpga MPSSE I/O) still don't
+        # observe the signal until the op returns.
         self.canceled = False
         self.cancel_reason = ""
+        self.cancel_event = threading.Event()
 
     # --- timeline recording ---
 
@@ -108,12 +112,16 @@ class Session:
         self.log_event("CTRL", "session", f"early_done: {reason}")
 
     def signal_cancel(self, reason=""):
-        """Request the session abort at the next op boundary. Idempotent
-        and thread-safe. Called from poller's cancel-marker drain
-        when DELETE /jobs/<digest> arrives mid-flight.
+        """Request the session abort. Idempotent and thread-safe.
+        Called from the poller's cancel-marker drain when DELETE
+        /jobs/<digest> arrives mid-flight. Sets self.canceled (which
+        _run_block tests at op boundaries) and self.cancel_event
+        (which long-blocking ops should wait on instead of using
+        plain time.sleep, so they wake immediately on cancel).
         """
         self.canceled = True
         self.cancel_reason = reason
+        self.cancel_event.set()
         self.log_event("CTRL", "session", f"cancel requested: {reason}")
 
     def _prescan_lease_resume(self):
@@ -407,7 +415,12 @@ class Session:
             ms = op.args.get("ms")
             if ms is None:
                 raise PlanError("delay: missing ms=")
-            time.sleep(max(0.0, ms.as_int() / 1000.0))
+            # Wait on cancel_event instead of time.sleep so DELETE
+            # /jobs/<digest> on a sleeping session aborts immediately.
+            # Returns True if the event fires, False on timeout --
+            # we don't care which since _run_block re-tests
+            # self.canceled at the next iteration.
+            self.cancel_event.wait(max(0.0, ms.as_int() / 1000.0))
         elif v == "wall_time":
             self._run_wall_time()
         elif v == "inventory":

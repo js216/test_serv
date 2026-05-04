@@ -230,13 +230,15 @@ def _op_uart_expect(session, h, args):
     stream = session.stream("dsp.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
+        if session.canceled:
+            return
         if sentinel in stream.snapshot_bytes():
             session.log_event("EXPECT", "dsp:uart_expect",
                               f"HIT {sentinel!r}")
             if end_session:
                 session.signal_early_done(f"dsp.uart saw {sentinel!r}")
             return
-        time.sleep(0.01)
+        session.cancel_event.wait(0.01)
     raise TimeoutError(
         f"dsp.uart did not contain {sentinel!r} within {timeout_ms} ms")
 

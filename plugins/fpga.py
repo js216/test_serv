@@ -299,13 +299,15 @@ def _op_uart_expect(session, h, args):
     stream = session.stream("fpga.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
     while time.monotonic() < deadline:
+        if session.canceled:
+            return
         if sentinel in stream.snapshot_bytes():
             session.log_event("EXPECT", "fpga:uart_expect",
                               f"HIT {sentinel!r}")
             if end_session:
                 session.signal_early_done(f"fpga.uart saw {sentinel!r}")
             return
-        time.sleep(0.01)
+        session.cancel_event.wait(0.01)
     raise TimeoutError(
         f"fpga.uart did not contain {sentinel!r} within {timeout_ms} ms")
 
