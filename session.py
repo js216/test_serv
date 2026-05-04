@@ -269,6 +269,13 @@ class Session:
             # partial MSC write) can't be magicked away here -- but
             # bytes-in-serial-buffer, mid-transaction FT4222 handles,
             # etc. all get reset.
+            #
+            # `registry.acquire` here bumps the cache entry's refs for
+            # the duration of the cleanup call, so the reaper thread
+            # can't TTL-evict and close the handle out from under us.
+            # If the device has vanished from registry.specs (probe
+            # said it's gone), LookupError surfaces and we skip --
+            # nothing to clean up on a vanished device.
             if self.canceled:
                 for key in sorted(self.touched_keys):
                     try:
@@ -277,13 +284,13 @@ class Session:
                             continue
                         pname, _spec = spec_pname_pair
                         pl = plugins.get(pname)
-                        cache = self.registry.cache.get(key)
-                        handle = cache[0] if cache else None
-                        if pl is not None and handle is not None:
+                        if pl is None:
+                            continue
+                        with self.registry.acquire(key) as handle:
                             pl.cleanup_after_cancel(handle)
-                            self.log_event(
-                                "CLEANUP", "session",
-                                f"{key}: post-cancel cleanup ran")
+                        self.log_event(
+                            "CLEANUP", "session",
+                            f"{key}: post-cancel cleanup ran")
                     except Exception:
                         traceback.print_exc()
             for key in sorted(self.touched_keys):
