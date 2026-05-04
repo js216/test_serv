@@ -414,7 +414,17 @@ class Session:
                     return
                 cm = self.registry.acquire(key)
                 cm.__enter__()
-                self.pinned[key] = cm
+                # If anything between __enter__ and the pinned dict
+                # store raises (asynchronous signal, MemoryError),
+                # we'd leak the bumped refcount + held dev_lock with
+                # no cm reference left to undo it. Tie the two
+                # together so the handle is always reachable from
+                # pinned, or rolled back.
+                try:
+                    self.pinned[key] = cm
+                except BaseException:
+                    cm.__exit__(None, None, None)
+                    raise
                 self.log_event("OPEN", op.device, key)
             else:
                 cm = self.pinned.pop(key, None)
