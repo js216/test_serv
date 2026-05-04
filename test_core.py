@@ -127,7 +127,7 @@ def test_session_runs_and_artefact_has_expected_shape():
     parsed = plan.load_tar(tar_in)
 
     plugins = {"fake": FakePlugin()}
-    reg = DeviceRegistry(plugins, ttl_s=0.1)
+    reg = DeviceRegistry(plugins)
     reg.refresh()
 
     session = Session(reg, parsed)
@@ -160,7 +160,7 @@ def test_session_closes_touched_handles_at_job_end():
     parsed = plan.load_tar(plan.pack_tar(text, {}))
     fake = FakePlugin()
     plugins = {"fake": fake}
-    reg = DeviceRegistry(plugins, ttl_s=60.0)
+    reg = DeviceRegistry(plugins)
     reg.refresh()
     key = reg.resolve("fake")
 
@@ -179,7 +179,7 @@ def test_inventory_returns_devices_and_ops_streams():
     parsed = plan.load_tar(plan.pack_tar("inventory\n", {}))
     fake = FakePlugin()
     plugins = {"fake": fake}
-    reg = DeviceRegistry(plugins, ttl_s=0.1)
+    reg = DeviceRegistry(plugins)
     reg.refresh()
 
     session = Session(reg, parsed)
@@ -237,25 +237,23 @@ def test_server_rest_queue_helpers():
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
 
 
-def test_lazy_handle_ttl_and_release():
+def test_lazy_handle_cache_and_release():
     plugins = {"fake": FakePlugin()}
-    reg = DeviceRegistry(plugins, ttl_s=0.05)
+    reg = DeviceRegistry(plugins)
     reg.refresh()
     key = reg.resolve("fake")
     with reg.acquire(key) as h:
         assert h is not None
-    # still cached
-    time.sleep(0.02)
+    # cached after release; refs back to 0.
     assert key in reg.cache
-    # TTL expires
-    time.sleep(0.2)
-    assert key not in reg.cache or reg.cache[key][3] == 0
-    # explicit release
-    with reg.acquire(key):
-        pass
+    assert reg.cache[key][1] == 0
+    # explicit release closes it.
     ok = reg.release_now(key)
-    assert ok or key not in reg.cache
-    reg.stop()
+    assert ok
+    assert key not in reg.cache
+    # acquiring again re-opens.
+    with reg.acquire(key):
+        assert key in reg.cache
     reg.close_all()
 
 
@@ -281,7 +279,7 @@ def main():
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
         test_server_rest_queue_helpers,
-        test_lazy_handle_ttl_and_release,
+        test_lazy_handle_cache_and_release,
         test_bounded_sizes,
     ]
     failed = 0

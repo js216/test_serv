@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# registry.py --- Lazy device-handle cache with TTL and explicit release
+# registry.py --- Device-handle cache with explicit release
 # Copyright (c) 2026 Jakob Kastelic
 
 import threading
@@ -14,29 +14,27 @@ class DeviceRegistry:
 
     ``probe()`` of each plugin is called on refresh to populate ``specs``.
     Handles are opened lazily the first time ``acquire()`` is called and
-    kept in ``cache`` for ``ttl`` seconds after the last release so
-    back-to-back ops don't pay the open cost every time.
-
-    A background reaper closes expired handles when no session holds
-    them. ``release_now()`` drops a specific handle immediately (the
-    endpoint the bench tech hits before opening PuTTY on the DSP UART).
+    stay cached so back-to-back ops within the same session don't pay
+    the open cost every time. Sessions force-close all touched devices
+    in their finally block (``release_now``), so handles don't linger
+    across job boundaries.
     """
 
-    def __init__(self, plugins, ttl_s=5.0):
+    def __init__(self, plugins):
         # plugins: {name: DevicePlugin}
         self.plugins = plugins
-        self.ttl_s = ttl_s
         self.lock = threading.Lock()
         self.specs = {}        # "dsp.A" -> (plugin_name, spec dict)
-        self.cache = {}        # "dsp.A" -> (handle, opened_at, last_used, refs)
+        # cache entry shape: [handle, refs]. No TTL; lifetime is bounded
+        # by session.run_all's release_now sweep at session end.
+        self.cache = {}
         self.per_dev_lock = {} # "dsp.A" -> threading.RLock
         self.verify_results = {}  # "dsp.A" -> {t, ok, err, latency_ms}
-        self._stop = threading.Event()
-        self._reaper = threading.Thread(target=self._reap, daemon=True)
-        self._reaper.start()
 
     def stop(self):
-        self._stop.set()
+        # Kept for API compatibility with the older TTL-reaper version;
+        # there's no background thread to stop now.
+        pass
 
     def refresh(self):
         """Rescan every plugin's probe() and update specs."""
@@ -58,7 +56,7 @@ class DeviceRegistry:
             for key in list(self.specs):
                 if key not in found:
                     entry = self.cache.get(key)
-                    if entry is None or entry[3] == 0:
+                    if entry is None or entry[1] == 0:
                         self.specs.pop(key, None)
                         self._close_if_cached_locked(key)
             for key, val in found.items():
@@ -97,7 +95,7 @@ class DeviceRegistry:
                     continue
                 if key not in found:
                     entry = self.cache.get(key)
-                    if entry is None or entry[3] == 0:
+                    if entry is None or entry[1] == 0:
                         self.specs.pop(key, None)
                         self._close_if_cached_locked(key)
             for key, val in found.items():
@@ -130,7 +128,7 @@ class DeviceRegistry:
             out = []
             for key, (pname, spec) in sorted(self.specs.items()):
                 entry = self.cache.get(key)
-                status = "open" if (entry and entry[3] > 0) else (
+                status = "open" if (entry and entry[1] > 0) else (
                     "cached" if entry else "closed")
                 verify = self.verify_results.get(key)
                 out.append({
@@ -160,7 +158,7 @@ class DeviceRegistry:
             # in-flight ops. Report the in-use status verbatim.
             with self.lock:
                 entry = self.cache.get(key)
-                in_use = entry is not None and entry[3] > 0
+                in_use = entry is not None and entry[1] > 0
             if in_use:
                 with self.lock:
                     self.verify_results[key] = {
@@ -176,6 +174,11 @@ class DeviceRegistry:
                     entry["verified"] = bool(
                         getattr(handle, "_identity_verified", False))
                 entry["ok"] = True
+                # The sweep's whole point is "open it once and put it
+                # back as if untouched"; close before we move on so a
+                # multi-device sweep doesn't end with every device
+                # cached open.
+                self.release_now(key)
             except Exception as e:
                 entry["err"] = f"{type(e).__name__}: {e}"
             entry["latency_ms"] = (time.monotonic() - t0) * 1e3
@@ -184,7 +187,7 @@ class DeviceRegistry:
         return {k: self.verify_results.get(k) for k in keys}
 
     def acquire(self, key):
-        """Context manager: returns (handle, per_device_lock_held).
+        """Context manager: returns the open handle.
 
         Callers must wrap usage in ``with registry.acquire(key) as h:``.
         """
@@ -196,7 +199,7 @@ class DeviceRegistry:
             entry = self.cache.get(key)
             if entry is None:
                 return False
-            if entry[3] > 0:
+            if entry[1] > 0:
                 return False
             self._close_if_cached_locked(key)
             return True
@@ -212,15 +215,14 @@ class DeviceRegistry:
         pname, spec = self.specs[key]
         pl = self.plugins[pname]
         handle = pl.open(spec)
-        now = time.monotonic()
-        self.cache[key] = [handle, now, now, 1]
+        self.cache[key] = [handle, 1]
         return handle
 
     def _close_if_cached_locked(self, key):
         entry = self.cache.pop(key, None)
         if entry is None:
             return
-        handle, _, _, refs = entry
+        handle, refs = entry
         if refs > 0:
             # should not happen with ref=0 gate, but be safe
             self.cache[key] = entry
@@ -232,15 +234,6 @@ class DeviceRegistry:
                 pl.close(handle)
             except Exception:
                 traceback.print_exc()
-
-    def _reap(self):
-        while not self._stop.wait(0.5):
-            now = time.monotonic()
-            with self.lock:
-                for key in list(self.cache):
-                    handle, opened_at, last_used, refs = self.cache[key]
-                    if refs == 0 and (now - last_used) > self.ttl_s:
-                        self._close_if_cached_locked(key)
 
 
 class _Acquire:
@@ -267,8 +260,7 @@ class _Acquire:
                     handle = reg._open_locked(key)
                 else:
                     handle = entry[0]
-                    entry[3] += 1
-                    entry[2] = time.monotonic()
+                    entry[1] += 1
         except BusyError:
             dev_lock.release()
             raise
@@ -285,8 +277,7 @@ class _Acquire:
             with reg.lock:
                 entry = reg.cache.get(self.key)
                 if entry is not None:
-                    entry[3] -= 1
-                    entry[2] = time.monotonic()
+                    entry[1] -= 1
         finally:
             if self._lock is not None:
                 self._lock.release()
