@@ -111,6 +111,14 @@ class Session:
         self.early_done = True
         self.log_event("CTRL", "session", f"early_done: {reason}")
 
+    def bail_if_canceled(self, where):
+        """Plugin helper: raise RuntimeError if the session is canceled.
+        Cheaper to call once per chunk than to manage a local helper.
+        """
+        if self.canceled:
+            raise RuntimeError(
+                f"{where} canceled via DELETE /jobs/<digest>")
+
     def signal_cancel(self, reason=""):
         """Request the session abort. Idempotent and thread-safe.
         Called from the poller's cancel-marker drain when DELETE

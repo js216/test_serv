@@ -198,9 +198,9 @@ def _open_master(desc, clk_div=8, mode=1, flags=0):
 # ---- op implementations ----
 
 def _op_reset(session, h, args):
-    _bail_if_canceled(session, "dsp:reset before pulse")
+    session.bail_if_canceled("dsp:reset before pulse")
     _Expander(h.ft4222_desc).pulse_reset(session=session)
-    _bail_if_canceled(session, "dsp:reset before init")
+    session.bail_if_canceled("dsp:reset before init")
     _Expander(h.ft4222_desc).init_and_reset()
 
 
@@ -219,7 +219,7 @@ def _op_boot(session, h, args):
     dev = _open_master(h.ft4222_desc, clk_div=8, mode=1, flags=0)
     try:
         for i in range(0, padded, CHUNK):
-            _bail_if_canceled(session, f"dsp:boot @ {i}/{padded}B")
+            session.bail_if_canceled(f"dsp:boot @ {i}/{padded}B")
             last = (i + CHUNK) >= padded
             dev.spiMaster_SingleWrite(bytes(buf[i:i+CHUNK]), last)
     finally:
@@ -268,12 +268,6 @@ def _validate_chunk_size(mode, chunk_size):
             f"{CHUNK_ABS_MAX}]")
 
 
-def _bail_if_canceled(session, where):
-    if session is not None and session.canceled:
-        raise RuntimeError(
-            f"{where} canceled via DELETE /jobs/<digest>")
-
-
 def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None,
                   session=None):
     """Write ``data`` in ``chunk_size``-byte CS frames.
@@ -303,7 +297,7 @@ def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None,
     pfx = bytes(prefix or b"")
     if mode == 1:
         for off in range(0, len(raw), chunk_size):
-            _bail_if_canceled(session, f"dsp:qspi_write @ {off}/{len(raw)}B")
+            session.bail_if_canceled(f"dsp:qspi_write @ {off}/{len(raw)}B")
             last = (off + chunk_size) >= len(raw)
             slice_ = raw[off:off+chunk_size]
             dev.spiMaster_SingleWrite(slice_, last)
@@ -311,7 +305,7 @@ def _master_write(dev, data, mode, chunk_size, prefix=b"", on_chunk=None,
                 on_chunk(off, len(slice_), len(slice_))
     else:
         for off in range(0, len(raw), chunk_size):
-            _bail_if_canceled(session, f"dsp:qspi_write @ {off}/{len(raw)}B")
+            session.bail_if_canceled(f"dsp:qspi_write @ {off}/{len(raw)}B")
             chunk = raw[off:off+chunk_size]
             frame = pfx + chunk
             dev.spiMaster_MultiReadWrite(b"", frame, 0)
@@ -325,14 +319,14 @@ def _master_read(dev, n, mode, chunk_size, session=None):
     if mode == 1:
         out = bytearray()
         while len(out) < n:
-            _bail_if_canceled(session, f"dsp:qspi_read @ {len(out)}/{n}B")
+            session.bail_if_canceled(f"dsp:qspi_read @ {len(out)}/{n}B")
             want = min(chunk_size, n - len(out))
             last = (len(out) + want) >= n
             out += bytes(dev.spiMaster_SingleRead(want, last))
         return bytes(out)
     out = bytearray()
     while len(out) < n:
-        _bail_if_canceled(session, f"dsp:qspi_read @ {len(out)}/{n}B")
+        session.bail_if_canceled(f"dsp:qspi_read @ {len(out)}/{n}B")
         want = min(chunk_size, n - len(out))
         out += bytes(dev.spiMaster_MultiReadWrite(b"", b"", want))
     return bytes(out)
@@ -354,7 +348,7 @@ def _master_xfer(dev, data, mode, chunk_size, prefix=b"", session=None):
     raw = bytes(data)
     out = bytearray()
     for off in range(0, len(raw), chunk_size):
-        _bail_if_canceled(session, f"dsp:qspi_xfer @ {off}/{len(raw)}B")
+        session.bail_if_canceled(f"dsp:qspi_xfer @ {off}/{len(raw)}B")
         last = (off + chunk_size) >= len(raw)
         out += bytes(dev.spiMaster_SingleReadWrite(
             raw[off:off+chunk_size], last))

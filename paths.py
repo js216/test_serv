@@ -6,6 +6,33 @@ import os
 import tempfile
 
 
+def write_atomic(path, body):
+    """Atomic file write usable from any thread/process.
+
+    A unique tempfile is used per call so concurrent writers don't
+    collide on a shared "<path>.tmp" name -- ThreadingHTTPServer in
+    server.py runs status pushes in parallel; the poller fires
+    _publish_status from both the main loop and worker threads via
+    the inventory op. ``os.replace`` is atomic on POSIX and overwrites-
+    if-exists on Windows.
+    """
+    d = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(
+        dir=d, prefix=os.path.basename(path) + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def default_state_dir():
     """Return a writable per-user scratch dir for inputs/outputs/status/etc.
 

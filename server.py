@@ -70,26 +70,7 @@ def _read_file(path):
         return None
 
 
-def _write_atomic(path, body):
-    # Unique tempfile per call so concurrent writers don't collide on a
-    # shared "<path>.inprogress" name; ThreadingHTTPServer dispatches
-    # multiple POST /status/<...> in parallel, and the second would
-    # FileNotFoundError when its tmp got renamed away by the first.
-    d = os.path.dirname(path) or "."
-    fd, tmp = tempfile.mkstemp(
-        dir=d, prefix=os.path.basename(path) + ".", suffix=".inprogress")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(body)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, path)
-    except Exception:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+_write_atomic = paths.write_atomic
 
 
 def _extract_plan_description(text):

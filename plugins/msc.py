@@ -79,11 +79,6 @@ class MscHandle:
         self.block_size = block_size
 
 
-def _bail_if_canceled(session, where):
-    if session.canceled:
-        raise RuntimeError(f"{where} canceled via DELETE /jobs/<digest>")
-
-
 def _op_write(session, h, args):
     data = bytes(args["data"])
     offset_lba = args.get("offset_lba") or 0
@@ -95,7 +90,7 @@ def _op_write(session, h, args):
         os.lseek(fd, offset, os.SEEK_SET)
         written = 0
         while written < total:
-            _bail_if_canceled(session, f"msc:write @ {written}/{total}B")
+            session.bail_if_canceled(f"msc:write @ {written}/{total}B")
             n = os.write(fd, data[written:written + CHUNK_BYTES])
             if n <= 0:
                 raise IOError(f"write stalled at {written}/{total}")
@@ -124,7 +119,7 @@ def _op_read(session, h, args):
         os.lseek(fd, offset, os.SEEK_SET)
         got = bytearray()
         while len(got) < n:
-            _bail_if_canceled(session, f"msc:read @ {len(got)}/{n}B")
+            session.bail_if_canceled(f"msc:read @ {len(got)}/{n}B")
             chunk = os.read(fd, min(CHUNK_BYTES, n - len(got)))
             if not chunk:
                 raise IOError(f"short read at {len(got)}/{n}")
@@ -147,7 +142,7 @@ def _op_verify(session, h, args):
         os.lseek(fd, offset, os.SEEK_SET)
         got = bytearray()
         while len(got) < total:
-            _bail_if_canceled(session, f"msc:verify @ {len(got)}/{total}B")
+            session.bail_if_canceled(f"msc:verify @ {len(got)}/{total}B")
             chunk = os.read(fd, min(CHUNK_BYTES, total - len(got)))
             if not chunk:
                 raise IOError(f"short read at {len(got)}/{total}")

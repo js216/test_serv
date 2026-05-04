@@ -117,9 +117,9 @@ def _xfer(dev, out, rdlen, session=None):
     for n in chunks:
         partial = bytearray()
         while len(partial) < n:
-            _bail_if_canceled(
-                session,
-                f"fpga:_xfer @ {len(got)+len(partial)}/{rdlen}B")
+            if session is not None:
+                session.bail_if_canceled(
+                    f"fpga:_xfer @ {len(got)+len(partial)}/{rdlen}B")
             piece = dev.read(n - len(partial))
             if not piece:
                 raise RuntimeError(
@@ -140,15 +140,9 @@ def _wait_wip(dev, session=None):
             time.sleep(0.001)
 
 
-def _bail_if_canceled(session, where):
-    if session is not None and session.canceled:
-        raise RuntimeError(
-            f"{where} canceled via DELETE /jobs/<digest>")
-
-
 def _erase(dev, nbytes, session=None):
     for addr in range(0, nbytes, SECTOR):
-        _bail_if_canceled(session, f"fpga:erase @ {addr}/{nbytes}B")
+        session.bail_if_canceled(f"fpga:erase @ {addr}/{nbytes}B")
         _cmd(dev, [0x06])
         _cmd(dev, [0xD8,
                    (addr >> 16) & 0xff,
@@ -159,7 +153,7 @@ def _erase(dev, nbytes, session=None):
 
 def _write(dev, buf, session=None):
     for off in range(0, len(buf), PAGE):
-        _bail_if_canceled(session, f"fpga:write @ {off}/{len(buf)}B")
+        session.bail_if_canceled(f"fpga:write @ {off}/{len(buf)}B")
         chunk = bytes(buf[off:off + PAGE])
         _cmd(dev, [0x06])
         _cmd(dev, [0x02,
@@ -170,7 +164,7 @@ def _write(dev, buf, session=None):
 
 
 def _verify(dev, buf, session=None):
-    _bail_if_canceled(session, "fpga:verify (read-back)")
+    session.bail_if_canceled("fpga:verify (read-back)")
     got = _xfer(dev, [0x03, 0, 0, 0], len(buf), session=session)
     if got == buf:
         return
