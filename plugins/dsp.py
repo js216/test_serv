@@ -9,7 +9,7 @@ import traceback
 import config
 from plugin import DevicePlugin, Op, BusyError
 from ._prbs import prbs_xorshift32
-from ._text import decode_escapes
+from ._text import decode_escapes, expect_timeout_msg
 from . import _usb
 
 
@@ -258,8 +258,8 @@ def _op_uart_expect(session, h, args):
                 session.signal_early_done(f"dsp.uart saw {sentinel!r}")
             return
         session.cancel_event.wait(0.01)
-    raise TimeoutError(
-        f"dsp.uart did not contain {sentinel!r} within {timeout_ms} ms")
+    raise TimeoutError(expect_timeout_msg(
+        "dsp.uart", sentinel, timeout_ms, stream.snapshot_bytes()))
 
 
 CHUNK_ABS_MAX = 262144   # 256 KiB, exact binary power

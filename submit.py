@@ -132,7 +132,19 @@ def _summarize_tar(data):
             sys.stdout.buffer.write(f"  {n}\n".encode())
 
 
-def _extract(data, out_dir):
+def _extract(data, out_dir, force=False):
+    # Refuse to merge into an existing non-empty directory: a stale
+    # streams/foo.bin from a previous run interleaved with a new
+    # streams/bar.bin from this run is a recipe for "but it worked
+    # last time" confusion. --force runs an rmtree first.
+    if os.path.isdir(out_dir) and os.listdir(out_dir):
+        if not force:
+            raise RuntimeError(
+                f"--extract dir {out_dir!r} is non-empty; pass "
+                f"--force to clear it before extracting, or pick "
+                f"a fresh dir")
+        import shutil
+        shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
         for m in tf.getmembers():
@@ -145,12 +157,12 @@ def _extract(data, out_dir):
             tf.extractall(out_dir)
 
 
-def _dump_outputs(tar_bytes, digest, extract_to):
+def _dump_outputs(tar_bytes, digest, extract_to, force=False):
     if tar_bytes is None:
         return
     _summarize_tar(tar_bytes)
     if extract_to is not None:
-        _extract(tar_bytes, extract_to)
+        _extract(tar_bytes, extract_to, force=force)
         tar_path = os.path.join(extract_to, f"{digest}.tar")
         with open(tar_path, "wb") as f:
             f.write(tar_bytes)
@@ -159,12 +171,12 @@ def _dump_outputs(tar_bytes, digest, extract_to):
     sys.stdout.buffer.flush()
 
 
-def _fetch(server, digest, extract_to):
+def _fetch(server, digest, extract_to, force=False):
     tar = _get_tar(server, digest)
     if tar is None:
         print(f"no outputs for digest {digest}", file=sys.stderr)
         return 1
-    _dump_outputs(tar, digest, extract_to)
+    _dump_outputs(tar, digest, extract_to, force=force)
     _delete_outputs(server, digest)
     return 0
 
@@ -186,6 +198,9 @@ def main():
                     help="block up to N seconds for artefacts")
     ap.add_argument("--extract", metavar="DIR",
                     help="extract artefact tarball into DIR (keeps the tar)")
+    ap.add_argument("--force", action="store_true",
+                    help="when --extract DIR is non-empty, rmtree it "
+                         "first instead of refusing")
     ap.add_argument("--runtime", type=float,
                     help="per-session deadline in seconds "
                          "(X-Test-Runtime; default 600).")
@@ -200,7 +215,8 @@ def main():
         ap.error("either a plan file or --fetch DIGEST is required")
 
     if args.fetch:
-        return _fetch(args.server, args.fetch, args.extract)
+        return _fetch(args.server, args.fetch, args.extract,
+                      force=args.force)
 
     # .plan = already-packed tar, otherwise treat as plan.txt + blobs.
     if args.plan.endswith(".plan"):
@@ -234,7 +250,7 @@ def main():
         print(f"timeout waiting for {digest}", file=sys.stderr)
         return 1
 
-    _dump_outputs(tar, digest, args.extract)
+    _dump_outputs(tar, digest, args.extract, force=args.force)
     _delete_outputs(args.server, digest)
     return 0
 

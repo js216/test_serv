@@ -64,6 +64,7 @@ const state = {
   devices: [],
   ops: {},
   jobs: [],
+  inflight: [],
   lastFetch: 0,
 };
 
@@ -77,20 +78,34 @@ async function jget(path) {
 
 async function refresh() {
   try {
-    const [devices, ops, jobs] = await Promise.all([
+    const [devices, ops, jobs, inflight] = await Promise.all([
       jget("/devices"),
       jget("/ops"),
       jget("/jobs"),
+      jget("/inflight").catch(() => []),
     ]);
     state.devices = devices;
     state.ops = ops;
     state.jobs = jobs;
+    state.inflight = Array.isArray(inflight) ? inflight : [];
     state.lastFetch = Date.now();
     renderAll();
     setPollStatus("ok");
   } catch (e) {
     setPollStatus("err", e.message);
   }
+}
+
+// Background tick: while there's any in-flight job, refresh every 3s
+// so the dashboard's tail tracks the bench. Idle dashboards don't
+// poll. (Belt-and-suspenders: setInterval re-checks once a session
+// arrives even if the operator hasn't clicked refresh.)
+let _liveTimer = null;
+function startLiveTickIfNeeded() {
+  if (_liveTimer) return;
+  _liveTimer = setInterval(() => {
+    if ((state.inflight || []).length > 0) refresh();
+  }, 3000);
 }
 
 function setPollStatus(kind, msg) {
@@ -139,6 +154,11 @@ function renderJobs() {
   }
   $("#jobs-empty").classList.add("hidden");
   const now = Date.now() / 1000;
+  // Map digest -> live snapshot so we can render the tail under
+  // the running job's row.
+  const liveByDigest = {};
+  for (const li of state.inflight || []) liveByDigest[li.digest] = li;
+  if (Object.keys(liveByDigest).length) startLiveTickIfNeeded();
   for (const j of state.jobs) {
     const ts = j.completed_at || j.picked_up_at || j.queued_at || 0;
     const age = ts ? fmtAge(now - ts) : "—";
@@ -188,7 +208,41 @@ function renderJobs() {
       el("td", { class: "mono" }, fmtBytes(j.size_bytes)),
       el("td", {}, actions),
     ));
+    // If there's a live in-flight snapshot for this digest, insert
+    // a stretched row underneath with a tail of recent events +
+    // stream tails. Operator gets ~2-3s-fresh visibility into a
+    // running test without fetching the artefact.
+    const live = liveByDigest[j.digest];
+    if (live) {
+      tbody.appendChild(renderInflightRow(live));
+    }
   }
+}
+
+function renderInflightRow(live) {
+  const tr = el("tr", { class: "inflight-row" });
+  const td = el("td", { colspan: "5" });
+  const wrap = el("div", { class: "inflight" });
+  const hdr = el("div", { class: "inflight-hdr" },
+    `live: ${live.elapsed_s.toFixed(1)}s elapsed, `
+    + `${live.n_ops} op(s), ${live.n_errors} error(s)`);
+  wrap.appendChild(hdr);
+  if (live.events && live.events.length) {
+    const evs = el("pre", { class: "inflight-events" });
+    evs.textContent = live.events.map(
+      e => `${e.t.toFixed(3).padStart(8)}  ${e.kind.padEnd(8)} `
+        + `${e.source.padEnd(20)} ${e.msg}`).join("\n");
+    wrap.appendChild(evs);
+  }
+  for (const [name, tail] of Object.entries(live.stream_tails || {})) {
+    const det = el("details", {});
+    det.appendChild(el("summary", {}, `${name} (tail)`));
+    det.appendChild(el("pre", { class: "inflight-stream" }, tail));
+    wrap.appendChild(det);
+  }
+  td.appendChild(wrap);
+  tr.appendChild(td);
+  return tr;
 }
 
 async function cancelJob(digest) {

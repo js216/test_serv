@@ -48,7 +48,7 @@ STATIC_CONTENT_TYPES = {
 }
 # Names the poller is allowed to push into the STATUS dir. Anything
 # else is rejected so a foreign POST can't drop arbitrary files there.
-ALLOWED_STATUS_FILES = ("devices.json", "ops.json")
+ALLOWED_STATUS_FILES = ("devices.json", "ops.json", "inflight.json")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -284,6 +284,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "ops":
             return self._send_json(
                 _read_file(os.path.join(STATUS, "ops.json")) or b"{}")
+        if path == "inflight":
+            return self._send_json(
+                _read_file(os.path.join(STATUS, "inflight.json")) or b"[]")
         if path == "jobs":
             return self._list_jobs()
         if path == "cancels":

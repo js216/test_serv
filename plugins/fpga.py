@@ -9,7 +9,7 @@ import time
 import config
 from plugin import DevicePlugin, Op
 from . import _usb
-from ._text import decode_escapes
+from ._text import decode_escapes, expect_timeout_msg
 
 
 FT2232H_DESC_A_DEFAULT = "Dual RS232-HS A"    # MPSSE channel
@@ -344,8 +344,8 @@ def _op_uart_expect(session, h, args):
                 session.signal_early_done(f"fpga.uart saw {sentinel!r}")
             return
         session.cancel_event.wait(0.01)
-    raise TimeoutError(
-        f"fpga.uart did not contain {sentinel!r} within {timeout_ms} ms")
+    raise TimeoutError(expect_timeout_msg(
+        "fpga.uart", sentinel, timeout_ms, stream.snapshot_bytes()))
 
 
 class FpgaPlugin(DevicePlugin):

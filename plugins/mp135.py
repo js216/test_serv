@@ -8,7 +8,7 @@ import time
 import config
 from plugin import DevicePlugin, Op
 from . import _usb
-from ._text import decode_escapes
+from ._text import decode_escapes, expect_timeout_msg
 
 
 # --- handle with background UART reader ---
@@ -116,8 +116,8 @@ def _op_uart_expect(session, h, args):
         # cancel_event wakes us instantly on cancel; otherwise tick at
         # 10 ms like the original poll loop.
         session.cancel_event.wait(0.01)
-    raise TimeoutError(
-        f"mp135.uart did not contain {sentinel!r} within {timeout_ms} ms")
+    raise TimeoutError(expect_timeout_msg(
+        "mp135.uart", sentinel, timeout_ms, stream.snapshot_bytes()))
 
 
 # --- plugin ---
@@ -190,8 +190,14 @@ class Mp135Plugin(DevicePlugin):
             ser = serial.Serial(h.port, baudrate=h.baud, timeout=0.1)
             ser.close()
         except Exception as e:
-            raise RuntimeError(
-                f"mp135: cannot claim {h.port}: {e}")
+            # SerialException("could not open port: device busy") and
+            # similar -- raise BusyError so the registry's per-device
+            # serialization can release the dev-lock without polluting
+            # the artefact with a generic RuntimeError.
+            from plugin import BusyError
+            raise BusyError(
+                f"mp135: cannot claim {h.port}: {e}; another process "
+                f"may have it (PuTTY / minicom / a stale poller?)")
 
         if verified:
             h._identity_verified = True

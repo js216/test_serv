@@ -3,6 +3,27 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 
+def expect_timeout_msg(stream_name, sentinel, timeout_ms,
+                       stream_bytes, tail_bytes=512):
+    """Build a `*_uart_expect` TimeoutError message that includes the
+    last `tail_bytes` of what actually arrived. Without this an
+    operator at 3am sees only "did not contain b'login:'" and has
+    to extract the artefact tar to find the bytes the chip *did*
+    send. With it the bench MCU's last words are already in the
+    error message and in errors.log.
+    """
+    tail = stream_bytes[-tail_bytes:] if stream_bytes else b""
+    repr_tail = (tail.decode("utf-8", errors="replace")
+                 .replace("\n", "\\n").replace("\r", "\\r"))
+    if len(stream_bytes) > tail_bytes:
+        prefix = f"...({len(stream_bytes)-tail_bytes}B truncated)..."
+    else:
+        prefix = ""
+    return (f"{stream_name} did not contain {sentinel!r} within "
+            f"{timeout_ms} ms; last {min(len(stream_bytes), tail_bytes)}B: "
+            f"{prefix}{repr_tail!r}")
+
+
 def decode_escapes(s):
     r"""Interpret Python-style backslash escapes inside a plan string.
 

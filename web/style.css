@@ -352,3 +352,19 @@ code {
   border-radius: 2px;
   font-size: 11px;
 }
+
+.inflight-row td { background: var(--bg); padding: 4px 8px; }
+.inflight { font-size: 11px; }
+.inflight-hdr { color: var(--fg-dim); margin-bottom: 4px; }
+.inflight-events,
+.inflight-stream {
+  background: #000;
+  color: #ccc;
+  padding: 4px 6px;
+  margin: 2px 0;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+}

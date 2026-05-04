@@ -249,11 +249,73 @@ def _push_status(name, body):
               f"status/{name} push failed (server unreachable?)")
 
 
+def _snapshot_inflight():
+    """Snapshot the in-flight sessions for the dashboard's live tail.
+
+    Bounded per session: last 32 events, last 2KiB per stream, max
+    8 streams. Operator gets a "what's actually happening RIGHT NOW"
+    view without the artefact-fetch cycle. Read-only over session
+    state, no mutations.
+    """
+    INFLIGHT_EVENTS = 32
+    INFLIGHT_STREAM_BYTES = 2048
+    INFLIGHT_MAX_STREAMS = 8
+    out = []
+    with _active_lock:
+        sessions = list(_active_sessions.items())
+    for digest, sess in sessions:
+        try:
+            with sess.lock:
+                events = list(sess.events[-INFLIGHT_EVENTS:])
+                stream_names = list(sess.streams.keys())
+            stream_tails = {}
+            for name in stream_names[:INFLIGHT_MAX_STREAMS]:
+                s = sess.streams.get(name)
+                if s is None:
+                    continue
+                raw = s.snapshot_bytes()[-INFLIGHT_STREAM_BYTES:]
+                stream_tails[name] = raw.decode(
+                    "utf-8", errors="replace")
+            out.append({
+                "digest": digest,
+                "elapsed_s": time.monotonic() - sess.t0,
+                "n_ops": len(sess.ops_log),
+                "n_errors": len(sess.errors),
+                "events": [
+                    {"t": e["t"], "kind": e["kind"],
+                     "source": e["source"], "msg": e["msg"]}
+                    for e in events],
+                "stream_tails": stream_tails,
+            })
+        except Exception:
+            # Don't let a single half-built Session break the whole
+            # snapshot.
+            traceback.print_exc()
+    return out
+
+
+def _publish_inflight():
+    """Publish only the inflight snapshot. Cheap; called on every
+    poll-loop tick (2.5s) so the dashboard's live tail tracks the
+    bench in near-real-time. Skips entirely when no session is
+    active so an idle bench doesn't churn the network.
+    """
+    with _active_lock:
+        any_active = bool(_active_sessions)
+    inflight = json.dumps(_snapshot_inflight()).encode()
+    os.makedirs(STATUS, mode=0o700, exist_ok=True)
+    _write_atomic(os.path.join(STATUS, "inflight.json"), inflight)
+    if any_active:
+        _push_status("inflight.json", inflight)
+
+
 def _publish_status(registry, plugins_by_name):
     os.makedirs(STATUS, mode=0o700, exist_ok=True)
     devices = json.dumps(registry.list_devices(), indent=2).encode()
     _write_atomic(os.path.join(STATUS, "devices.json"), devices)
     _push_status("devices.json", devices)
+
+    _publish_inflight()
 
     ops_map = {}
     for name, pl in plugins_by_name.items():
@@ -610,8 +672,17 @@ def main():
 
     def _sighup(signum, frame):
         print(datetime.now(), "SIGHUP: refresh plugins + devices")
+        # Refuse the reload while sessions are running -- live plugin
+        # modules with cached USB handles would be swapped under
+        # them. The operator's edits land on the next idle window.
+        with _active_lock:
+            if _active_sessions:
+                print(datetime.now(),
+                      f"SIGHUP: deferring -- {len(_active_sessions)} "
+                      f"session(s) still running")
+                return
         try:
-            new_plugins = plugins.load_all()
+            new_plugins = plugins.load_all(reload=True)
             plugins_by_name.clear()
             plugins_by_name.update(new_plugins)
             registry.plugins = plugins_by_name
@@ -656,6 +727,10 @@ def main():
             _drain_sweep_markers(registry, plugins_by_name)
             _drain_cancels()
             _drain_pending_uploads()
+            # Refresh the live-tail snapshot every poll tick so the
+            # dashboard sees in-flight events + stream tails with
+            # ~2.5s latency rather than waiting for the artefact.
+            _publish_inflight()
 
             if time.monotonic() - last_refresh > DEVICE_REFRESH_S:
                 registry.refresh()

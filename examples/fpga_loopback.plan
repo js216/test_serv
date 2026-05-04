@@ -1,5 +1,12 @@
 # Program iCEstick flash with a loopback bitstream and wait for the
 # FPGA to print READY. Releases FPGA reset as part of program step.
+#
+# Required blob: @loopback.bin -- build it from your iCE40 toolchain
+# (yosys + nextpnr-ice40 + icepack), then submit with:
+#
+#   python3 submit.py examples/fpga_loopback.plan \
+#     --blob loopback.bin=path/to/loopback.bin \
+#     --wait 30 --extract /tmp/fpga
 
 fpga:program bin=@loopback.bin
 fpga:uart_open

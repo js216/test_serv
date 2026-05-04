@@ -1,6 +1,15 @@
 # Cross-device PRBS flow: FPGA first (acts as observer/loopback),
 # then DSP boots and streams PRBS at its SPI pins. Both UARTs captured
 # on one timeline; scope captures at the end.
+#
+# Required blobs (all bench-built; not in this repo):
+#   @observer.bin  -- FPGA bitstream that watches dsp's SPI pins
+#   @pattern.ldr   -- DSP loader image that runs qspi_write_prbs
+# Submit:
+#   python3 submit.py examples/dsp_to_fpga_prbs.plan \
+#     --blob observer.bin=build/observer.bin \
+#     --blob pattern.ldr=build/pattern.ldr \
+#     --wait 60 --extract /tmp/prbs
 
 fpga:program bin=@observer.bin
 fpga:uart_open

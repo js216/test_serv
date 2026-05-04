@@ -22,18 +22,60 @@ def load():
     repo-root ``config.json``. First found wins -- the bench operator can
     fully override shipped defaults by placing a file in the state dir.
     Missing file -> empty dict.
+
+    Supports a top-level ``"include": ["path1.json", ...]`` array so a
+    multi-bench setup can split per-bench specs into separate files
+    rather than stamping ~80 lines of duplicated instance dicts into
+    one giant config. Includes are loaded relative to the including
+    file's directory; later entries shallow-merge over earlier ones,
+    and the including file's keys win over included ones.
     """
     for p in DEFAULT_PATHS:
         if not p:
             continue
         try:
-            with open(p) as f:
-                return json.load(f)
+            return _load_with_includes(p)
         except FileNotFoundError:
             continue
         except Exception as e:
             raise RuntimeError(f"bad config {p!r}: {e}")
     return {}
+
+
+def _load_with_includes(path):
+    with open(path) as f:
+        data = json.load(f)
+    includes = data.pop("include", None) or []
+    if not includes:
+        return data
+    base_dir = os.path.dirname(os.path.abspath(path))
+    merged = {}
+    # Includes first (so they form the base), then overlay the
+    # current file's keys (so the operator's top-level entries win).
+    for inc in includes:
+        inc_path = (inc if os.path.isabs(inc)
+                    else os.path.join(base_dir, inc))
+        try:
+            sub = _load_with_includes(inc_path)
+        except FileNotFoundError as e:
+            raise RuntimeError(
+                f"config {path!r} includes missing file {inc!r}: {e}")
+        _shallow_merge(merged, sub)
+    _shallow_merge(merged, data)
+    return merged
+
+
+def _shallow_merge(dst, src):
+    """Dict update with one level of nesting: per-plugin sections
+    merge their instances + scalar settings rather than wholesale
+    replacing each other.
+    """
+    for k, v in src.items():
+        if (isinstance(v, dict) and isinstance(dst.get(k), dict)):
+            for k2, v2 in v.items():
+                dst[k][k2] = v2
+        else:
+            dst[k] = v
 
 
 def section(name):
