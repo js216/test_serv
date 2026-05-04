@@ -199,6 +199,15 @@ class ScopePlugin(DevicePlugin):
             res = inst.get("resource")
             if not res or res not in resources:
                 continue
+            # expected_idn is mandatory: a multi-scope bench could
+            # otherwise have two scopes share VID/PID and present
+            # different VISA resources after re-enumeration; without
+            # an *IDN? gate the plugin would silently drive whichever
+            # one ResourceManager returned first.
+            if not inst.get("expected_idn"):
+                print(f"scope.{inst.get('id', '0')}: skipped, "
+                      f"config requires expected_idn for identity safety")
+                continue
             out.append({
                 "id": inst.get("id", "0"),
                 "resource": res,
@@ -210,8 +219,9 @@ class ScopePlugin(DevicePlugin):
     def open(self, spec):
         h = ScopeHandle(resource=spec["resource"])
         h.open()
-        # Verify IDN string if the config pinned one. The scope responds to
-        # the standard *IDN? SCPI query with "vendor,model,serial,fw".
+        # expected_idn is required by probe(); verify the *IDN? reply
+        # contains it. The scope responds to the standard *IDN? SCPI
+        # query with "vendor,model,serial,fw".
         expected = spec.get("expected_idn")
         if expected:
             try:

@@ -666,6 +666,10 @@ class DspPlugin(DevicePlugin):
                 "baudrate": int(inst.get("baudrate", 115200)),
                 "ft4222_desc": ft_desc,
                 "ft4222_serial": inst.get("ft4222_serial"),
+                "expected_uart_vid": inst.get("expected_uart_vid"),
+                "expected_uart_pid": inst.get("expected_uart_pid"),
+                "expected_uart_serial": inst.get("expected_uart_serial"),
+                "expected_uart_interface": inst.get("expected_uart_interface"),
                 "description": inst.get("description"),
             })
         return out
@@ -701,6 +705,20 @@ class DspPlugin(DevicePlugin):
             raise RuntimeError(
                 f"dsp: no FTDI device matches desc={desc!r} "
                 f"serial={expected_serial!r}")
+        # The FT4222 SPI/I2C side is identity-verified above. The UART
+        # side comes out on a separate USB endpoint (often a sibling
+        # FTDI port) -- on a multi-board bench the configured
+        # serial_port can land on the wrong device after a Windows
+        # re-enumeration. Mirror mp135's USB-level pin so we hard-fail
+        # rather than silently driving someone else's UART.
+        port = spec.get("serial_port")
+        if port:
+            _usb.verify_com_identity(
+                port, label="dsp.uart",
+                exp_vid=spec.get("expected_uart_vid"),
+                exp_pid=spec.get("expected_uart_pid"),
+                exp_serial=spec.get("expected_uart_serial"),
+                exp_interface=spec.get("expected_uart_interface"))
         handle = DspHandle(serial_port=spec["serial_port"],
                            baud=spec["baudrate"],
                            ft4222_desc=spec["ft4222_desc"])

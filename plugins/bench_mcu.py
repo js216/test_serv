@@ -159,6 +159,10 @@ class BenchMcuPlugin(DevicePlugin):
                 "baudrate": int(inst.get("baudrate", 115200)),
                 "expected_identity": (inst.get("expected_identity")
                                       or EXPECTED_IDENTITY.decode()),
+                "expected_usb_vid": inst.get("expected_usb_vid"),
+                "expected_usb_pid": inst.get("expected_usb_pid"),
+                "expected_usb_serial": inst.get("expected_usb_serial"),
+                "expected_usb_interface": inst.get("expected_usb_interface"),
                 "description": inst.get("description"),
             })
         return out
@@ -169,6 +173,18 @@ class BenchMcuPlugin(DevicePlugin):
             baud=spec["baudrate"],
             expected_identity=spec["expected_identity"].encode(),
         )
+        # USB-level identity gate. The on-wire '?' handshake below is
+        # the primary check, but if the configured serial_port is
+        # hardcoded (no autodetect) and another USB-CDC device with a
+        # similar reply slot lands on it after a re-enumeration, the
+        # handshake alone could match. Pin VID/PID/iSerial too when
+        # available -- no-op when none are set in config.
+        _usb.verify_com_identity(
+            handle.port, label="bench_mcu",
+            exp_vid=spec.get("expected_usb_vid"),
+            exp_pid=spec.get("expected_usb_pid"),
+            exp_serial=spec.get("expected_usb_serial"),
+            exp_interface=spec.get("expected_usb_interface"))
         # Identity handshake: refuse to hand back a handle if the device
         # at ``port`` does not answer '?' with the expected string.
         # Prevents handing ops a misassigned COM port (wrong device on

@@ -177,51 +177,12 @@ class Mp135Plugin(DevicePlugin):
         # STLink VCP (matching VID/PID/iSerial) -- the STM32F405 and any
         # generic USB-UART share a port namespace but have different USB
         # identities.
-        info = _usb.com_port_info(h.port)
-        if info is None:
-            raise RuntimeError(f"mp135: {h.port} not in OS port list")
-
-        exp_vid = spec.get("expected_usb_vid")
-        exp_pid = spec.get("expected_usb_pid")
-        exp_ser = spec.get("expected_usb_serial")
-        exp_if  = spec.get("expected_usb_interface")
-        verified = False
-        if exp_vid is not None:
-            if info.vid != config.as_int(exp_vid):
-                raise RuntimeError(
-                    f"mp135 USB VID mismatch on {h.port}: "
-                    f"expected 0x{config.as_int(exp_vid):04x}, "
-                    f"got 0x{info.vid or 0:04x}")
-            verified = True
-        if exp_pid is not None:
-            if info.pid != config.as_int(exp_pid):
-                raise RuntimeError(
-                    f"mp135 USB PID mismatch on {h.port}: "
-                    f"expected 0x{config.as_int(exp_pid):04x}, "
-                    f"got 0x{info.pid or 0:04x}")
-            verified = True
-        if exp_ser is not None:
-            got = info.serial_number or ""
-            if exp_ser not in got:
-                raise RuntimeError(
-                    f"mp135 USB iSerial mismatch on {h.port}: "
-                    f"expected {exp_ser!r} substring, got {got!r}")
-            verified = True
-        if exp_if is not None:
-            loc = (info.location or "") + " " + (info.hwid or "")
-            n = int(exp_if)
-            # Various driver stacks encode the USB interface number
-            # differently in hwid / location strings:
-            #   Windows usbser.sys:        MI_0N
-            #   Linux sysfs-derived:       :1.N
-            #   Some Windows STLink VCP:   :x.N   (config index is 'x')
-            needles = (f"MI_{n:02d}", f":1.{n}", f":x.{n}")
-            if not any(x in loc for x in needles):
-                raise RuntimeError(
-                    f"mp135 USB interface mismatch on {h.port}: "
-                    f"expected interface {n} "
-                    f"(one of {needles}), got {loc!r}")
-            verified = True
+        verified = _usb.verify_com_identity(
+            h.port, label="mp135",
+            exp_vid=spec.get("expected_usb_vid"),
+            exp_pid=spec.get("expected_usb_pid"),
+            exp_serial=spec.get("expected_usb_serial"),
+            exp_interface=spec.get("expected_usb_interface"))
 
         # Claim the port briefly so contention (PuTTY etc.) fails now.
         try:

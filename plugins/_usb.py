@@ -81,6 +81,61 @@ def com_port_info(name):
     return None
 
 
+def verify_com_identity(port, label, exp_vid=None, exp_pid=None,
+                        exp_serial=None, exp_interface=None):
+    """Look up the USB identity of the given COM port and assert it
+    matches the expected values from config. Raises ``RuntimeError``
+    on any mismatch (port not present, VID/PID/iSerial/interface wrong).
+    Returns True if any expected field matched (so caller can record
+    "_identity_verified"); returns False if nothing was pinned.
+
+    Used by every UART-driven plugin so a Windows re-enumeration that
+    moves a different USB-CDC device onto the configured COM number
+    becomes a hard failure rather than silently driving the wrong
+    chip.
+    """
+    info = com_port_info(port)
+    if info is None:
+        raise RuntimeError(f"{label}: {port} not in OS port list")
+    verified = False
+    if exp_vid is not None:
+        v = config.as_int(exp_vid)
+        if info.vid != v:
+            raise RuntimeError(
+                f"{label} USB VID mismatch on {port}: "
+                f"expected 0x{v:04x}, got 0x{info.vid or 0:04x}")
+        verified = True
+    if exp_pid is not None:
+        v = config.as_int(exp_pid)
+        if info.pid != v:
+            raise RuntimeError(
+                f"{label} USB PID mismatch on {port}: "
+                f"expected 0x{v:04x}, got 0x{info.pid or 0:04x}")
+        verified = True
+    if exp_serial is not None:
+        got = info.serial_number or ""
+        if exp_serial not in got:
+            raise RuntimeError(
+                f"{label} USB iSerial mismatch on {port}: "
+                f"expected {exp_serial!r} substring, got {got!r}")
+        verified = True
+    if exp_interface is not None:
+        loc = (info.location or "") + " " + (info.hwid or "")
+        n = int(exp_interface)
+        # Various driver stacks encode the USB interface number
+        # differently in hwid / location strings:
+        #   Windows usbser.sys:        MI_0N
+        #   Linux sysfs-derived:       :1.N
+        #   Some Windows STLink VCP:   :x.N   (config index is 'x')
+        needles = (f"MI_{n:02d}", f":1.{n}", f":x.{n}")
+        if not any(x in loc for x in needles):
+            raise RuntimeError(
+                f"{label} USB interface mismatch on {port}: "
+                f"expected interface {n} (one of {needles}), got {loc!r}")
+        verified = True
+    return verified
+
+
 def ftd2xx_descriptors():
     """Return the set of FTDI descriptor strings currently enumerated,
     or ``None`` if the driver is unavailable (non-FTDI host, etc.).
