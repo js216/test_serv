@@ -11,12 +11,13 @@
 #     --blob sdcard.img=build/sdcard.img \
 #     --wait 600 --extract ./out
 #
-# The flash.tsv blob must reference the other blobs by @name:
+# The flash.tsv blob references the other blobs by name; the
+# leading "@" is optional (kept for back-compat with older plans):
 #
-#   -   0x01    fsbl1-boot   Binary     none    0x0    @tf-a.stm32
-#   -   0x03    fip_boot     Binary     none    0x0    @fip.bin
-#   -   0x03    ssbl-boot    Binary     none    0x0    @u-boot-nodtb.bin
-#   P   0x10    sdcard       RawImage   mmc0    0x0    @sdcard.img
+#   -   0x01    fsbl1-boot   Binary     none    0x0    tf-a.stm32
+#   -   0x03    fip_boot     Binary     none    0x0    fip.bin
+#   -   0x03    ssbl-boot    Binary     none    0x0    u-boot-nodtb.bin
+#   P   0x10    sdcard       RawImage   mmc0    0x0    sdcard.img
 
 dfu.evb:list
 dfu.evb:flash_layout layout=@flash.tsv

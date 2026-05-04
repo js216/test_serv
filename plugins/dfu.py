@@ -127,11 +127,13 @@ def _rewrite_tsv(tsv_text, blobs, staging_dir):
     """Validate + rewrite the flashlayout so Binary cells point to files
     in ``staging_dir``.  Raises ValueError on any unsafe reference.
 
-    Contract: each non-empty, non-``none`` Binary cell MUST be
-    ``@blobname`` where ``blobname`` is both a safe identifier and
-    present in ``blobs``.  Plain filenames, absolute paths, and
-    traversal strings are rejected outright -- we do NOT want cubeprog
-    reading /etc/passwd for an attacker who can craft a TSV.
+    Contract: each non-empty, non-``none`` Binary cell names a blob
+    that's present in the plan tar. The ``@`` prefix is optional --
+    ``@tf-a.stm32`` and ``tf-a.stm32`` both resolve to the
+    ``tf-a.stm32`` blob. Either way, the value must match
+    SAFE_NAME_RE (alphanumeric, dot, dash, underscore only) so an
+    attacker can't smuggle a filesystem path -- ``/etc/passwd``,
+    ``../x``, etc. all fail the regex and are rejected.
     """
     out_lines = []
     needed = {}     # blob_name -> (staged_path, bytes)
@@ -149,18 +151,16 @@ def _rewrite_tsv(tsv_text, blobs, staging_dir):
         if binary in ("none", "-", ""):
             out_lines.append(raw)
             continue
-        if not binary.startswith("@"):
-            raise ValueError(
-                f"flashlayout line {lineno}: Binary column must be "
-                f"@blobname (plan blob reference), got {binary!r}; "
-                f"filesystem paths are rejected for safety")
-        name = binary[1:]
+        # Strip optional leading '@' so both `@blob` and `blob` work.
+        name = binary[1:] if binary.startswith("@") else binary
         if not SAFE_NAME_RE.match(name):
             raise ValueError(
-                f"flashlayout line {lineno}: unsafe blob name {name!r}")
+                f"flashlayout line {lineno}: Binary column must be a "
+                f"plain blob name (alphanumeric + .-_), got {binary!r}; "
+                f"filesystem paths are rejected for safety")
         if name not in blobs:
             raise ValueError(
-                f"flashlayout line {lineno}: blob @{name} not in plan tar")
+                f"flashlayout line {lineno}: blob {name!r} not in plan tar")
         staged = os.path.join(staging_dir, name)
         needed[name] = (staged, blobs[name])
         # Rebuild the row with the staged path in column 7. Keep
@@ -367,10 +367,11 @@ class DfuPlugin(DevicePlugin):
     name = "dfu"
     doc = ("STM32 DFU bootloader programming via STM32_Programmer_CLI. "
            "Ops: list (enumerate DFU devices), flash (single file to "
-           "address), flash_layout (TSV-described multi-partition, each "
-           "row's Binary column is a plan @blob reference).  Binary path "
-           "is bench-owned; attacker-controllable inputs are limited to "
-           "typed plan args and plan blobs.")
+           "address), flash_layout (TSV-described multi-partition; each "
+           "row's Binary column is a plan blob name -- plain `name` or "
+           "`@name` both work).  Binary path is bench-owned; attacker-"
+           "controllable inputs are limited to typed plan args and plan "
+           "blobs.")
 
     ops = {
         "list": Op(args={},
@@ -384,8 +385,10 @@ class DfuPlugin(DevicePlugin):
             args={"layout": "blob"},
             optional_args={"no_reconnect": "bool"},
             doc=("Multi-partition flash from a TSV flashlayout (see "
-                 "STM32CubeProgrammer docs).  Every Binary column must "
-                 "be @blobname; filesystem paths are rejected. "
+                 "STM32CubeProgrammer docs).  Every Binary column "
+                 "names a plan blob, with or without a leading '@' "
+                 "(e.g. `tf-a.stm32` or `@tf-a.stm32`); filesystem "
+                 "paths are rejected. "
                  "no_reconnect=true kills cubeprog once "
                  "'Reconnecting the device' appears on stdout -- "
                  "saves ~30 s per iteration when loading a "
