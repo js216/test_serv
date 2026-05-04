@@ -23,9 +23,59 @@ MAX_BLOB_BYTES = 512 * 1024 * 1024
 MAX_BLOBS = 64
 MAX_OPS = 4096
 
-CONTROL_VERBS = {
-    "mark", "delay", "inventory", "description", "expect",
+# Single source of truth for control-verb grammar. Each entry:
+#   args:           required key/type pairs at parse time
+#   optional_args:  optional key/type pairs
+#   doc:            human-readable description (rendered into
+#                   bench.ops.json when `inventory` runs)
+#   positional:     True for free-text verbs (description, expect)
+#                   that take "rest of line" as args["text"]; False
+#                   for k=v verbs (mark, delay, inventory).
+#
+# session._run_inventory's _control entry is built from this table.
+# session._run_control dispatches on the verb name. Adding a new
+# control verb means: add a row here, add a case in _run_control;
+# the inventory output is automatic.
+CONTROL_VERB_SPECS = {
+    "mark": {
+        "args": {}, "optional_args": {"tag": "ident"},
+        "doc": "Add a named checkpoint to timeline.log.",
+        "positional": False,
+    },
+    "delay": {
+        "args": {"ms": "int"}, "optional_args": {},
+        "doc": "Sleep for ms milliseconds.",
+        "positional": False,
+    },
+    "inventory": {
+        "args": {}, "optional_args": {},
+        "doc": ("Refresh the device probe list and emit "
+                "bench.devices.json + bench.ops.json into the "
+                "artefact. For an identity-verified sweep, "
+                "POST /sweep first."),
+        "positional": False,
+    },
+    "description": {
+        "args": {}, "optional_args": {"text": "str"},
+        "doc": ("Tag this plan with a short, human-readable "
+                "summary of what it does. Canonical form: "
+                "`description \"<text>\"` (positional, free-form). "
+                "Server extracts the first such line at submit "
+                "time and exposes it in /jobs entries' meta dict."),
+        "positional": True,
+    },
+    "expect": {
+        "args": {}, "optional_args": {"text": "str"},
+        "doc": ("Record a plan-time assertion in "
+                "manifest.expectations[]. Descriptive only -- "
+                "machine-checkable assertions land in "
+                "manifest.checks[] via *_expect ops."),
+        "positional": True,
+    },
 }
+
+CONTROL_VERBS = set(CONTROL_VERB_SPECS)
+
 # `open` and `close` are device-only verbs (always written as
 # `device:open` / `device:close`) -- they live in the device-op
 # branch of plan parsing and session execution, never as bare
@@ -158,19 +208,17 @@ def parse_text(text):
                 raise PlanError(f"line {lineno}: bad device:op {head!r}")
             ops.append(Op(lineno=lineno, device=device, verb=verb,
                           args=_parse_args(rest, lineno)))
-        elif head in ("description", "expect"):
-            # Free-form positional verbs: the rest of the line is the
-            # human-readable claim. `description "<short summary>"` is
-            # the dashboard label; `expect "<assertion>"` records a
-            # plan-time claim in the artefact's manifest.expectations
-            # so a reader sees what the plan was *asserting*, not
-            # just the bytes that happened to flow.
-            args = {"text": Value("str", " ".join(rest))}
+        elif head in CONTROL_VERB_SPECS:
+            spec = CONTROL_VERB_SPECS[head]
+            if spec["positional"]:
+                # Free-form positional verbs (description, expect):
+                # the rest of the line is the human-readable text,
+                # bound to args["text"].
+                args = {"text": Value("str", " ".join(rest))}
+            else:
+                args = _parse_args(rest, lineno)
             ops.append(Op(lineno=lineno, device=None, verb=head,
                           args=args))
-        elif head in CONTROL_VERBS:
-            ops.append(Op(lineno=lineno, device=None, verb=head,
-                          args=_parse_args(rest, lineno)))
         else:
             raise PlanError(
                 f"line {lineno}: unknown verb {head!r} "

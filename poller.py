@@ -147,7 +147,9 @@ def _acquire_poller_lock():
     global _poller_lock_fd
     import fcntl
     path = os.path.join(STATE_DIR, "poller.lock")
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    # O_TRUNC so a previous poller's pid line doesn't leave stale tail
+    # bytes in the file when a different-pid poller wins the lock.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -666,7 +668,9 @@ def _failure_artefact(job_id, message):
     # Same shape as session.pack_artefact's manifest (one schema, one
     # builder) so anything reading manifest.json sees consistent keys
     # whether the run succeeded, errored, or never started. status is
-    # the discriminator.
+    # the discriminator. Identity fields (run_id, plan_digest,
+    # code_digest) MUST be populated even on failure so an aggregator
+    # can group failed runs against their plan + bench code state.
     manifest = make_manifest(
         status="failed",
         t0_monotonic=time.monotonic(),
@@ -678,6 +682,10 @@ def _failure_artefact(job_id, message):
         required_devices=[],
         expectations=[],
         message=message,
+        run_id=f"sess-{uuid.uuid4().hex[:12]}",
+        plan_digest=job_id,
+        code_digest=_CODE_DIGEST,
+        blob_digests={},
     )
     manifest["job_id"] = job_id
     manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode()
@@ -937,6 +945,24 @@ def main():
                         p.kill()
                 except Exception:
                     pass
+            # Wait briefly so the kernel actually reaps each child
+            # before the interpreter exits -- without this, USB
+            # handles held by the children can stay locked on
+            # Windows (TerminateProcess + parent-exit) and the
+            # children's pipe ends remain open in the parent's
+            # daemon-thread .communicate() until process death.
+            for p in zombies:
+                try:
+                    p.wait(timeout=2.0)
+                except Exception:
+                    pass
+                # Close pipe ends so the kernel releases them.
+                for stream in (p.stdout, p.stderr, p.stdin):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except Exception:
+                        pass
         # Try to drain any pending uploads one last time so a cancel
         # artefact lands on the server before we go.
         try:

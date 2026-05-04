@@ -27,7 +27,7 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
                   expectations=None, message=None,
                   files=None, run_id=None, plan_digest=None,
                   code_digest=None, blob_digests=None,
-                  lease_token=None, checks=None):
+                  lease_token=None, checks=None, inert_reason=None):
     """Single source of truth for the artefact ``manifest.json``
     shape. Both the session's success path and the poller's failure-
     artefact path emit through here so the two never drift on field
@@ -70,6 +70,8 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
     }
     if lease_token is not None:
         out["lease_token"] = lease_token
+    if inert_reason is not None:
+        out["inert_reason"] = inert_reason
     if message is not None:
         out["message"] = message
     return out
@@ -113,7 +115,6 @@ class Stream:
         # Running byte total to avoid an O(n) sum on every append.
         self._size = 0
         self._dropped = 0
-        self._truncation_warned = False
 
     def append(self, data):
         if not data:
@@ -128,15 +129,15 @@ class Stream:
                 _, dropped = self.records.pop(0)
                 self._size -= len(dropped)
                 self._dropped += len(dropped)
-            if self._dropped and not self._truncation_warned:
-                marker = (
-                    f"[STREAM TRUNCATED: dropped oldest bytes; cap="
-                    f"{STREAM_MAX_BYTES}B]\n").encode()
-                # Insert at position 0 so render_timeline sees the
-                # marker before the surviving payload.
-                self.records.insert(0, (0.0, marker))
-                self._size += len(marker)
-                self._truncation_warned = True
+            # Truncation marker is rendered on every snapshot rather
+            # than stored in records[]: a previous version inserted a
+            # marker record at index 0 on the first cap-hit, but the
+            # next eviction silently dropped that marker (it was the
+            # oldest record), and the sticky _truncation_warned flag
+            # never re-inserted it. Net result: a stream that
+            # truncated multiple times rendered without any marker.
+            # Now we just track the dropped byte count; snapshot()
+            # synthesizes the marker.
 
     def close(self):
         with self.lock:
@@ -144,7 +145,13 @@ class Stream:
 
     def snapshot_bytes(self):
         with self.lock:
-            return b"".join(d for _, d in self.records)
+            data = b"".join(d for _, d in self.records)
+            if self._dropped:
+                marker = (f"[STREAM TRUNCATED: dropped {self._dropped} "
+                          f"oldest bytes; cap={STREAM_MAX_BYTES}B]\n"
+                          ).encode()
+                data = marker + data
+            return data
 
     def tail_bytes(self, n):
         """Return the last ``n`` bytes of this stream without
@@ -160,16 +167,25 @@ class Stream:
                 if remaining <= 0:
                     break
                 if len(data) >= remaining:
-                    out.append(bytes(data[-remaining:]))
+                    # data is already an immutable bytes from append();
+                    # slicing returns a fresh bytes object, no extra
+                    # copy needed.
+                    out.append(data[-remaining:])
                     remaining = 0
                 else:
-                    out.append(bytes(data))
+                    out.append(data)
                     remaining -= len(data)
         return b"".join(reversed(out))
 
     def snapshot_timestamped(self):
         with self.lock:
-            return list(self.records)
+            recs = list(self.records)
+            if self._dropped:
+                marker = (f"[STREAM TRUNCATED: dropped {self._dropped} "
+                          f"oldest bytes; cap={STREAM_MAX_BYTES}B]\n"
+                          ).encode()
+                recs.insert(0, (0.0, marker))
+            return recs
 
 
 class Session:
@@ -333,9 +349,13 @@ class Session:
         token = v.raw if hasattr(v, "raw") else str(v)
         held = self.registry.lease_resume(token)  # raises on bad token
         self.lease_token = token
+        # Don't include the token in the event message -- the live
+        # /inflight feed exposes events to any tunnel client every
+        # 2.5s, and the token is the lease credential. Same redaction
+        # rule as plugins/lease.py:_op_resume.
         self.log_event(
             "LEASE", "session",
-            f"resume token={token!r} devices={sorted(held)}")
+            f"resumed devices={sorted(held)} (token redacted)")
 
     # --- execution ---
 
@@ -718,6 +738,21 @@ class Session:
         self.registry.refresh()
 
         devices = self.registry.list_devices()
+        # Build the _control plugin entry from the single source of
+        # truth in plan.CONTROL_VERB_SPECS so a new control verb only
+        # has to be defined once. Adding a verb means: update
+        # CONTROL_VERB_SPECS in plan.py + add a case in _run_control;
+        # the dashboard's Ops panel and the artefact's bench.ops.json
+        # update automatically.
+        from plan import CONTROL_VERB_SPECS
+        control_ops = {
+            verb: {
+                "args": dict(spec["args"]),
+                "optional_args": dict(spec["optional_args"]),
+                "doc": spec["doc"],
+            }
+            for verb, spec in CONTROL_VERB_SPECS.items()
+        }
         ops_map = {
             "_control": {
                 "doc": (
@@ -744,56 +779,7 @@ class Session:
                     "session's bench.devices.json (each entry has both\n"
                     "an `id` like `mp135.evb` and a `description` if\n"
                     "the operator put one in config.json)."),
-                "ops": {
-                    "delay": {
-                        "args": {"ms": "int"},
-                        "optional_args": {},
-                        "doc": "Sleep for ms milliseconds.",
-                    },
-                    "description": {
-                        "args": {},
-                        "optional_args": {"text": "str"},
-                        "doc": (
-                            "Tag this plan with a short, human-"
-                            "readable summary of what it does. "
-                            "Canonical form: `description \"flash "
-                            "custom rootfs and verify SSH login\"` "
-                            "(positional, free-form). The server "
-                            "extracts the first such line at submit "
-                            "time and exposes it in /jobs entries' "
-                            "meta dict; the dashboard renders it "
-                            "under the digest. Strongly recommended "
-                            "for any non-trivial plan -- agents who "
-                            "set this make their work easier to "
-                            "triage, cancel, and audit."),
-                    },
-                    "inventory": {
-                        "args": {},
-                        "optional_args": {},
-                        "doc": (
-                            "Refresh the device probe list and return "
-                            "bench.devices.json + bench.ops.json. For an "
-                            "identity-verified sweep, POST /sweep instead."
-                        ),
-                    },
-                    "expect": {
-                        "args": {},
-                        "optional_args": {"text": "str"},
-                        "doc": (
-                            "Record a plan-time assertion in the "
-                            "artefact's manifest.expectations[] so a "
-                            "future reader sees what the plan was "
-                            "asserting (\"the DUT boots to login within "
-                            "60s\"), not just the bytes that flowed. "
-                            "Canonical form: positional, free-form."
-                        ),
-                    },
-                    "mark": {
-                        "args": {},
-                        "optional_args": {"tag": "ident"},
-                        "doc": "Add a named checkpoint to timeline.log.",
-                    },
-                },
+                "ops": control_ops,
             },
         }
         # Job-lifecycle / REST docs used to be jammed in here as a
@@ -907,10 +893,20 @@ def pack_artefact(session):
     # the run actually checked something.
     if n_errors:
         status = "errors"
+        inert_reason = None
     elif not session.checks:
         status = "inert"
+        # Self-explaining artefact: tell a future reader why the run
+        # is inert so they don't have to grep the README to find out
+        # what "inert" means.
+        inert_reason = (
+            "no machine-checkable assertions ran -- "
+            "add a *:uart_expect / scope:capture / msc:verify or "
+            "another op that calls session.record_check() to make "
+            "the run produce a verifiable result")
     else:
         status = "ok"
+        inert_reason = None
     manifest = make_manifest(
         status=status,
         t0_monotonic=session.t0,
@@ -932,6 +928,7 @@ def pack_artefact(session):
         # but would re-expose the credential.
         lease_token=(session.lease_token if session.lease_just_claimed
                      else None),
+        inert_reason=inert_reason,
     )
     manifest_text = json.dumps(manifest, indent=2) + "\n"
 

@@ -294,6 +294,18 @@ class DeviceRegistry:
         the lease just gates *other* agents at lock-acquire time.
         """
         import uuid
+        # Reject lease-plugin internals: the lease plugin probes a
+        # `lease._default` pseudo-device so the registry can route
+        # `lease:claim` ops; an agent claiming `lease._default`
+        # itself would lock every other session out of the lease
+        # subsystem (their lease:claim/release/list would all try
+        # to acquire lease._default and fast-fail on the lease
+        # check). Block it explicitly.
+        for k in devices:
+            if k.startswith("lease."):
+                raise BusyError(
+                    f"lease:claim cannot target the lease plugin's "
+                    f"own pseudo-device ({k!r})")
         # Validate device names against the live spec set so an agent
         # can't claim an arbitrary string ("dsp.A,fakeval,etc"). This
         # also caps the per-claim device list: if the spec set is
@@ -393,13 +405,6 @@ class DeviceRegistry:
 
     # --- internals ---
 
-    def _open_locked(self, key):
-        pname, spec = self.specs[key]
-        pl = self.plugins[pname]
-        handle = pl.open(spec)
-        self.cache[key] = [handle, 1]
-        return handle
-
     def _close_if_cached_locked(self, key):
         entry = self.cache.pop(key, None)
         if entry is None:
@@ -436,13 +441,32 @@ class _Acquire:
         # devices can be acquired concurrently.
         dev_lock.acquire()
         try:
+            # Read the spec / plugin under reg.lock and check the cache,
+            # but release reg.lock BEFORE calling pl.open(). A hung
+            # USB open syscall would otherwise hold reg.lock for the
+            # whole kernel-timeout window, blocking every other reg
+            # consumer (list_devices, refresh, status publisher, every
+            # other session's acquire) -- the bench would freeze even
+            # though only one device is sick. The per-device dev_lock
+            # is held throughout, so two threads can't race to open
+            # the same key.
             with reg.lock:
                 entry = reg.cache.get(key)
-                if entry is None:
-                    handle = reg._open_locked(key)
-                else:
+                if entry is not None:
                     handle = entry[0]
                     entry[1] += 1
+                    self._lock = dev_lock
+                    self.handle = handle
+                    return handle
+                pname, spec = reg.specs[key]
+                pl = reg.plugins[pname]
+            # Plugin call OUTSIDE reg.lock.
+            handle = pl.open(spec)
+            with reg.lock:
+                # Cache may have been populated concurrently by
+                # another acquirer, but we held dev_lock the whole
+                # time so that's impossible; install fresh.
+                reg.cache[key] = [handle, 1]
         except BusyError:
             dev_lock.release()
             raise

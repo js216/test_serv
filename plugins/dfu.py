@@ -14,6 +14,27 @@ from plugin import DevicePlugin, Op
 from . import _usb
 
 
+def _track_subproc(proc):
+    """Register a Popen so the poller's SIGINT shutdown can SIGKILL
+    it. Imported at first call so this module stays importable
+    without poller.py (e.g. plain `python -c "import plugins.dfu"`
+    in a debug session).
+    """
+    try:
+        from poller import register_subprocess
+        register_subprocess(proc)
+    except Exception:
+        pass
+
+
+def _untrack_subproc(proc):
+    try:
+        from poller import unregister_subprocess
+        unregister_subprocess(proc)
+    except Exception:
+        pass
+
+
 CUBEPROG_EXE_DEFAULT = (
     "C:\\Program Files\\STMicroelectronics\\STM32Cube\\"
     "STM32CubeProgrammer\\bin\\STM32_Programmer_CLI.exe"
@@ -52,11 +73,7 @@ def _run_cubeprog(exe, argv_tail, timeout_s, session=None):
             raise TimeoutError(f"cubeprog timed out after {timeout_s}s")
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        from poller import register_subprocess, unregister_subprocess
-        register_subprocess(proc)
-    except ImportError:
-        register_subprocess = unregister_subprocess = None
+    _track_subproc(proc)
     deadline = time.monotonic() + timeout_s
     try:
         while True:
@@ -84,8 +101,7 @@ def _run_cubeprog(exe, argv_tail, timeout_s, session=None):
                     raise TimeoutError(
                         f"cubeprog timed out after {timeout_s}s")
     finally:
-        if unregister_subprocess is not None:
-            unregister_subprocess(proc)
+        _untrack_subproc(proc)
 
 
 def _parse_list_output(stdout):
@@ -245,11 +261,7 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     argv = [exe] + list(argv_tail)
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-    try:
-        from poller import register_subprocess
-        register_subprocess(proc)
-    except ImportError:
-        pass
+    _track_subproc(proc)
 
     seen_running = [False]
     seen_reconnect = [False]
@@ -311,11 +323,7 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     # proc has fully exited and we're past every kill path; drop it
     # from the shutdown registry so a SIGINT after this point doesn't
     # try to SIGKILL an already-reaped pid.
-    try:
-        from poller import unregister_subprocess
-        unregister_subprocess(proc)
-    except ImportError:
-        pass
+    _untrack_subproc(proc)
 
     if reader_err:
         session.log_event("DFU", "dfu:flash_layout",

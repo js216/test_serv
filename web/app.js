@@ -169,7 +169,35 @@ function renderJobs() {
       statusEl = el("span", { class: "tag-warn" },
         j.cancel_pending ? "running (cancel pending)" : "running");
     } else if (j.status === "done") {
-      statusEl = el("span", { class: "tag-ok" }, "done");
+      // The /jobs entry's "done" means a tarball is on disk. The
+      // manifest's own status (ok / inert / errors / failed /
+      // canceled) is the actually-meaningful answer; surface it
+      // distinctly so an "inert" run isn't mistaken for a passing
+      // test, and an "errors" run isn't conflated with "ok".
+      const ms = j.manifest_status;
+      if (ms === "ok") {
+        statusEl = el("span", { class: "tag-ok",
+                                title: "ran, no errors, at least one check fired" },
+                      "ok");
+      } else if (ms === "inert") {
+        statusEl = el("span", { class: "tag-warn",
+                                title: "ran, no errors, but no check fired -- the run proved nothing" },
+                      "inert");
+      } else if (ms === "errors") {
+        statusEl = el("span", { class: "tag-err",
+                                title: "one or more ops raised; see errors.log" },
+                      "errors");
+      } else if (ms === "failed") {
+        statusEl = el("span", { class: "tag-err",
+                                title: "poller refused before run started" },
+                      "failed");
+      } else if (ms === "canceled") {
+        statusEl = el("span", { class: "tag-warn",
+                                title: "DELETE /jobs/<digest> arrived mid-run" },
+                      "canceled");
+      } else {
+        statusEl = el("span", { class: "tag-ok" }, "done");
+      }
     } else {
       statusEl = el("span", { class: "tag-unset" }, j.status || "?");
     }
@@ -420,7 +448,45 @@ async function waitForArtefact(digest) {
   return { status: "timeout" };
 }
 
+// Last lease token observed in any artefact this dashboard has
+// rendered. Persisted in localStorage so a page reload doesn't lose
+// the operator's in-flight lease. Used to auto-fill the
+// REPLACE_WITH_YOUR_TOKEN placeholder in lease_resume.plan /
+// lease_release.plan when the operator picks them from the
+// example dropdown -- otherwise the dashboard lease workflow
+// requires the operator to manually copy a 16-char hex string from
+// manifest.json into the textarea.
+const LEASE_TOKEN_KEY = "test_serv_last_lease_token";
+
+function getStoredLeaseToken() {
+  try { return localStorage.getItem(LEASE_TOKEN_KEY) || ""; }
+  catch (e) { return ""; }
+}
+function setStoredLeaseToken(tok) {
+  try {
+    if (tok) localStorage.setItem(LEASE_TOKEN_KEY, tok);
+    else localStorage.removeItem(LEASE_TOKEN_KEY);
+  } catch (e) {}
+}
+
+async function _maybeStashLeaseToken(digest) {
+  // After a successful claim, manifest.lease_token is set. Capture
+  // it for future resume/release pre-fills.
+  try {
+    const r = await fetch(
+      `/outputs/${digest}/file/manifest.json`, { cache: "no-store" });
+    if (!r.ok) return;
+    const m = await r.json();
+    if (m && m.lease_token) {
+      setStoredLeaseToken(m.lease_token);
+    }
+  } catch (e) {}
+}
+
 async function renderArtefact(digest, result) {
+  // Side-effect: stash any lease token from this run BEFORE rendering
+  // so the next example-picker change can pre-fill it.
+  _maybeStashLeaseToken(digest);
   const out = $("#submit-result");
   if (!out) return;
   out.innerHTML = "";
@@ -538,10 +604,32 @@ $("#example-picker")?.addEventListener("change", async (ev) => {
     const r = await fetch(`/examples/${encodeURIComponent(name)}`,
                           { cache: "no-store" });
     if (!r.ok) throw new Error(`/examples/${name}: ${r.status}`);
-    const text = await r.text();
+    let text = await r.text();
+    // Pre-fill REPLACE_WITH_YOUR_TOKEN with the most recently
+    // observed lease token, so the dashboard lease workflow doesn't
+    // require copy-pasting a 16-char hex string from manifest.json.
+    // The operator can still hand-edit afterwards (which clears the
+    // exampleState so submit goes through plain text, not auto-pack).
+    const stored = getStoredLeaseToken();
+    let substituted = false;
+    if (stored && text.includes("REPLACE_WITH_YOUR_TOKEN")) {
+      text = text.split("REPLACE_WITH_YOUR_TOKEN").join(stored);
+      substituted = true;
+    }
     $("#plan-text").value = text;
-    _exampleState.name = name;
-    _exampleState.original = text;
+    if (substituted) {
+      // The dashboard text now differs from examples/<name>.plan; if
+      // we left exampleState set, submit would route through
+      // /examples/<name>.plan.tar (which would re-fetch the
+      // unsubstituted example with the placeholder, defeating the
+      // auto-fill). Lease plans don't carry @blob refs so plain-text
+      // submit works fine.
+      _exampleState.name = null;
+      _exampleState.original = "";
+    } else {
+      _exampleState.name = name;
+      _exampleState.original = text;
+    }
   } catch (e) {
     alert(`failed to load example: ${e}`);
   }
@@ -645,9 +733,13 @@ $("#run-inventory").addEventListener("click", async () => {
   const btn = $("#run-inventory");
   btn.disabled = true;
   try {
-    // Trigger a full identity sweep server-side, then submit a plain
-    // `inventory` plan to get the freshly-probed snapshot back.
-    // /sweep is async; the poller picks it up on its next tick.
+    // Two-step: POST /sweep first so the poller's next tick re-runs
+    // identity verification, then submit an `inventory` plan to get
+    // the freshly-probed snapshot back. The timestamp in the
+    // description is only there to make the plan-digest unique --
+    // examples/inventory.plan would dedupe to the same digest on
+    // every click and the user would see "stale_outputs" after the
+    // first run instead of fresh state.
     await fetch("/sweep", { method: "POST" });
     const ts = new Date().toISOString();
     await submitPlanText(

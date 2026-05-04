@@ -11,6 +11,22 @@ import config
 from plugin import DevicePlugin, Op
 
 
+def _track_subproc(proc):
+    try:
+        from poller import register_subprocess
+        register_subprocess(proc)
+    except Exception:
+        pass
+
+
+def _untrack_subproc(proc):
+    try:
+        from poller import unregister_subprocess
+        unregister_subprocess(proc)
+    except Exception:
+        pass
+
+
 SSH_TIMEOUT_S = 60
 # `open()`'s identity probe runs `ssh ... uname -a` synchronously --
 # session.canceled is unreachable from there. Cap that probe at a
@@ -41,11 +57,7 @@ def _op_exec(session, h, args):
     session.log_event("SSH", "ssh:exec", cmd)
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
-    try:
-        from poller import register_subprocess, unregister_subprocess
-        register_subprocess(proc)
-    except ImportError:
-        register_subprocess = unregister_subprocess = None
+    _track_subproc(proc)
     deadline = time.monotonic() + SSH_TIMEOUT_S
     stdout = stderr = b""
     try:
@@ -72,8 +84,7 @@ def _op_exec(session, h, args):
                     raise TimeoutError(
                         f"ssh:exec timed out ({SSH_TIMEOUT_S}s)")
     finally:
-        if unregister_subprocess is not None:
-            unregister_subprocess(proc)
+        _untrack_subproc(proc)
     if stdout:
         session.stream("ssh.exec").append(stdout)
     if stderr:
@@ -120,11 +131,7 @@ def _op_trust_host_key(session, h, args):
     proc = subprocess.Popen(
         ["ssh-keygen", "-R", h.ip, "-f", h.known_hosts],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    try:
-        from poller import register_subprocess, unregister_subprocess
-        register_subprocess(proc)
-    except ImportError:
-        register_subprocess = unregister_subprocess = None
+    _track_subproc(proc)
     try:
         while True:
             try:
@@ -140,8 +147,7 @@ def _op_trust_host_key(session, h, args):
                     raise RuntimeError(
                         "ssh:trust_host_key canceled mid-keygen")
     finally:
-        if unregister_subprocess is not None:
-            unregister_subprocess(proc)
+        _untrack_subproc(proc)
     # Append the new entry IP-prefixed; ssh-keygen leaves the file
     # without a trailing newline, so emit one before our line.
     with open(h.known_hosts, "ab") as f:

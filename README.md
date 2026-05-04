@@ -41,11 +41,13 @@ from the bench host, typically via an operator-managed SSH tunnel
 
 ### environment
 
-| variable           | purpose                                      | default                                |
-|--------------------|----------------------------------------------|----------------------------------------|
-| `TEST_SERV_DIR`    | state dir for inputs/outputs/done/status     | `<tmp>/test_serv-<user>`               |
-| `TEST_SERV_CONFIG` | absolute path to `config.json`               | `$TEST_SERV_DIR/config.json` then repo |
-| `TEST_SERV_URL`    | base URL the agent clients post against      | `http://localhost:8080`                |
+| variable              | purpose                                      | default                                |
+|-----------------------|----------------------------------------------|----------------------------------------|
+| `TEST_SERV_DIR`       | state dir for inputs/outputs/done/status     | `~/.local/share/test_serv` (POSIX)     |
+| `TEST_SERV_CONFIG`    | absolute path to `config.json`               | `$TEST_SERV_DIR/config.json` then repo |
+| `TEST_SERV_URL`       | base URL the agent clients post against      | `http://localhost:8080`                |
+| `TEST_SERV_BENCH_ID`  | label embedded in every artefact's manifest  | unset (manifest field stays `null`)    |
+| `TEST_SERV_PORT`      | port the poller connects to (and server binds, via --port) | `8080`                   |
 
 ### first plan
 
@@ -199,8 +201,9 @@ next, or a multi-agent bench where another agent must not grab the
 device between two of your submissions.
 
 ```
-# plan 1: claim dsp.A for ten minutes; the token is written to the
-# artefact's streams/lease.token.bin
+# plan 1: claim dsp.A for ten minutes. The issued token is written
+# ONLY to manifest.lease_token in the artefact -- not into a stream
+# or timeline event -- so the live /inflight feed doesn't expose it.
 lease:claim devices="dsp.A" duration_s=600
 
 # plan 2..N: resume and do work; other agents get fast BusyError if
@@ -212,6 +215,12 @@ dsp.A:uart_open
 # plan N+1: release early (or just let the duration expire)
 lease:resume token="abc1234..."
 lease:release token="abc1234..."
+```
+
+To read the token:
+```
+python3 submit.py examples/lease_claim.plan --wait 5 --extract /tmp/lease
+python3 -c 'import json; print(json.load(open("/tmp/lease/manifest.json"))["lease_token"])'
 ```
 
 Lease state is in-memory on the poller. A poller restart drops every
@@ -312,3 +321,21 @@ curl -X POST http://localhost:8080/devices/dsp.A/release
 
 This closes the handle only if no job is currently using it. The next
 job reopens the device.
+
+### Automated Test
+
+`run_md.py` looks for this heading by default, runs the fenced plan(s)
+below it through the same REST API as `submit.py`, and checks each
+bullet against the resulting artefact via a sibling `verify.py` the
+operator writes per-bench. The shipped block is a smoke test:
+
+```
+description "smoke: probe the bench"
+inventory
+```
+
+- `bench.devices.json` exists in the artefact
+
+Run with `python3 run_md.py --server http://localhost:8080`. The
+default `verify.py` in this repo just checks that the named file
+appears in `streams/` -- replace it for real bench tests.

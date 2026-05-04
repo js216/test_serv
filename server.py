@@ -238,6 +238,38 @@ def queue_job(body, meta=None):
     return digest, "queued"
 
 
+_manifest_status_cache = {}  # tar_path -> (mtime, status_str)
+
+
+def _peek_manifest_status(tar_path):
+    """Pull manifest.json's status field out of an artefact tar
+    cheaply, with a tiny mtime-keyed cache so /jobs polling doesn't
+    re-tar-open the same files. Returns None on any error -- the
+    dashboard falls back to the file-level "done" tag.
+    """
+    try:
+        st = os.stat(tar_path)
+    except OSError:
+        return None
+    cached = _manifest_status_cache.get(tar_path)
+    if cached and cached[0] == st.st_mtime:
+        return cached[1]
+    try:
+        with tarfile.open(tar_path, "r") as tf:
+            f = tf.extractfile("manifest.json")
+            if f is None:
+                return None
+            data = json.loads(f.read().decode("utf-8", "replace"))
+            status = data.get("status")
+    except (tarfile.TarError, KeyError, ValueError, OSError):
+        status = None
+    # Cap cache to a few thousand entries to avoid unbounded growth.
+    if len(_manifest_status_cache) > 4096:
+        _manifest_status_cache.clear()
+    _manifest_status_cache[tar_path] = (st.st_mtime, status)
+    return status
+
+
 def parse_output_name(name):
     tail = name.rsplit("/", 1)[-1]
     digest, ext = os.path.splitext(tail)
@@ -835,6 +867,15 @@ class Handler(BaseHTTPRequestHandler):
                 entry = jobs.get(digest, {"digest": digest, "size_bytes": 0})
                 entry["status"] = "done"
                 entry["completed_at"] = mtime
+                # Pull manifest.status out of the .tar so the dashboard
+                # can distinguish ok / inert / errors / failed /
+                # canceled. Cheap: small tar, manifest.json is the
+                # first member usually. Failures here just leave the
+                # entry as "done"; the agent can fetch the tar to see.
+                tar_path = os.path.join(OUTPUTS, f"{digest}.tar")
+                ms = _peek_manifest_status(tar_path)
+                if ms:
+                    entry["manifest_status"] = ms
                 jobs[digest] = entry
         except FileNotFoundError:
             pass
