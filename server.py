@@ -161,6 +161,103 @@ def delete_outputs(digest, ext=""):
     return removed
 
 
+JOBS_HELP = """\
+test_serv job-control REST API
+==============================
+
+These endpoints are how agents drive the queue. They're served by
+server.py on the test_serv host (typically reached over an SSH
+tunnel as http://localhost:8080).
+
+Submitting a plan
+-----------------
+  POST /submit         binary plan-tar (plan.txt + arbitrary blobs).
+  POST /submit-text    plain plan.txt body, no blobs. Convenience for
+                       agents that don't want to build a tar.
+
+  Both return JSON: {"status": "queued", "digest": "<sha256>"}.
+  413 if the body exceeds the per-call cap; 409 with status="duplicate"
+  if the same digest is already queued; 409 status="stale_outputs"
+  if outputs for the digest still exist (DELETE them first).
+
+Inspecting jobs
+---------------
+  GET    /jobs           list every job server-side with status
+                         (queued, running, done), timestamps, and the
+                         per-submission meta dict (X-Test-* headers
+                         and the in-plan `description` line).
+  DELETE /jobs           prune stale-running entries (DONE/.plan with
+                         no corresponding artefact). Use after a poller
+                         crash to clean up the listing.
+  DELETE /jobs/all       wipe every job record (queued, running, done).
+                         NOT a force cancel of a running session.
+
+Cancellation
+------------
+  DELETE /jobs/<digest>  cancel.
+                         If still queued, the server unlinks the .plan
+                         before the poller picks it up; returns
+                         {"status": "canceled_queued"}.
+                         If in-flight, the server drops a marker;
+                         the poller signals the running session to
+                         abort at the next op boundary; returns
+                         {"status": "cancel_signaled"}. The artefact
+                         eventually lands in OUTPUTS with the cancel
+                         reason in errors.log.
+
+  Cancellation is between-op in v1: an op already mid-subprocess
+  (cubeprog flash, large MSC write) won't abort until that op
+  returns and the runner checks the flag. Long-running plugin ops
+  honour the flag at chunk/poll boundaries -- mid-op cancel is
+  responsive in seconds for the standard flash/UART/scope ops.
+
+Fetching artefacts
+------------------
+  GET    /outputs/<digest>.txt   sentinel manifest (small JSON).
+  GET    /outputs/<digest>.tar   full artefact tar (logs, traces, etc.).
+  GET    /outputs/<digest>/manifest        web UI: list tar members.
+  GET    /outputs/<digest>/file/<member>   web UI: extract one file.
+  DELETE /outputs/<digest>       remove .txt + .tar AND the DONE/.plan
+                                 record. Strongly recommended after a
+                                 successful fetch -- otherwise the
+                                 entry lingers in the listing.
+
+Per-submission metadata
+-----------------------
+In-plan: a top-level `description "<short summary>"` line is the
+recommended way to label the job. The server pre-extracts that line
+at submit time and exposes it in the meta dict of /jobs entries,
+so the dashboard and other agents can triage the queue without
+opening the artefact. The line is also a real control verb -- it
+logs to timeline -- so the artefact stays self-describing.
+
+HTTP headers: every header `X-Test-<Name>: <value>` is captured and
+stored alongside the plan, exposed as the meta dict on /jobs
+entries. Two are honoured by the runner itself:
+    X-Test-Runtime        per-session deadline in seconds; clamped
+                          to [1, 3600], default 600.
+    X-Test-Upload-Timeout artefact-POST timeout in seconds;
+                          clamped to [1, 3600], default 600.
+
+Other useful endpoints
+----------------------
+  GET  /devices          poller's device-probe snapshot (cached).
+  GET  /ops              poller's bench.ops.json (full plugin/op map).
+  GET  /leases           current lease holders.
+  GET  /examples         list of bundled starter plan files.
+  GET  /examples/<name>  fetch one example plan as text/plain.
+  POST /devices/<id>/release    drop the lease on <id>.
+  POST /sweep                   trigger a probe + verify pass.
+
+Discovery for agents
+--------------------
+The plan-grammar verbs and the per-plugin op signatures are
+returned by `inventory` in a plan, NOT by /help -- run a small
+plan with `inventory verify=true` to get bench.devices.json and
+bench.ops.json. /help only documents the HTTP surface above.
+"""
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "test_serv/2"
 
@@ -189,6 +286,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._list_examples()
         if path.startswith("examples/"):
             return self._fetch_example(path[len("examples/"):])
+        if path == "help":
+            return self._help()
         # Artefact tar extraction endpoints (web UI). Order matters:
         # manifest and file before the bare /outputs/<digest>.<ext>
         # fetch, since they're more specific.
@@ -814,6 +913,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
             return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _help(self):
+        body = JOBS_HELP.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
