@@ -11,6 +11,7 @@ import random
 import re
 import tarfile
 import threading
+import time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
@@ -157,6 +158,18 @@ def parse_output_name(name):
 
 
 def delete_outputs(digest, ext=""):
+    """Remove output files for ``digest``.
+
+    DELETE /outputs/<digest> (no ext) drops every artefact AND the
+    DONE/<digest>.plan record so the job disappears from /jobs.
+    Single-call cleanup after an agent has fetched its artefact is
+    the typical flow; calling DELETE /jobs/<digest> separately would
+    just be more round-trips for the same outcome.
+
+    DELETE /outputs/<digest>.<ext> (specific ext) drops only that
+    file -- e.g. just the .tar or just the .txt -- and leaves the
+    job record alone.
+    """
     names = ([f"{digest}{ext}"] if ext else [
         n for n in os.listdir(OUTPUTS) if n.startswith(f"{digest}.")
     ])
@@ -167,11 +180,6 @@ def delete_outputs(digest, ext=""):
             removed += 1
         except FileNotFoundError:
             pass
-    # When the caller drops *all* outputs for a digest (no specific
-    # ext), also clear the DONE/<digest>.plan record. Otherwise the
-    # job sits in the listing as "running" forever -- the poller
-    # picked it up at some point and the .plan stayed in DONE even
-    # though everyone else has forgotten about it.
     if not ext:
         for tail in (".plan", ".plan.meta"):
             try:
@@ -498,6 +506,13 @@ class Handler(BaseHTTPRequestHandler):
         # dashboard would then try to render.
         _write_atomic(
             os.path.join(OUTPUTS, f"{digest}.{ext_bare}"), body)
+        # Drop any stale cancel marker for this digest -- the job is
+        # done now, so /cancels won't keep returning the marker and a
+        # re-submit of the same digest won't trigger a phantom cancel.
+        try:
+            os.unlink(os.path.join(CANCEL, digest))
+        except FileNotFoundError:
+            pass
         self.send_response(200)
         self.end_headers()
 
@@ -753,20 +768,31 @@ class Handler(BaseHTTPRequestHandler):
             json.dumps({"status": "ok", **counts}).encode())
 
     def _pull_cancels(self):
-        """Return the current set of cancel markers and remove them.
-        The poller calls this on its main loop tick; the markers are
-        consumed atomically so duplicate signals don't fire.
+        """Return the current set of cancel markers. Markers are NOT
+        deleted on read -- the poller's signal_cancel is idempotent,
+        and persistent markers close the pickup-vs-dispatch race
+        (cancel arrives while a worker is mid-dispatch but hasn't
+        registered the Session yet, so the next tick re-finds it).
+        Markers are unlinked when the matching artefact arrives
+        (see _artefact). Old markers (>5 min) are GC'd here as a
+        safety net for jobs that never produced an artefact.
         """
+        cutoff = time.time() - 300.0
         try:
             names = [n for n in os.listdir(CANCEL) if SAFE_DIGEST_RE.match(n)]
         except FileNotFoundError:
             names = []
+        live = []
         for n in names:
+            p = os.path.join(CANCEL, n)
             try:
-                os.unlink(os.path.join(CANCEL, n))
+                if os.path.getmtime(p) < cutoff:
+                    os.unlink(p)
+                else:
+                    live.append(n)
             except FileNotFoundError:
                 pass
-        return self._send_json(json.dumps(names).encode())
+        return self._send_json(json.dumps(live).encode())
 
     # --- examples ---
 

@@ -7,22 +7,6 @@ picks it up, walks the plan against a plugin registry, drives hardware,
 and posts a single `.tar` artefact back carrying a merged timeline, raw
 streams, and a JSON manifest.
 
-### agent workflow
-
-Use `submit.py --server URL` or set `TEST_SERV_URL`.
-
-Bench discovery is a normal job:
-
-```
-printf 'inventory\n' > /tmp/inventory.txt
-python3 submit.py --server http://localhost:8080 /tmp/inventory.txt --extract /tmp/test-serv-inventory --wait 30
-cat /tmp/test-serv-inventory/streams/bench.devices.json.bin
-cat /tmp/test-serv-inventory/streams/bench.ops.json.bin
-```
-
-For a full identity-verified sweep before returning the device list,
-`POST /sweep` first; `inventory` itself only refreshes the probe.
-
 ### install
 
 The server (`server.py`) and the agent clients (`submit.py`,
@@ -44,14 +28,6 @@ Bench-host system tools (not pip):
   drive. The script writes `/etc/udev/rules.d/99-bench-usb.rules`
   and reloads. Replug devices afterwards.
 
-### environment
-
-| variable           | purpose                                      | default                                |
-|--------------------|----------------------------------------------|----------------------------------------|
-| `TEST_SERV_DIR`    | state dir for inputs/outputs/done/status     | `<tmp>/test_serv-<user>`               |
-| `TEST_SERV_CONFIG` | absolute path to `config.json`               | `$TEST_SERV_DIR/config.json` then repo |
-| `TEST_SERV_URL`    | base URL the agent clients post against      | `http://localhost:8080`                |
-
 ### running
 
 ```
@@ -62,6 +38,28 @@ python3 poller.py                      # bench host
 `poller.py` must be able to reach `server.py` at `localhost:8080`
 from the bench host, typically via an operator-managed SSH tunnel
 (`ssh -R 8080:localhost:8080 bench-host`).
+
+### environment
+
+| variable           | purpose                                      | default                                |
+|--------------------|----------------------------------------------|----------------------------------------|
+| `TEST_SERV_DIR`    | state dir for inputs/outputs/done/status     | `<tmp>/test_serv-<user>`               |
+| `TEST_SERV_CONFIG` | absolute path to `config.json`               | `$TEST_SERV_DIR/config.json` then repo |
+| `TEST_SERV_URL`    | base URL the agent clients post against      | `http://localhost:8080`                |
+
+### first plan
+
+A trivial inventory plan, end to end:
+
+```
+printf 'inventory\n' > /tmp/inventory.txt
+python3 submit.py --server http://localhost:8080 /tmp/inventory.txt --extract /tmp/inv --wait 30
+cat /tmp/inv/streams/bench.devices.json.bin   # devices the poller can see
+cat /tmp/inv/streams/bench.ops.json.bin       # per-plugin op signatures
+```
+
+For a full identity-verified sweep before returning the device list,
+`POST /sweep` first; `inventory` itself only refreshes the probe.
 
 ### submit a job
 
@@ -91,21 +89,23 @@ python3 run_md.py --fresh --block 0
 
 Agents can use HTTP directly against the server base URL.
 
-Submit a packed `.plan` tar:
+Submit:
 
 ```
 POST /submit
 Content-Type: application/octet-stream
 
-<plan tar bytes>
+<plan tar OR plain plan.txt body>
 ```
 
-Response:
+Server sniffs the body: a packed plan tar (plan.txt + blobs) is queued
+as-is; a plain plan.txt body is wrapped in a tar server-side. Response:
 
 ```
-201 {"status": "queued", "digest": "<sha256>"}
-409 {"status": "duplicate", "digest": "<sha256>"}
+201 {"status": "queued",        "digest": "<sha256>"}
+409 {"status": "duplicate",     "digest": "<sha256>"}
 409 {"status": "stale_outputs", "digest": "<sha256>"}
+413 {"status": "too_large", "limit": <bytes>}
 ```
 
 Two optional request headers tune the poller:
@@ -125,51 +125,26 @@ GET  /outputs/<digest>.tar    # full artefact
 After a successful fetch, clean up server-held results:
 
 ```
-DELETE /outputs/<digest>
+DELETE /outputs/<digest>      # drops outputs AND the job record
 ```
 
-Discovery helpers:
+Cancel a job (queued or in-flight):
 
 ```
-GET /examples
-GET /examples/<name>
-POST /sweep
-POST /devices/<device-id>/release
+DELETE /jobs/<digest>
 ```
 
-### discover what is available
-
-For bench hardware and bench-supported ops, use the inventory job shown
-above. It returns the authoritative poller-side view.
-
-Local server helpers:
+Inspect:
 
 ```
-curl http://localhost:8080/examples       # starter plan names
-curl http://localhost:8080/examples/NAME  # fetch one
+GET /jobs                     # list every job (queued, running, done)
+GET /devices                  # poller's device-probe snapshot
+GET /ops                      # bench.ops.json (full plugin/op map)
+GET /examples                 # bundled starter plan names
+GET /examples/<name>          # fetch one
+POST /sweep                   # trigger a probe + verify pass
+POST /devices/<id>/release    # drop an idle cached handle
 ```
-
-### device config
-
-All per-instance parameters -- COM ports, USB VID/PID, FTDI descriptors,
-VISA resources, SSH target, cubeprog path, expected identity strings --
-live in `config.json`. Search order: `$TEST_SERV_CONFIG`,
-`$TEST_SERV_DIR/config.json`, repo-root `config.json`. First hit wins.
-
-Each plugin's `instances` entry can specify either a hard port
-(`serial_port`: "COM15") or an `autodetect` rule (`{ "vid": "0x0483",
-"pid": "0x3753", "interface": 1 }`). Autodetect follows the board
-across Windows re-enumerations; no code edits needed.
-
-### identity verification
-
-On startup the poller performs one full sweep: every probed device is
-opened, its plugin runs an identity handshake (`?` reply, `*IDN?`,
-`uname -a`, ...) against the expected substring in `config.json`, then
-the handle is immediately released. A summary table is printed and
-exposed via `/devices`. A REST-triggered `POST /sweep` re-runs the
-same sweep at any time. Identity mismatch becomes a clear failure
-instead of a run that silently drives the wrong device.
 
 ### plan grammar (complete)
 
@@ -224,6 +199,28 @@ streams/NAME.bin      raw bytes per stream (uart, scope csv, prbs mismatches...)
 
 Read `manifest.json` first, then `timeline.log`. Pull `streams/*.bin`
 only when raw bytes are needed.
+
+### device config
+
+All per-instance parameters -- COM ports, USB VID/PID, FTDI descriptors,
+VISA resources, SSH target, cubeprog path, expected identity strings --
+live in `config.json`. Search order: `$TEST_SERV_CONFIG`,
+`$TEST_SERV_DIR/config.json`, repo-root `config.json`. First hit wins.
+
+Each plugin's `instances` entry can specify either a hard port
+(`serial_port`: "COM15") or an `autodetect` rule (`{ "vid": "0x0483",
+"pid": "0x3753", "interface": 1 }`). Autodetect follows the board
+across Windows re-enumerations; no code edits needed.
+
+### identity verification
+
+On startup the poller performs one full sweep: every probed device is
+opened, its plugin runs an identity handshake (`?` reply, `*IDN?`,
+`uname -a`, ...) against the expected substring in `config.json`, then
+the handle is immediately released. A summary table is printed and
+exposed via `/devices`. A REST-triggered `POST /sweep` re-runs the
+same sweep at any time. Identity mismatch becomes a clear failure
+instead of a run that silently drives the wrong device.
 
 ### security model
 

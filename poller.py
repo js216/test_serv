@@ -30,25 +30,14 @@ RELEASE = os.path.join(STATE_DIR, "release")
 SWEEP = os.path.join(STATE_DIR, "sweep")
 LOG = os.path.join(STATE_DIR, "log.txt")
 
-# digest -> Session (or _PendingSlot) for jobs the poller has picked
-# up but not yet finished. _PendingSlot fills the window between
-# pickup and Session construction so a cancel arriving in that gap
-# isn't silently consumed -- the slot records canceled=True and the
-# dispatcher transcribes it onto the real Session as soon as that
-# Session exists.
+# digest -> Session for jobs the poller has picked up and finished
+# constructing. _drain_cancels signals against this map; the server
+# keeps cancel markers across drain ticks (and the artefact-upload
+# path unlinks them), so a cancel that arrives mid-dispatch -- before
+# the Session is registered here -- is found again on the next tick
+# once the Session has landed in the map.
 _active_sessions = {}
 _active_lock = threading.Lock()
-
-
-class _PendingSlot:
-    """Stand-in for a not-yet-constructed Session; matches the subset
-    of the Session API used by _drain_cancels.signal_cancel."""
-
-    def __init__(self):
-        self.canceled = False
-
-    def signal_cancel(self):
-        self.canceled = True
 
 
 class _Tee:
@@ -354,46 +343,36 @@ def _print_device_table(verify_map, registry):
 def _dispatch(payload, headers, registry, plugins_by_name):
     job_id = hashlib.sha256(payload).hexdigest()
     tag = f"[{job_id[:8]}]"
-    # Register a placeholder slot in _active_sessions BEFORE any heavy
-    # work. A cancel arriving during plan.load_tar / validation /
-    # Session construction now lands on the slot instead of being
-    # consumed by /cancels and silently dropped.
-    slot = _PendingSlot()
-    with _active_lock:
-        _active_sessions[job_id] = slot
+    from session import DEFAULT_SESSION_S, MAX_SESSION_S
+    runtime_s = _meta_float(headers, "Runtime",
+                            DEFAULT_SESSION_S, MAX_SESSION_S)
+    upload_s = _meta_float(headers, "Upload-Timeout",
+                           DEFAULT_UPLOAD_S, MAX_UPLOAD_S)
     try:
-        from session import DEFAULT_SESSION_S, MAX_SESSION_S
-        runtime_s = _meta_float(headers, "Runtime",
-                                DEFAULT_SESSION_S, MAX_SESSION_S)
-        upload_s = _meta_float(headers, "Upload-Timeout",
-                               DEFAULT_UPLOAD_S, MAX_UPLOAD_S)
-        try:
-            parsed = plan.load_tar(payload)
-        except plan.PlanError as e:
-            print(datetime.now(), tag,
-                  f"pickup {len(payload)} B  devices=?  parse failed: {e}")
-            tar = _failure_artefact(job_id, f"plan parse failed: {e}")
-            _post_artefact(job_id, tar, upload_s)
-            return
-
-        needed = sorted(plan.required_devices(parsed))
-        devs = ",".join(needed) if needed else "(none)"
+        parsed = plan.load_tar(payload)
+    except plan.PlanError as e:
         print(datetime.now(), tag,
-              f"pickup {len(payload)} B  devices={devs}")
+              f"pickup {len(payload)} B  devices=?  parse failed: {e}")
+        tar = _failure_artefact(job_id, f"plan parse failed: {e}")
+        _post_artefact(job_id, tar, upload_s)
+        return
 
-        try:
-            _validate_against_plugins(parsed, plugins_by_name, registry)
-        except Exception as e:
-            tar = _failure_artefact(job_id, f"validation: {e}")
-            _post_artefact(job_id, tar, upload_s)
-            return
+    needed = sorted(plan.required_devices(parsed))
+    devs = ",".join(needed) if needed else "(none)"
+    print(datetime.now(), tag,
+          f"pickup {len(payload)} B  devices={devs}")
 
-        session = Session(registry, parsed, runtime_s=runtime_s)
-        # Transcribe any cancel that landed on the slot during parse.
-        if slot.canceled:
-            session.signal_cancel()
-        with _active_lock:
-            _active_sessions[job_id] = session
+    try:
+        _validate_against_plugins(parsed, plugins_by_name, registry)
+    except Exception as e:
+        tar = _failure_artefact(job_id, f"validation: {e}")
+        _post_artefact(job_id, tar, upload_s)
+        return
+
+    session = Session(registry, parsed, runtime_s=runtime_s)
+    with _active_lock:
+        _active_sessions[job_id] = session
+    try:
         session.run_all(plugins_by_name)
         tar, _manifest_text = pack_artefact(session)
         _post_artefact(job_id, tar, upload_s)
