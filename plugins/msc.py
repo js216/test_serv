@@ -100,7 +100,14 @@ def _op_write(session, h, args):
             if n <= 0:
                 raise IOError(f"write stalled at {written}/{total}")
             written += n
-        os.fsync(fd)
+        # Skip fsync on cancel: cancel observed AT the bottom of the
+        # loop means the write completed but the agent already wants
+        # out -- making them wait several seconds for the kernel to
+        # flush a 100 MB buffer to USB just to abandon the result is
+        # the wrong tradeoff. The kernel will flush in the background;
+        # the next msc op opens the device fresh and sees current state.
+        if not session.canceled:
+            os.fsync(fd)
     finally:
         os.close(fd)
     session.log_event(

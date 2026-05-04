@@ -20,6 +20,11 @@ CUBEPROG_EXE_DEFAULT = (
 )
 FLASH_TIMEOUT_S = 600
 LIST_TIMEOUT_S = 30
+# `cubeprog -l usb` from open()/probe() runs synchronously with no
+# session cancel hook reachable; cap it tighter than the
+# session-aware LIST_TIMEOUT_S so cancel observed elsewhere isn't
+# blocked behind a wedged probe.
+LIST_NOSESSION_TIMEOUT_S = 5
 
 # Accept only safe blob-name characters -- no path separators, no '..',
 # no shell metacharacters. Applied to every @blob reference inside a
@@ -402,7 +407,8 @@ class DfuPlugin(DevicePlugin):
         # the single authoritative source, takes ~1 s, and is
         # side-effect-free (pure USB listing).
         try:
-            result = _run_cubeprog(cubeprog, ["-l", "usb"], LIST_TIMEOUT_S)
+            result = _run_cubeprog(
+                cubeprog, ["-l", "usb"], LIST_NOSESSION_TIMEOUT_S)
         except Exception:
             return []
         if result.returncode != 0:
@@ -450,7 +456,7 @@ class DfuPlugin(DevicePlugin):
                 f"config; refuse to open since multi-board benches can "
                 f"silently flash the wrong device without it")
         result = _run_cubeprog(
-            spec["cubeprog_exe"], ["-l", "usb"], LIST_TIMEOUT_S)
+            spec["cubeprog_exe"], ["-l", "usb"], LIST_NOSESSION_TIMEOUT_S)
         if result.returncode != 0:
             raise RuntimeError(
                 f"dfu: cubeprog -l usb exit={result.returncode}: "
