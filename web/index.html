@@ -93,6 +93,13 @@
   <section id="submit-section">
     <h2>Submit a plan</h2>
     <p class="hint">No-blob plans only. For blob attachments use submit.py / the REST API directly.</p>
+    <div class="row">
+      <label>load example
+        <select id="example-picker" title="Load a bundled starter plan into the editor below.">
+          <option value="">(choose one)</option>
+        </select>
+      </label>
+    </div>
     <textarea id="plan-text" rows="8"
               placeholder='description "short summary of what this plan does"&#10;lease:list&#10;# or any multi-op plan'></textarea>
     <div class="row">

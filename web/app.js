@@ -514,6 +514,38 @@ $("#claim-form").addEventListener("submit", async (e) => {
   await submitPlanText(lines.join("\n") + "\n");
 });
 
+// Populate the example-picker dropdown from GET /examples and load
+// the chosen plan into the textarea on change. Plain text fetch --
+// /examples/<name> serves the .plan body as text/plain.
+async function loadExamples() {
+  const sel = $("#example-picker");
+  if (!sel) return;
+  let names;
+  try {
+    names = await jget("/examples");
+  } catch (e) {
+    return;
+  }
+  for (const n of names) {
+    sel.appendChild(el("option", { value: n }, n));
+  }
+}
+
+$("#example-picker")?.addEventListener("change", async (ev) => {
+  const name = ev.target.value;
+  if (!name) return;
+  try {
+    const r = await fetch(`/examples/${encodeURIComponent(name)}`,
+                          { cache: "no-store" });
+    if (!r.ok) throw new Error(`/examples/${name}: ${r.status}`);
+    $("#plan-text").value = await r.text();
+  } catch (e) {
+    alert(`failed to load example: ${e}`);
+  }
+});
+
+loadExamples();
+
 $("#submit-plan-btn").addEventListener("click", async () => {
   const text = $("#plan-text").value;
   if (!text.trim()) return;
