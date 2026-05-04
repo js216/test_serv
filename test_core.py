@@ -680,10 +680,14 @@ def test_failure_artefact_carries_identity_fields():
 
 
 def test_prune_skips_inflight_digests():
-    """Reviewer P / round-8 P1: clear-stale must not unlink DONE/.plan
-    of digests the poller currently considers in flight. Without this
-    guard, a long-running job whose DONE/.plan is written but whose
-    OUTPUTS/.tar hasn't posted yet would be silently destroyed.
+    """Reviewer P / round-8 P1 + round-12-extra: clear-stale must not
+    unlink DONE/.plan of:
+      a) digests the poller's published inflight.json says are live, OR
+      b) digests whose DONE/.plan was created less than PRUNE_MIN_AGE_S
+         seconds ago (covers the publish-lag window before the first
+         inflight push reaches the server -- a 105ms lease op finishes
+         long before STATUS/inflight.json catches up).
+    Old, non-inflight DONE/.plan files do get pruned.
     """
     with tempfile.TemporaryDirectory() as tmp:
         old_dirs = (server.INPUTS, server.OUTPUTS, server.DONE,
@@ -698,12 +702,19 @@ def test_prune_skips_inflight_digests():
                   server.STATUS, server.RELEASE, server.SWEEP):
             os.makedirs(d, mode=0o700, exist_ok=True)
         try:
-            live = "a" * 64
-            stale = "b" * 64
-            for digest in (live, stale):
+            live = "a" * 64    # in inflight, old mtime
+            stale = "b" * 64   # not in inflight, old mtime -- prunable
+            fresh = "c" * 64   # not in inflight, new mtime -- protected
+            for digest in (live, stale, fresh):
                 with open(os.path.join(server.DONE, f"{digest}.plan"),
                           "wb") as f:
                     f.write(b"plan-bytes\n")
+            # Backdate `live` and `stale` past PRUNE_MIN_AGE_S so the
+            # mtime guard doesn't shadow the inflight test.
+            old_t = time.time() - server.PRUNE_MIN_AGE_S - 1.0
+            for digest in (live, stale):
+                os.utime(os.path.join(server.DONE, f"{digest}.plan"),
+                         (old_t, old_t))
             with open(os.path.join(server.STATUS, "inflight.json"),
                       "wb") as f:
                 f.write(json.dumps([{"digest": live}]).encode())
@@ -713,6 +724,9 @@ def test_prune_skips_inflight_digests():
             assert os.path.exists(
                 os.path.join(server.DONE, f"{live}.plan")), \
                 "in-flight digest must survive prune"
+            assert os.path.exists(
+                os.path.join(server.DONE, f"{fresh}.plan")), \
+                "fresh DONE/.plan must survive prune (mtime guard)"
             assert not os.path.exists(
                 os.path.join(server.DONE, f"{stale}.plan")), \
                 "non-inflight stale digest must be pruned"
@@ -725,6 +739,49 @@ def test_prune_skips_inflight_digests():
         finally:
             (server.INPUTS, server.OUTPUTS, server.DONE,
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
+
+
+def test_delete_outputs_no_op_when_nothing_to_delete():
+    """An agent's DELETE /outputs/<digest> can race a fresh re-pickup
+    of the same digest: agent thinks it's cleaning up after a fetch,
+    server has already moved INPUTS/.plan to DONE/.plan for the new
+    pickup. If delete_outputs unconditionally removes DONE/.plan,
+    the live session's eventual artefact upload 409s and the spool
+    is parked under refused/.
+
+    Rule: only remove DONE/<digest>.plan if at least one OUTPUTS file
+    was actually removed. A bare DELETE for a digest with no OUTPUTS
+    is a no-op (idempotent).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dirs = (server.OUTPUTS, server.DONE)
+        server.OUTPUTS = os.path.join(tmp, "outputs")
+        server.DONE = os.path.join(tmp, "done")
+        for d in (server.OUTPUTS, server.DONE):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            d = "a" * 64
+            with open(os.path.join(server.DONE, f"{d}.plan"), "wb") as f:
+                f.write(b"freshly-picked-up\n")
+
+            # No OUTPUTS for this digest. Stale DELETE comes in.
+            removed = server.delete_outputs(d, "")
+            assert removed == 0
+            assert os.path.exists(
+                os.path.join(server.DONE, f"{d}.plan")), \
+                "fresh DONE/.plan must survive a stale DELETE /outputs"
+
+            # Now the legitimate flow: an artefact lands, then DELETE.
+            with open(os.path.join(server.OUTPUTS, f"{d}.tar"),
+                      "wb") as f:
+                f.write(b"x")
+            removed = server.delete_outputs(d, "")
+            assert removed == 1
+            assert not os.path.exists(
+                os.path.join(server.DONE, f"{d}.plan")), \
+                "DONE/.plan must be removed after a real DELETE"
+        finally:
+            server.OUTPUTS, server.DONE = old_dirs
 
 
 def test_multi_instance_plan_holds_all_dev_locks_for_session():
@@ -827,6 +884,7 @@ def main():
         test_lease_claim_rejects_lease_pseudo_device,
         test_failure_artefact_carries_identity_fields,
         test_prune_skips_inflight_digests,
+        test_delete_outputs_no_op_when_nothing_to_delete,
         test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,
     ]

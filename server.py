@@ -138,6 +138,9 @@ def _queued_plan_count():
         return 0
 
 
+PRUNE_MIN_AGE_S = 30.0
+
+
 def prune_stale_jobs():
     """Remove DONE/<digest>.plan files whose digests have no OUTPUTS
     and aren't currently in flight on the poller. These are the
@@ -146,11 +149,17 @@ def prune_stale_jobs():
     restarted before posting, or the agent already DELETE'd it after
     fetching).
 
-    The inflight skip-set is critical: a long-running session has
-    DONE/<digest>.plan written + OUTPUTS/.tar not yet posted, so
-    without this guard the operator could prune their own running
-    job. The artefact upload would then 409 against the idempotency
-    gate and the poller would unlink its spool -- silent data loss.
+    Two protection layers:
+    1) digest-in-inflight (poller's published JSON): covers any
+       long-running session that's been live for >= one inflight
+       publish tick (2.5s).
+    2) DONE/.plan mtime younger than PRUNE_MIN_AGE_S: covers the
+       gap before the first inflight push reaches the server. A
+       lease op or quick failure can finish in ~100ms -- long
+       before STATUS/inflight.json catches up -- and was
+       previously vulnerable to "operator clicked clear-stale
+       just after pickup", which deleted DONE/.plan, made the
+       upload 409, and parked the artefact under refused/.
 
     Returns the count of plan records actually removed. Module-level
     so tests can exercise the protection logic without HTTP plumbing.
@@ -164,6 +173,7 @@ def prune_stale_jobs():
     except FileNotFoundError:
         pass
     protect = _inflight_digests()
+    cutoff = time.time() - PRUNE_MIN_AGE_S
     removed = 0
     try:
         for n in list(os.listdir(DONE)):
@@ -176,8 +186,14 @@ def prune_stale_jobs():
                 continue
             if digest in protect:
                 continue
+            path = os.path.join(DONE, n)
             try:
-                os.unlink(os.path.join(DONE, n))
+                if os.stat(path).st_mtime > cutoff:
+                    continue  # too fresh; presumed in-flight
+            except FileNotFoundError:
+                continue
+            try:
+                os.unlink(path)
                 removed += 1
             except FileNotFoundError:
                 pass
@@ -382,6 +398,15 @@ def delete_outputs(digest, ext=""):
     DELETE /outputs/<digest>.<ext> (specific ext) drops only that
     file -- e.g. just the .tar or just the .txt -- and leaves the
     job record alone.
+
+    Idempotency rule: only remove DONE/<digest>.plan if at least one
+    OUTPUTS file was actually removed. Otherwise this DELETE is
+    racing a fresh re-pickup of the same digest (queue_job allows
+    re-submit once OUTPUTS are gone, the poller picks it up and
+    creates a new DONE/.plan -- and a stale DELETE from the agent's
+    "clean up after fetch" flow could otherwise yank that fresh
+    DONE/.plan out from under the live session, making the eventual
+    artefact upload 409.
     """
     names = ([f"{digest}{ext}"] if ext else [
         n for n in os.listdir(OUTPUTS) if n.startswith(f"{digest}.")
@@ -393,7 +418,7 @@ def delete_outputs(digest, ext=""):
             removed += 1
         except FileNotFoundError:
             pass
-    if not ext:
+    if not ext and removed > 0:
         for tail in (".plan", ".plan.meta"):
             try:
                 os.remove(os.path.join(DONE, f"{digest}{tail}"))
