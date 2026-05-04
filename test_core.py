@@ -526,6 +526,30 @@ def test_lease_lifecycle():
     reg.close_all()
 
 
+def test_lease_release_honors_explicit_token_without_resume():
+    """Round-12 W1: a one-line plan `lease:release token="..."` (no
+    preceding lease:resume) must actually drop the lease. The op
+    receives args["token"] decoded to a plain str by decode_args;
+    the previous helper looked for a Value.raw attribute and silently
+    fell back to session.lease_token (None for a fresh session) --
+    so the operator saw "no-op" while the lease lived on until expiry.
+    """
+    from plugins.lease import LeasePlugin
+    plugins = {"fake": FakePlugin(), "lease": LeasePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    token = reg.lease_claim(["fake.0"], 60)
+    assert token in reg.leases
+    parsed = plan.load_tar(plan.pack_tar(
+        f'lease:release token="{token}"\n', {}))
+    s = Session(reg, parsed)
+    s.run_all(plugins)
+    assert not s.errors, s.errors
+    assert token not in reg.leases, (
+        "explicit-token release must drop the lease even with no "
+        "preceding lease:resume")
+    reg.close_all()
+
+
 def test_expect_lands_in_manifest():
     """`expect "<claim>"` must surface in manifest.expectations[].
     A plan that records `expect` but never runs a *machine-checkable*
@@ -753,6 +777,7 @@ def main():
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
         test_lease_lifecycle,
+        test_lease_release_honors_explicit_token_without_resume,
         test_expect_lands_in_manifest,
         test_stream_truncation_marker_survives_multiple_cap_hits,
         test_lease_claim_rejects_lease_pseudo_device,

@@ -347,6 +347,25 @@ def main(argv):
               file=sys.stderr)
         return 1
 
+    # Install the log FIRST so make output and parser errors land in
+    # it (the _TeeStream replaces stdout/stderr, and _run_make's
+    # subprocess inherits the tee). Refuse if --log lives inside
+    # OUT_DIR -- the rmtree later would unlink the file out from
+    # under the open fd. This keeps two traps closed at once: the
+    # round-10 T5 trap (log inside OUT_DIR vanishes) AND the round-12
+    # X1 regression (make/parser output not captured because log
+    # was installed after make ran).
+    if log_path is not None:
+        out_root_abs = os.path.abspath(OUT_DIR)
+        log_abs = os.path.abspath(log_path)
+        if log_abs == out_root_abs or log_abs.startswith(
+                out_root_abs + os.sep):
+            print(f"error: --log {log_path!r} is inside {OUT_DIR}/, "
+                  f"which run_md wipes on every run; pick a path "
+                  f"outside.", file=sys.stderr)
+            return 1
+    log_handle = _install_log(log_path) if log_path is not None else None
+
     if os.path.isfile(TEST_MD):
         src = TEST_MD
         parser = _parse_test_md
@@ -395,11 +414,6 @@ def main(argv):
     if os.path.isdir(out_root):
         shutil.rmtree(out_root)
     os.makedirs(out_root, exist_ok=True)
-    # Install the log AFTER the rmtree -- a --log path inside OUT_DIR
-    # would otherwise be silently deleted out from under the open fd
-    # (Linux: writes go to an orphaned inode, file vanishes; Windows:
-    # rmtree fails with "in use" and aborts the whole run).
-    log_handle = _install_log(log_path) if log_path is not None else None
 
     checks_map = {}
     for plan_text, bullets in pairs:

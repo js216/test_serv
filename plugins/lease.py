@@ -30,11 +30,6 @@ import config
 from plugin import DevicePlugin, Op
 
 
-def _lease_token_from(args):
-    v = args.get("token")
-    return v.raw if (v is not None and hasattr(v, "raw")) else None
-
-
 def _split_devices(arg):
     raw = arg.raw if hasattr(arg, "raw") else str(arg)
     return [s.strip() for s in raw.split(",") if s.strip()]
@@ -76,7 +71,14 @@ def _op_resume(session, h, args):
 
 
 def _op_release(session, h, args):
-    token = _lease_token_from(args)
+    # args["token"] is already decoded to a plain str by decode_args
+    # (it's typed "str" in the op schema). The previous helper looked
+    # for a .raw attribute that only exists on parser Values, so an
+    # explicit lease:release token="..." silently fell back to the
+    # session's own lease_token -- and on a one-line release plan
+    # with no preceding lease:resume, that's None, so the operator
+    # got "no-op (no token)" while the lease lived on until expiry.
+    token = args.get("token")
     if token is None:
         # Default to the session's own lease.
         token = getattr(session, "lease_token", None)
