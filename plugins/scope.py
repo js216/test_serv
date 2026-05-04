@@ -181,7 +181,7 @@ class ScopePlugin(DevicePlugin):
                  "transition counts + active duty in timeline.log "
                  "(e.g. C2 DSP_FAULT: went_active=0 ...) and writes "
                  "the full summary as JSON to the scope.summary "
-                 "stream. GET /scope/signals returns the current map."),
+                 "stream."),
             run=_op_capture),
     }
 

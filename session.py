@@ -87,7 +87,6 @@ class Session:
         # (dfu cubeprog flash, large msc/fpga MPSSE I/O) still don't
         # observe the signal until the op returns.
         self.canceled = False
-        self.cancel_reason = ""
         self.cancel_event = threading.Event()
 
     # --- timeline recording ---
@@ -119,7 +118,7 @@ class Session:
             raise RuntimeError(
                 f"{where} canceled via DELETE /jobs/<digest>")
 
-    def signal_cancel(self, reason=""):
+    def signal_cancel(self):
         """Request the session abort. Idempotent and thread-safe.
         Called from the poller's cancel-marker drain when DELETE
         /jobs/<digest> arrives mid-flight. Sets self.canceled (which
@@ -128,9 +127,8 @@ class Session:
         plain time.sleep, so they wake immediately on cancel).
         """
         self.canceled = True
-        self.cancel_reason = reason
         self.cancel_event.set()
-        self.log_event("CTRL", "session", f"cancel requested: {reason}")
+        self.log_event("CTRL", "session", "cancel requested")
 
     def _prescan_lease_resume(self):
         """If the plan starts with ``lease:resume token=...``, take over
@@ -296,8 +294,7 @@ class Session:
                 return
             if self.canceled:
                 msg = (f"canceled at op {op.lineno} "
-                       f"({op.device or 'ctrl'}:{op.verb}): "
-                       f"{self.cancel_reason or 'no reason given'}")
+                       f"({op.device or 'ctrl'}:{op.verb})")
                 self.log_event("ERROR", "session", msg)
                 self.errors.append(msg + "\n")
                 return
@@ -465,12 +462,11 @@ class Session:
             raise PlanError(f"unknown control verb {v!r}")
 
     def _run_inventory(self, op, plugins):
-        verify = op.args.get("verify")
-        refresh = op.args.get("refresh")
-        if refresh is None or refresh.as_bool():
-            self.registry.refresh()
-        if verify is not None and verify.as_bool():
-            self.registry.verify_sweep()
+        # inventory always refreshes the device list. Identity sweeps
+        # (which actually open every device) live in POST /sweep so an
+        # agent who just wants the device map doesn't pay for I/O on
+        # every call.
+        self.registry.refresh()
         # Also push the freshly probed state to the server right away so
         # an `inventory` op from the web UI updates the dashboard
         # without waiting for the next 15 s tick.
@@ -502,7 +498,7 @@ class Session:
                     "                         one is configured.\n"
                     "  control-verb args...   no device prefix, e.g.\n"
                     "                         `delay ms=500` or\n"
-                    "                         `inventory verify=true`.\n"
+                    "                         `inventory`.\n"
                     "\n"
                     "Available instance ids per plugin appear in this\n"
                     "session's bench.devices.json (each entry has both\n"
@@ -543,13 +539,11 @@ class Session:
                     },
                     "inventory": {
                         "args": {},
-                        "optional_args": {
-                            "refresh": "bool",
-                            "verify": "bool",
-                        },
+                        "optional_args": {},
                         "doc": (
-                            "Return bench.devices.json and bench.ops.json "
-                            "streams. Defaults: refresh=true verify=false."
+                            "Refresh the device probe list and return "
+                            "bench.devices.json + bench.ops.json. For an "
+                            "identity-verified sweep, POST /sweep instead."
                         ),
                     },
                     "join": {

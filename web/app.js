@@ -609,14 +609,19 @@ $("#wipe-jobs").addEventListener("click", async () => {
 
 $("#run-inventory").addEventListener("click", async () => {
   const btn = $("#run-inventory");
-  // Embed a timestamp in a comment so the plan body's SHA256 differs
-  // from previous runs -- otherwise queue_job's stale_outputs check
-  // would short-circuit and we'd just re-fetch the previous artefact
-  // instead of doing a fresh re-probe.
-  const ts = new Date().toISOString();
-  await submitPlanText(
-    `description "dashboard: run inventory ${ts}"\n` +
-    `inventory verify=true\n`, {}, btn);
+  btn.disabled = true;
+  try {
+    // Trigger a full identity sweep server-side, then submit a plain
+    // `inventory` plan to get the freshly-probed snapshot back.
+    // /sweep is async; the poller picks it up on its next tick.
+    await fetch("/sweep", { method: "POST" });
+    const ts = new Date().toISOString();
+    await submitPlanText(
+      `description "dashboard: run inventory ${ts}"\n` +
+      `inventory\n`, {}, btn);
+  } finally {
+    btn.disabled = false;
+  }
 });
 
 // --- boot ------------------------------------------------------------

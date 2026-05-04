@@ -46,11 +46,9 @@ class _PendingSlot:
 
     def __init__(self):
         self.canceled = False
-        self.cancel_reason = ""
 
-    def signal_cancel(self, reason=""):
+    def signal_cancel(self):
         self.canceled = True
-        self.cancel_reason = reason
 
 
 class _Tee:
@@ -271,7 +269,7 @@ def _drain_cancels():
         with _active_lock:
             sess = _active_sessions.get(d)
         if sess is not None:
-            sess.signal_cancel("REST DELETE /jobs/<digest>")
+            sess.signal_cancel()
             print(datetime.now(), f"[{d[:8]}] cancel signaled")
         else:
             # Job already completed before the marker arrived, or
@@ -398,9 +396,7 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         session = Session(registry, parsed, runtime_s=runtime_s)
         # Transcribe any cancel that landed on the slot during parse.
         if slot.canceled:
-            session.signal_cancel(
-                slot.cancel_reason or
-                "REST DELETE /jobs/<digest> arrived during dispatch")
+            session.signal_cancel()
         with _active_lock:
             _active_sessions[job_id] = session
         session.run_all(plugins_by_name)

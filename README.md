@@ -20,8 +20,8 @@ cat /tmp/test-serv-inventory/streams/bench.devices.json.bin
 cat /tmp/test-serv-inventory/streams/bench.ops.json.bin
 ```
 
-Use `inventory verify=true` to make the bench poller run an identity
-sweep before returning the device list. That can take longer.
+For a full identity-verified sweep before returning the device list,
+`POST /sweep` first; `inventory` itself only refreshes the probe.
 
 ### install
 
@@ -135,7 +135,6 @@ Discovery helpers:
 GET /help                # full job-control REST reference (text/plain)
 GET /examples
 GET /examples/<name>
-GET /scope/signals
 POST /sweep
 POST /devices/<device-id>/release
 ```
@@ -158,7 +157,6 @@ Local server helpers:
 ```
 curl http://localhost:8080/examples       # starter plan names
 curl http://localhost:8080/examples/NAME  # fetch one
-curl http://localhost:8080/scope/signals  # channel -> {name, active_below} map
 ```
 
 ### device config
@@ -209,10 +207,10 @@ Control verbs:
 
 - `delay ms=N`
 - `mark tag=NAME` / `barrier tag=NAME` -- checkpoints in the timeline
-- `inventory [refresh=true] [verify=false]` -- return the bench
-  poller's device list and supported ops as `bench.devices.json` and
-  `bench.ops.json` streams in the artefact. `refresh=false` skips the
-  pre-snapshot probe; `verify=true` runs the identity sweep first.
+- `inventory` -- return the bench poller's device list and supported
+  ops as `bench.devices.json` and `bench.ops.json` streams in the
+  artefact. Always refreshes the device probe; for a full identity
+  sweep, `POST /sweep` first.
 - `fork name=IDENT` ... `end` -- run the enclosed op list in a thread;
   a plan can contain several `fork` blocks, each joined at its `end`.
 - `open` / `close` on any device -- pin or release its handle for the

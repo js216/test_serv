@@ -93,6 +93,22 @@ def _read_file(path):
 _write_atomic = paths.write_atomic
 
 
+# Two named per-submission knobs honoured by the runner. Anything
+# else an agent might want to convey about a job goes in the in-plan
+# `description "..."` line. Generic X-Test-* passthrough used to
+# exist; nothing read it, so it's gone.
+_META_HEADERS = ("Runtime", "Upload-Timeout")
+
+
+def _meta_from_headers(headers):
+    meta = {}
+    for name in _META_HEADERS:
+        v = headers.get(f"X-Test-{name}")
+        if v is not None and v != "":
+            meta[name.lower()] = v
+    return meta
+
+
 def queue_job(body, meta=None):
     digest = hashlib.sha256(body).hexdigest()
     dst = os.path.join(INPUTS, f"{digest}.plan")
@@ -231,13 +247,14 @@ so the dashboard and other agents can triage the queue without
 opening the artefact. The line is also a real control verb -- it
 logs to timeline -- so the artefact stays self-describing.
 
-HTTP headers: every header `X-Test-<Name>: <value>` is captured and
-stored alongside the plan, exposed as the meta dict on /jobs
-entries. Two are honoured by the runner itself:
+Two HTTP headers are honoured at submit time:
     X-Test-Runtime        per-session deadline in seconds; clamped
                           to [1, 3600], default 600.
     X-Test-Upload-Timeout artefact-POST timeout in seconds;
                           clamped to [1, 3600], default 600.
+Other X-Test-* headers are ignored. Anything else an agent wants
+to convey about a job goes in the in-plan `description "..."`
+line, which the server extracts and surfaces in /jobs entries.
 
 Other useful endpoints
 ----------------------
@@ -253,7 +270,7 @@ Discovery for agents
 --------------------
 The plan-grammar verbs and the per-plugin op signatures are
 returned by `inventory` in a plan, NOT by /help -- run a small
-plan with `inventory verify=true` to get bench.devices.json and
+plan with `inventory` to get bench.devices.json and
 bench.ops.json. /help only documents the HTTP surface above.
 """
 
@@ -299,8 +316,6 @@ class Handler(BaseHTTPRequestHandler):
             return self._outputs_file(m.group(1), m.group(2))
         if path.startswith("outputs/"):
             return self._fetch_output(path[len("outputs/"):])
-        if path == "scope/signals":
-            return self._scope_signals()
         if path == "" or path == "index.html":
             return self._serve_static("index.html")
         if path.startswith("web/"):
@@ -351,16 +366,10 @@ class Handler(BaseHTTPRequestHandler):
                 json.dumps({"status": "too_large",
                             "limit": MAX_PLAN_BYTES}).encode(), status=413)
         body = self.rfile.read(n) if n else b""
-        meta = {}
-        for k, v in self.headers.items():
-            if k.lower().startswith("x-test-"):
-                meta[k[len("X-Test-"):].lower()] = v
-        # In-plan `description "..."` line wins over (and populates) the
-        # meta dict if the agent didn't set one any other way.
-        if "description" not in meta:
-            desc = plan.extract_description_from_tar(body)
-            if desc:
-                meta["description"] = desc
+        meta = _meta_from_headers(self.headers)
+        desc = plan.extract_description_from_tar(body)
+        if desc:
+            meta["description"] = desc
         digest, status = queue_job(body, meta)
 
         if status == "stale_outputs":
@@ -401,14 +410,10 @@ class Handler(BaseHTTPRequestHandler):
             ti.size = len(text)
             tf.addfile(ti, io.BytesIO(text))
         body = buf.getvalue()
-        meta = {}
-        for k, v in self.headers.items():
-            if k.lower().startswith("x-test-"):
-                meta[k[len("X-Test-"):].lower()] = v
-        if "description" not in meta:
-            desc = plan.extract_description(text)
-            if desc:
-                meta["description"] = desc
+        meta = _meta_from_headers(self.headers)
+        desc = plan.extract_description(text)
+        if desc:
+            meta["description"] = desc
         digest, status = queue_job(body, meta)
         if status == "stale_outputs":
             return self._send_json(
@@ -882,26 +887,6 @@ class Handler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             entries = []
         return self._send_json(json.dumps(entries).encode())
-
-    def _scope_signals(self):
-        """Expose scope.signals from config.json so agents know which
-        channel carries which bench signal and what active threshold
-        applies. Served straight from the config file at request time
-        so operator edits show up without server restart.
-        """
-        # Read config.json inline: server.py has no config.py import
-        # chain to avoid binding to the poller process.
-        cfg_path = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "config.json")
-        try:
-            with open(cfg_path) as f:
-                cfg = json.load(f)
-        except FileNotFoundError:
-            cfg = {}
-        except Exception:
-            return self._send_json(b"{}")
-        signals = (cfg.get("scope") or {}).get("signals") or {}
-        return self._send_json(json.dumps(signals, indent=2).encode())
 
     def _fetch_example(self, name):
         if not name.endswith(".plan") or not SAFE_NAME_RE.match(name):

@@ -181,16 +181,6 @@ def _fetch(server, digest, expected_path, extract_to):
     return 0
 
 
-def _parse_meta_kv(pairs):
-    meta = {}
-    for p in pairs or []:
-        k, _, v = p.partition("=")
-        if not k or not v:
-            raise ValueError(f"--meta expects key=value, got {p!r}")
-        meta[k] = v
-    return meta
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("plan", nargs="?",
@@ -209,10 +199,12 @@ def main():
     ap.add_argument("--expected", help="compare sentinel .txt against this")
     ap.add_argument("--extract", metavar="DIR",
                     help="extract artefact tarball into DIR (keeps the tar)")
-    ap.add_argument("--meta", action="append", metavar="KEY=VAL",
-                    help="sidecar metadata (X-Test-<Key>), repeatable")
     ap.add_argument("--runtime", type=float,
-                    help="shortcut for --meta runtime=SEC")
+                    help="per-session deadline in seconds "
+                         "(X-Test-Runtime; default 600).")
+    ap.add_argument("--upload-timeout", type=float,
+                    help="artefact-POST timeout in seconds "
+                         "(X-Test-Upload-Timeout; default 600).")
     args = ap.parse_args()
 
     if args.fetch and args.plan:
@@ -230,9 +222,11 @@ def main():
     else:
         data = _pack_from_plan(args.plan, args.blob)
 
-    meta = _parse_meta_kv(args.meta)
+    meta = {}
     if args.runtime is not None:
         meta["runtime"] = str(args.runtime)
+    if args.upload_timeout is not None:
+        meta["upload-timeout"] = str(args.upload_timeout)
 
     try:
         digest = _submit(data, meta, args.server)
