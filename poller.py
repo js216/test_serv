@@ -920,7 +920,28 @@ def main():
         except Exception:
             traceback.print_exc()
 
+    # Two-step Ctrl-C: first ^C raises KeyboardInterrupt so the
+    # graceful cleanup at the bottom of main() runs (cancel sessions,
+    # SIGKILL subprocs, drain uploads, close handles). A SECOND ^C
+    # at any point afterwards calls os._exit() directly so the
+    # operator can always escape -- without this, a Ctrl-C that lands
+    # while a USB close syscall in registry.close_all() is hung in C
+    # never returns to Python and the process becomes unkillable
+    # short of SIGKILL from another shell.
+    _sigint_count = [0]
+
+    def _sigint_handler(_signum, _frame):
+        _sigint_count[0] += 1
+        if _sigint_count[0] >= 2:
+            sys.stderr.write(
+                "\nSIGINT (second): forcing exit, no further cleanup\n")
+            os._exit(130)
+        # First ^C: re-raise as KeyboardInterrupt so the existing
+        # except KeyboardInterrupt cleanup path runs.
+        raise KeyboardInterrupt
+
     try:
+        signal.signal(signal.SIGINT, _sigint_handler)
         signal.signal(signal.SIGHUP, _sighup)
     except (AttributeError, ValueError):
         # windows / non-main thread: skip
@@ -995,8 +1016,14 @@ def main():
         # graceful shot at finishing -- so cubeprog flashes etc.
         # don't get orphaned at PID 1 mid-write -- before the
         # daemon-thread reaper bites at interpreter exit.
+        # The custom SIGINT handler installed at startup has already
+        # promoted itself to "hard exit on any further SIGINT" so an
+        # operator who mashes Ctrl-C because cleanup is taking too
+        # long (USB close hung in C-level syscall, _drain_pending_
+        # uploads waiting on a flaky tunnel) always has an escape.
         print(datetime.now(),
-              "SIGINT: cancelling active sessions, waiting up to 30s")
+              "SIGINT: cancelling active sessions, waiting up to 30s "
+              "(Ctrl-C again to force exit)")
         with _active_lock:
             for sess in list(_active_sessions.values()):
                 try:
