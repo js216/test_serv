@@ -32,12 +32,34 @@ def write_atomic(path, body):
 
 
 def default_state_dir():
-    """Return a writable per-user scratch dir for inputs/outputs/status/etc.
+    """Return a *persistent* writable per-user scratch dir for
+    inputs/outputs/status/done/cancel.
 
-    On Windows ``tempfile.gettempdir()`` honours ``%TEMP%`` /
-    ``%LOCALAPPDATA%\\Temp``; on POSIX it's typically ``/tmp``. Hardcoding
-    ``/tmp`` breaks Windows, so use the stdlib resolver.
+    Persistence matters: if the dir lives on tmpfs (Linux /tmp) every
+    queued plan, every DONE record, every artefact, and every cancel
+    marker disappears on reboot -- agents who submitted minutes earlier
+    silently lose their work and the dashboard shows nothing.
+
+    POSIX:   ``$XDG_DATA_HOME/test_serv`` if set,
+             else ``~/.local/share/test_serv``.
+    Windows: ``%LOCALAPPDATA%\\test_serv`` if set,
+             else ``~/AppData/Local/test_serv``.
+    Fallback: ``<tempdir>/test_serv-<user>``.
     """
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA")
+        if base:
+            return os.path.join(base, "test_serv")
+        home = os.path.expanduser("~")
+        if home and home != "~":
+            return os.path.join(home, "AppData", "Local", "test_serv")
+    else:
+        base = os.environ.get("XDG_DATA_HOME")
+        if base:
+            return os.path.join(base, "test_serv")
+        home = os.path.expanduser("~")
+        if home and home != "~":
+            return os.path.join(home, ".local", "share", "test_serv")
     user = os.getenv("USER") or os.getenv("USERNAME") or "anon"
     return os.path.join(tempfile.gettempdir(), f"test_serv-{user}")
 

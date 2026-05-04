@@ -501,6 +501,22 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         body = self.rfile.read(n) if n else b""
+        # Idempotency gate: refuse the upload if neither DONE/<digest>.plan
+        # (job still in flight from this poller's perspective) nor
+        # INPUTS/<digest>.plan (job hasn't been picked up yet, e.g. a
+        # second poller racing) is present. That's the "agent already
+        # fetched + DELETE'd, then a poller-side retry of an earlier
+        # attempt belatedly arrives" case -- without this gate the
+        # phantom artefact lingers in OUTPUTS and blocks the next
+        # /submit of the same digest with stale_outputs.
+        plan_present = (
+            os.path.exists(os.path.join(DONE, f"{digest}.plan")) or
+            os.path.exists(os.path.join(INPUTS, f"{digest}.plan")))
+        if not plan_present:
+            self.send_response(409)
+            self.end_headers()
+            self.wfile.write(b"no matching job record; refusing artefact\n")
+            return
         # Atomic write so a half-uploaded artefact (poller crashed
         # mid-PUT) never appears in OUTPUTS as a partial file that the
         # dashboard would then try to render.
@@ -848,6 +864,8 @@ def main():
     args = ap.parse_args()
     for d in (INPUTS, OUTPUTS, DONE, STATUS, RELEASE, SWEEP, CANCEL):
         os.makedirs(d, mode=0o700, exist_ok=True)
+    print(f"state dir: {STATE_DIR}")
+    print(f"listening on 127.0.0.1:{args.port}")
     ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
 
 

@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime
@@ -29,6 +30,12 @@ STATUS = os.path.join(STATE_DIR, "status")
 RELEASE = os.path.join(STATE_DIR, "release")
 SWEEP = os.path.join(STATE_DIR, "sweep")
 LOG = os.path.join(STATE_DIR, "log.txt")
+# Artefacts produced by run_all are spooled here before the POST to
+# the server. If the POST fails (server restart, SSH-tunnel hiccup),
+# the file stays on bench-side disk and the next main-loop tick
+# retries -- so a transient outage at the end of a 20-minute flash
+# test doesn't lose the artefact.
+PENDING = os.path.join(STATE_DIR, "pending_uploads")
 
 # digest -> Session for jobs the poller has picked up and finished
 # constructing. _drain_cancels signals against this map; the server
@@ -431,19 +438,89 @@ def _failure_artefact(job_id, message):
     return buf.getvalue()
 
 
-def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):
+def _spool_artefact(job_id, tar_bytes):
+    """Write the artefact to PENDING/<digest>.tar atomically.
+
+    Returns the spool path. The next main-loop tick (or the immediate
+    upload attempt) reads from this path; on success the file is
+    unlinked. On failure the file stays so a later tick can retry.
+    """
+    os.makedirs(PENDING, mode=0o700, exist_ok=True)
+    path = os.path.join(PENDING, f"{job_id}.tar")
+    paths.write_atomic(path, tar_bytes)
+    return path
+
+
+def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
+    """Try POSTing one spooled artefact. On 2xx, unlink it. On 4xx
+    (permanent refusal -- e.g. server returns 409 because the agent
+    already cleaned up that digest) also unlink: a retry would just
+    fail the same way. On 5xx / connection errors leave the file
+    and log; the next main-loop tick will retry.
+    """
+    name = os.path.basename(spool_path)
     base = f"http://localhost:{HTTP_PORT}"
     try:
-        _post(f"{base}/{job_id}.tar", tar_bytes, timeout=timeout_s)
+        with open(spool_path, "rb") as f:
+            body = f.read()
+    except FileNotFoundError:
+        return False
+    try:
+        _post(f"{base}/{name}", body, timeout=timeout_s)
+    except urllib.error.HTTPError as e:
+        if 400 <= e.code < 500:
+            print(datetime.now(),
+                  f"POST {name} refused with {e.code} (giving up): {e}")
+            try:
+                os.unlink(spool_path)
+            except FileNotFoundError:
+                pass
+            return False
+        print(datetime.now(),
+              f"POST {name} failed with {e.code} (will retry): {e}")
+        return False
     except Exception:
-        print(datetime.now(), f"POST .tar failed:\n{traceback.format_exc()}")
+        print(datetime.now(),
+              f"POST {name} failed (will retry):",
+              traceback.format_exc().splitlines()[-1])
+        return False
+    try:
+        os.unlink(spool_path)
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _drain_pending_uploads(timeout_s=DEFAULT_UPLOAD_S):
+    """Try to POST every spooled artefact. Called on each main-loop
+    tick so a transient server outage doesn't lose work.
+    """
+    try:
+        names = sorted(os.listdir(PENDING))
+    except FileNotFoundError:
+        return
+    for n in names:
+        if not n.endswith(".tar"):
+            continue
+        _post_spooled(os.path.join(PENDING, n), timeout_s=timeout_s)
+
+
+def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):
+    """Spool the artefact to disk first, then try to upload. If the
+    upload fails, the file stays in PENDING and the next main-loop
+    tick's _drain_pending_uploads picks it up.
+    """
+    spool = _spool_artefact(job_id, tar_bytes)
+    _post_spooled(spool, timeout_s=timeout_s)
 
 
 def main():
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(PENDING, mode=0o700, exist_ok=True)
     log_f = open(LOG, "a", buffering=1, encoding="utf-8", errors="replace")
     sys.stdout = _Tee(sys.__stdout__, log_f)
     sys.stderr = _Tee(sys.__stderr__, log_f)
+    print(datetime.now(), f"state dir: {STATE_DIR}")
     print(datetime.now(), f"logging to {LOG}")
     print(datetime.now(), "loading plugins...")
     plugins_by_name = plugins.load_all()
@@ -503,6 +580,7 @@ def main():
             _drain_release_markers(registry)
             _drain_sweep_markers(registry, plugins_by_name)
             _drain_cancels()
+            _drain_pending_uploads()
 
             if time.monotonic() - last_refresh > DEVICE_REFRESH_S:
                 registry.refresh()
