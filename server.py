@@ -11,6 +11,7 @@ import random
 import re
 import tarfile
 import tempfile
+import threading
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
@@ -50,6 +51,25 @@ ALLOWED_STATUS_FILES = ("devices.json", "ops.json", "leases.json")
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 SAFE_EXT_RE = re.compile(r"^[A-Za-z0-9]+$")
 SAFE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+# Artefact uploads beyond this size are rejected. 256 MiB comfortably
+# covers a full scope capture set + chunked logs; if we ever need more,
+# the cap is the right knob to bump rather than letting the poller
+# OOM the server with a runaway body.
+MAX_ARTEFACT_BYTES = 256 * 1024 * 1024
+# Plan tarballs are small -- plan.txt + a few KB of blobs. Anything
+# larger is almost certainly a mistake or abuse.
+MAX_PLAN_BYTES = 16 * 1024 * 1024
+# Status snapshots are small JSON.
+MAX_STATUS_BYTES = 4 * 1024 * 1024
+# Allowed extensions for artefact uploads (POST /<digest>.<ext>).
+ARTEFACT_EXTS = ("tar", "txt")
+
+# Serialize queue_job's check-and-write so two concurrent /submit calls
+# for the same digest can't both pass the duplicate check and race on
+# meta/body files. queue_job is fast (small disk writes), so coarse
+# locking is fine.
+_submit_lock = threading.Lock()
 
 
 def _read_meta(path):
@@ -118,26 +138,33 @@ def _extract_plan_description_from_tar(body):
 def queue_job(body, meta=None):
     digest = hashlib.sha256(body).hexdigest()
     dst = os.path.join(INPUTS, f"{digest}.plan")
-    stale = [
-        n for n in os.listdir(OUTPUTS)
-        if n.startswith(f"{digest}.")
-    ]
-    if stale:
-        return digest, "stale_outputs"
-    if os.path.exists(dst):
-        return digest, "duplicate"
-
     meta_path = f"{dst}.meta"
-    try:
-        os.remove(meta_path)
-    except FileNotFoundError:
-        pass
-    if meta:
-        with open(meta_path, "w") as f:
-            f.write("".join(f"{k}={v}\n" for k, v in meta.items()))
-            f.flush()
-            os.fsync(f.fileno())
-    _write_atomic(dst, body)
+    # Whole check-and-write is under a single lock so two concurrent
+    # /submit calls for the same digest can't both clear the meta file
+    # and race on rewrites. The dedupe check (os.path.exists(dst))
+    # would otherwise be a TOCTOU racing against another writer.
+    with _submit_lock:
+        stale = [
+            n for n in os.listdir(OUTPUTS)
+            if n.startswith(f"{digest}.")
+        ]
+        if stale:
+            return digest, "stale_outputs"
+        if os.path.exists(dst):
+            return digest, "duplicate"
+        # Write meta first so a poller racing to pick up the .plan
+        # never sees an empty/old meta file -- pickup keys off .plan
+        # presence.
+        if meta:
+            body_meta = "".join(
+                f"{k}={v}\n" for k, v in meta.items()).encode()
+            _write_atomic(meta_path, body_meta)
+        else:
+            try:
+                os.remove(meta_path)
+            except FileNotFoundError:
+                pass
+        _write_atomic(dst, body)
     return digest, "queued"
 
 
@@ -262,6 +289,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _submit_job(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > MAX_PLAN_BYTES:
+            return self._send_json(
+                json.dumps({"status": "too_large",
+                            "limit": MAX_PLAN_BYTES}).encode(), status=413)
         body = self.rfile.read(n) if n else b""
         meta = {}
         for k, v in self.headers.items():
@@ -299,6 +330,10 @@ class Handler(BaseHTTPRequestHandler):
     # `plan.txt`-only tarball.
     def _submit_text_job(self):
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > MAX_PLAN_BYTES:
+            return self._send_json(
+                json.dumps({"status": "too_large",
+                            "limit": MAX_PLAN_BYTES}).encode(), status=413)
         text = self.rfile.read(n) if n else b""
         if not text:
             return self._send_json(
@@ -338,6 +373,10 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > MAX_STATUS_BYTES:
+            self.send_response(413)
+            self.end_headers()
+            return
         body = self.rfile.read(n) if n else b""
         os.makedirs(STATUS, mode=0o700, exist_ok=True)
         _write_atomic(os.path.join(STATUS, name), body)
@@ -430,46 +469,82 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         suffix = f".{ext}"
-        names = [n for n in os.listdir(INPUTS) if n.endswith(suffix)]
-        if not names:
-            self.send_response(204)
+        # Two pollers (or two workers in one poller) racing on pickup
+        # both list INPUTS and could both pick the same name. Make
+        # claim-by-rename the atomic gate: rename to DONE first, only
+        # the OS-winning rename gets to read the body. Loop a few
+        # times so a rename collision doesn't surface as 204 when
+        # other plans are still queued.
+        for _ in range(8):
+            try:
+                names = [n for n in os.listdir(INPUTS)
+                         if n.endswith(suffix)]
+            except FileNotFoundError:
+                names = []
+            if not names:
+                self.send_response(204)
+                self.end_headers()
+                return
+            name = random.choice(names)
+            src = os.path.join(INPUTS, name)
+            dst = os.path.join(DONE, name)
+            try:
+                os.rename(src, dst)
+            except FileNotFoundError:
+                # Another worker grabbed this one between listdir and
+                # rename. Loop and try a different file.
+                continue
+            meta_src = os.path.join(INPUTS, f"{name}.meta")
+            meta_dst = os.path.join(DONE, f"{name}.meta")
+            try:
+                os.rename(meta_src, meta_dst)
+            except FileNotFoundError:
+                meta_dst = None
+            with open(dst, "rb") as f:
+                data = f.read()
+            meta = (_read_meta(meta_dst)
+                    if meta_dst and os.path.exists(meta_dst) else {})
+            self.send_response(200)
+            for k, v in meta.items():
+                self.send_header(f"X-Test-{k.capitalize()}", v)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(data)))
             self.end_headers()
+            self.wfile.write(data)
             return
-        name = random.choice(names)
-        src = os.path.join(INPUTS, name)
-        meta_src = os.path.join(INPUTS, f"{name}.meta")
-        with open(src, "rb") as f:
-            data = f.read()
-        meta = _read_meta(meta_src) if os.path.exists(meta_src) else {}
-        self.send_response(200)
-        for k, v in meta.items():
-            self.send_header(f"X-Test-{k.capitalize()}", v)
-        self.send_header("Content-Type", "application/octet-stream")
-        self.send_header("Content-Length", str(len(data)))
+        # Fell through the retry budget -- treat as "nothing right
+        # now"; the poller will retry on its next tick.
+        self.send_response(204)
         self.end_headers()
-        self.wfile.write(data)
-        os.rename(src, os.path.join(DONE, name))
-        if os.path.exists(meta_src):
-            os.rename(meta_src, os.path.join(DONE, f"{name}.meta"))
 
     # --- POST / artefact ---
 
     def _artefact(self, path):
         tail = path.rsplit("/", 1)[-1]
         digest, url_ext = os.path.splitext(tail)
-        if not SAFE_NAME_RE.match(digest):
+        # Digest must be a real 64-char hex sha256, not just "safe-ish"
+        # filename bytes. Old SAFE_NAME_RE would have accepted dotted
+        # paths and other shapes that don't belong in OUTPUTS.
+        if not SAFE_DIGEST_RE.match(digest):
             self.send_response(400)
             self.end_headers()
             return
-        ext = url_ext or ".txt"
-        if not SAFE_NAME_RE.match(ext.lstrip(".")):
+        ext_bare = url_ext.lstrip(".") if url_ext else "txt"
+        if ext_bare not in ARTEFACT_EXTS:
             self.send_response(400)
             self.end_headers()
             return
         n = int(self.headers.get("Content-Length") or 0)
+        if n < 0 or n > MAX_ARTEFACT_BYTES:
+            self.send_response(413)
+            self.end_headers()
+            return
         body = self.rfile.read(n) if n else b""
-        with open(os.path.join(OUTPUTS, f"{digest}{ext}"), "wb") as f:
-            f.write(body)
+        # Atomic write so a half-uploaded artefact (poller crashed
+        # mid-PUT) never appears in OUTPUTS as a partial file that the
+        # dashboard would then try to render.
+        _write_atomic(
+            os.path.join(OUTPUTS, f"{digest}.{ext_bare}"), body)
         self.send_response(200)
         self.end_headers()
 
