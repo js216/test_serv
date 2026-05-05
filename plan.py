@@ -377,6 +377,22 @@ def required_devices(plan):
     return out
 
 
+def required_device_refs(plan):
+    """Return device references as written when concrete, else plugin.
+
+    This is for operator-facing logs. It preserves ``plugin.id`` when
+    the plan names a concrete instance, while still showing bare
+    plugin names for plans that rely on runtime resolution.
+    """
+    out = set()
+    for op in plan.ops:
+        plugin_name, spec_id = split_device_ref(op.device)
+        if plugin_name is None:
+            continue
+        out.add(f"{plugin_name}.{spec_id}" if spec_id else plugin_name)
+    return out
+
+
 def pack_tar(plan_text, blobs):
     """Build a .plan tar bytes: plan.txt + blobs dict {name: bytes}."""
     buf = io.BytesIO()

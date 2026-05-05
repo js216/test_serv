@@ -416,16 +416,24 @@ POLL_INTERVAL_S = 2.5
 DEVICE_REFRESH_S = 15.0
 DEFAULT_UPLOAD_S = 600.0
 MAX_UPLOAD_S = 3600.0
-# Show a dotted progress line on stdout for transfers >= this size, with
-# one dot per ``PROGRESS_BYTES_PER_DOT``. Tee'd into log.txt so even
-# headless runs keep a record of how long the big SD-card-image moves
-# actually took.
+# Show a dotted progress line on stdout for transfers >= this size.
+# One dot per MiB is byte-based, but at the tunnel speeds this bench
+# typically sees it reads as roughly one dot per second. Tee'd into
+# log.txt so even headless runs keep a record of how long big
+# SD-card-image moves actually took.
 PROGRESS_THRESHOLD = 1 << 20         # 1 MiB
-PROGRESS_BYTES_PER_DOT = 256 * 1024  # 256 KiB
+PROGRESS_BYTES_PER_DOT = 1 << 20     # 1 MiB
 _HTTP_CHUNK = 64 * 1024              # send/recv granularity
 
 
-def _progress_dots(label, total, advance):
+def _fmt_rate(nbytes, seconds):
+    if seconds <= 0:
+        return "?"
+    mib_s = nbytes / seconds / (1024 * 1024)
+    return f"{mib_s:.2f} MiB/s"
+
+
+def _progress_dots(label, total, advance, started=None, done_bytes=None):
     """Render a progress line incrementally. Call with ``advance=0`` for
     the header, then with the byte count after each transfer chunk; call
     once more with ``advance < 0`` to terminate the line. Single-line,
@@ -437,7 +445,13 @@ def _progress_dots(label, total, advance):
         sys.stdout.flush()
         return
     if advance < 0:
-        sys.stdout.write(" done\n")
+        if started is not None and done_bytes is not None:
+            elapsed = max(0.0, time.monotonic() - started)
+            sys.stdout.write(
+                f" done in {elapsed:.1f}s @ "
+                f"{_fmt_rate(done_bytes, elapsed)}\n")
+        else:
+            sys.stdout.write(" done\n")
         sys.stdout.flush()
         return
     while advance >= PROGRESS_BYTES_PER_DOT:
@@ -456,6 +470,7 @@ def _get(url, timeout=30.0):
         if cl_int is not None and cl_int >= PROGRESS_THRESHOLD:
             buf = bytearray()
             tally = 0
+            started = time.monotonic()
             _progress_dots(f"GET {url}", cl_int, 0)
             while len(buf) < cl_int:
                 chunk = r.read(min(_HTTP_CHUNK, cl_int - len(buf)))
@@ -466,7 +481,7 @@ def _get(url, timeout=30.0):
                 if tally >= PROGRESS_BYTES_PER_DOT:
                     _progress_dots("", 0, tally)
                     tally %= PROGRESS_BYTES_PER_DOT
-            _progress_dots("", 0, -1)
+            _progress_dots("", 0, -1, started=started, done_bytes=len(buf))
             body = bytes(buf)
         else:
             body = r.read()
@@ -507,6 +522,7 @@ def _post_streamed(url, data, timeout):
         conn.endheaders()
         sent = 0
         tally = 0
+        started = time.monotonic()
         _progress_dots(f"POST {url}", len(data), 0)
         mv = memoryview(data)
         while sent < len(data):
@@ -517,7 +533,7 @@ def _post_streamed(url, data, timeout):
             if tally >= PROGRESS_BYTES_PER_DOT:
                 _progress_dots("", 0, tally)
                 tally %= PROGRESS_BYTES_PER_DOT
-        _progress_dots("", 0, -1)
+        _progress_dots("", 0, -1, started=started, done_bytes=sent)
         resp = conn.getresponse()
         # Drain so the connection can be reused / closed cleanly.
         body = resp.read()
@@ -934,15 +950,15 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         parsed = plan.load_tar(payload)
     except plan.PlanError as e:
         print(datetime.now(), tag,
-              f"pickup {len(payload)} B  devices=?  parse failed: {e}")
+              f"pickup {len(payload):>8} B  ?  parse failed: {e}")
         tar = _failure_artefact(job_id, f"plan parse failed: {e}")
         _post_artefact(job_id, tar, upload_s, try_now=False)
         return
 
-    needed = sorted(plan.required_devices(parsed))
+    needed = sorted(plan.required_device_refs(parsed))
     devs = ",".join(needed) if needed else "(none)"
     print(datetime.now(), tag,
-          f"pickup {len(payload)} B  devices={devs}")
+          f"pickup {len(payload):>8} B  {devs}")
 
     try:
         _validate_against_plugins(parsed, plugins_by_name, registry)

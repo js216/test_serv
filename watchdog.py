@@ -30,7 +30,7 @@ def heartbeat_current(path=HEARTBEAT, now=None):
 
 
 def kill_poller():
-    subprocess.run(
+    return subprocess.run(
         ["pkill", "-9", "-f", PKILL_PATTERN],
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -41,9 +41,13 @@ def main():
         if age is None or age > STALE_AFTER_S:
             detail = "missing" if age is None else f"age={age:.0f}s"
             print(f"{datetime.now().isoformat(timespec='seconds')} "
-                  f"heartbeat stale ({detail}); killing poller",
+                  f"heartbeat stale ({detail}); "
+                  f"running pkill -9 -f {PKILL_PATTERN!r}",
                   flush=True)
-            kill_poller()
+            result = kill_poller()
+            print(f"{datetime.now().isoformat(timespec='seconds')} "
+                  f"pkill finished rc={result.returncode}",
+                  flush=True)
         time.sleep(CHECK_INTERVAL_S)
 
 

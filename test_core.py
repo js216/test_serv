@@ -87,6 +87,16 @@ def test_parse_basic():
     assert ops[4].verb == "mark"
 
 
+def test_required_device_refs_preserves_concrete_instances():
+    parsed = plan.load_tar(plan.pack_tar(
+        "mp135.custom:uart_open\n"
+        "msc.custom:write image=@x.bin\n"
+        "dsp:reset\n", {"x.bin": b"x"}))
+    assert plan.required_devices(parsed) == {"mp135", "msc", "dsp"}
+    assert plan.required_device_refs(parsed) == {
+        "mp135.custom", "msc.custom", "dsp"}
+
+
 def test_blob_ref_missing_rejected():
     text = "fake:emit stream=s data=@missing\n"
     # parser doesn't know about blobs yet, so this is a Value("blob",...)
@@ -1187,6 +1197,7 @@ def test_bench_id_defaults_to_hostname_and_env_overrides():
 def main():
     tests = [
         test_parse_basic,
+        test_required_device_refs_preserves_concrete_instances,
         test_blob_ref_missing_rejected,
         test_unknown_verb_rejected,
         test_pack_and_load_roundtrip,
