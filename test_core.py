@@ -1034,6 +1034,12 @@ def test_prune_skips_inflight_digests():
             inflight = server._inflight_digests()
             assert live in inflight
             assert stale not in inflight
+
+            stale_t = time.time() - server.INFLIGHT_STALE_S - 1.0
+            os.utime(os.path.join(server.STATUS, "inflight.json"),
+                     (stale_t, stale_t))
+            assert server._inflight_digests() == set(), \
+                "stale inflight snapshot must not protect jobs forever"
         finally:
             (server.INPUTS, server.OUTPUTS, server.DONE,
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs

@@ -149,6 +149,13 @@ _log_f = [None]
 # months and the artefact is gone" trap). Trade more disk for more
 # data safety; that's the right tradeoff for an R&D bench.
 REFUSED_RETENTION_S = 365 * 24 * 3600  # 365 days
+# A 409 during artefact upload means "server has no matching job
+# record". That can be permanent (operator wiped history), but it can
+# also be transient after a server restart / stale-job sweep while the
+# poller still has the only copy of the completed artefact. Keep
+# retrying for a while so resubmitting the same digest or restoring the
+# server state can recover without remote-shell access to the bench.
+REFUSED_GRACE_S = 6 * 3600  # 6 hours
 
 
 def _gc_refused_spools(now=None):
@@ -920,7 +927,7 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         print(datetime.now(), tag,
               f"pickup {len(payload)} B  devices=?  parse failed: {e}")
         tar = _failure_artefact(job_id, f"plan parse failed: {e}")
-        _post_artefact(job_id, tar, upload_s)
+        _post_artefact(job_id, tar, upload_s, try_now=False)
         return
 
     needed = sorted(plan.required_devices(parsed))
@@ -932,7 +939,7 @@ def _dispatch(payload, headers, registry, plugins_by_name):
         _validate_against_plugins(parsed, plugins_by_name, registry)
     except Exception as e:
         tar = _failure_artefact(job_id, f"validation: {e}")
-        _post_artefact(job_id, tar, upload_s)
+        _post_artefact(job_id, tar, upload_s, try_now=False)
         return
 
     session = Session(registry, parsed, runtime_s=runtime_s)
@@ -947,10 +954,10 @@ def _dispatch(payload, headers, registry, plugins_by_name):
     try:
         session.run_all(plugins_by_name)
         tar, _manifest_text = pack_artefact(session)
-        _post_artefact(job_id, tar, upload_s)
     finally:
         with _active_lock:
             _active_sessions.pop(job_id, None)
+    _post_artefact(job_id, tar, upload_s, try_now=False)
 
 
 def _validate_against_plugins(parsed, plugins_by_name, registry):
@@ -1074,14 +1081,28 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
             # No matching job record on the server (e.g. the operator
             # clicked "delete all" between session-end and our retry).
             # Don't unlink: the spool is the only on-bench evidence
-            # the run happened. Park it under refused/ so the operator
-            # can re-POST it manually after re-queueing.
+            # the run happened. Also don't park it immediately: after a
+            # server crash/restart or stale-job sweep, the operator may
+            # resubmit the same digest and the next retry will be valid.
+            try:
+                age_s = time.time() - os.path.getmtime(spool_path)
+            except OSError:
+                age_s = 0.0
+            if age_s < REFUSED_GRACE_S:
+                print(datetime.now(),
+                      f"POST {name} refused 409; keeping in "
+                      f"{PENDING} for retry for up to "
+                      f"{REFUSED_GRACE_S:.0f}s")
+                return False
+            # Grace expired. Park under refused/ so the operator can
+            # re-POST it manually after re-queueing.
             refused = os.path.join(PENDING, "refused")
             os.makedirs(refused, mode=0o700, exist_ok=True)
             try:
                 os.replace(spool_path, os.path.join(refused, name))
                 print(datetime.now(),
-                      f"POST {name} refused 409; parked under "
+                      f"POST {name} refused 409 after retry grace; "
+                      f"parked under "
                       f"{refused} (resubmit the digest, then move "
                       f"the file back into {PENDING} to retry).")
             except FileNotFoundError:
@@ -1184,13 +1205,15 @@ def _drain_pending_uploads(timeout_s=None):
         _post_spooled(path, timeout_s=per_spool)
 
 
-def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):
+def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S,
+                   try_now=True):
     """Spool the artefact to disk first, then try to upload. If the
     upload fails, the file stays in PENDING and the next main-loop
     tick's _drain_pending_uploads picks it up.
     """
     spool = _spool_artefact(job_id, tar_bytes)
-    _post_spooled(spool, timeout_s=timeout_s)
+    if try_now:
+        _post_spooled(spool, timeout_s=timeout_s)
 
 
 # Supervisor knobs. Match the prior shell-supervisor's behaviour so

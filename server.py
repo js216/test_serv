@@ -148,6 +148,7 @@ def _queued_plan_count():
 
 
 PRUNE_MIN_AGE_S = 30.0
+INFLIGHT_STALE_S = 5 * 60.0
 
 
 def prune_stale_jobs():
@@ -220,9 +221,18 @@ def _inflight_digests():
     poller currently considers live. Used to protect mid-flight jobs
     from prune/idempotency-gate races: a long session has DONE/.plan
     written + OUTPUTS/.tar not yet posted, so it would otherwise look
-    indistinguishable from a stale leftover.
+    indistinguishable from a stale leftover. Ignore stale snapshots so
+    a disconnected poller does not protect dead DONE records forever.
     """
-    raw = _read_file(os.path.join(STATUS, "inflight.json"))
+    path = os.path.join(STATUS, "inflight.json")
+    try:
+        if time.time() - os.path.getmtime(path) > INFLIGHT_STALE_S:
+            return set()
+    except FileNotFoundError:
+        return set()
+    except OSError:
+        pass
+    raw = _read_file(path)
     if not raw:
         return set()
     try:
@@ -418,7 +428,8 @@ def delete_outputs(digest, ext=""):
     artefact upload 409.
     """
     names = ([f"{digest}{ext}"] if ext else [
-        n for n in os.listdir(OUTPUTS) if n.startswith(f"{digest}.")
+        n for n in os.listdir(OUTPUTS)
+        if n.startswith(f"{digest}.") and not n.endswith(".tmp")
     ])
     removed = 0
     for n in names:

@@ -15,8 +15,10 @@ def write_atomic(path, body):
     atomic on POSIX and overwrites-if-exists on Windows.
     """
     d = os.path.dirname(path) or "."
+    tmpdir = os.path.join(d, ".tmp")
+    os.makedirs(tmpdir, mode=0o700, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
-        dir=d, prefix=os.path.basename(path) + ".", suffix=".tmp")
+        dir=tmpdir, prefix=os.path.basename(path) + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(body)
