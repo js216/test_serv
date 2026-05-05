@@ -99,7 +99,7 @@ async function refresh() {
   }
 }
 
-function _fmtUptime(s) {
+function fmtUptime(s) {
   if (s == null || s < 0) return "?";
   const d = Math.floor(s / 86400);
   const h = Math.floor((s % 86400) / 3600);
@@ -109,31 +109,30 @@ function _fmtUptime(s) {
   return `${m}m`;
 }
 
-function _fmtBytes(b) {
-  if (b == null || b < 0) return "?";
-  if (b > 1 << 30) return `${(b / (1 << 30)).toFixed(1)}GiB`;
-  if (b > 1 << 20) return `${(b / (1 << 20)).toFixed(0)}MiB`;
-  if (b > 1 << 10) return `${(b / (1 << 10)).toFixed(0)}KiB`;
-  return `${b}B`;
-}
-
 function renderBenchId() {
   const e = $("#bench-id");
   if (!e) return;
   const b = state.bench || {};
   const bid = b.bench_id;
-  // Process-health metrics: surface so an operator returning to a
-  // bench that's been up for months can spot leaks at a glance.
-  // bench.json carries uptime_s, thread_count, open_fd_count,
-  // rss_bytes; "?" if any are unavailable (non-Linux, sandboxed).
+  // Process-health + spool-backlog metrics: surface so an operator
+  // returning to a bench that's been up for months can spot leaks +
+  // tunnel issues at a glance. bench.json carries uptime_s,
+  // thread_count, open_fd_count, rss_bytes, pending_uploads,
+  // refused_spools; "?" if any are unavailable (non-Linux,
+  // sandboxed). Both spool counts are highlighted only when > 0
+  // since "0 pending" is the steady state.
   const metrics = [];
-  if (b.uptime_s != null) metrics.push(`up ${_fmtUptime(b.uptime_s)}`);
+  if (b.uptime_s != null) metrics.push(`up ${fmtUptime(b.uptime_s)}`);
   if (b.thread_count != null && b.thread_count >= 0)
     metrics.push(`${b.thread_count} threads`);
   if (b.open_fd_count != null && b.open_fd_count >= 0)
     metrics.push(`${b.open_fd_count} fds`);
   if (b.rss_bytes != null && b.rss_bytes >= 0)
-    metrics.push(`${_fmtBytes(b.rss_bytes)} RSS`);
+    metrics.push(`${fmtBytes(b.rss_bytes)} RSS`);
+  if (b.pending_uploads != null && b.pending_uploads > 0)
+    metrics.push(`${b.pending_uploads} pending`);
+  if (b.refused_spools != null && b.refused_spools > 0)
+    metrics.push(`${b.refused_spools} refused`);
   const tail = metrics.length ? ` | ${metrics.join(", ")}` : "";
   if (bid) {
     e.textContent = `bench: ${bid}${tail}`;
@@ -781,12 +780,22 @@ $("#submit-plan-btn").addEventListener("click", async () => {
 $("#refresh-now").addEventListener("click", refresh);
 
 $("#prune-jobs").addEventListener("click", async () => {
+  // Server-side prune protects (a) digests in inflight.json and
+  // (b) DONE/.plan files younger than PRUNE_MIN_AGE_S=30s. Subtract
+  // those from the user-visible count so the confirm doesn't promise
+  // more removals than the server will actually do.
+  const inflight = new Set(
+    (state.inflight || []).map(x => x && x.digest).filter(Boolean));
   const stale = state.jobs.filter(
-    j => j.status === "running" && !j.completed_at).length;
+    j => j.status === "running"
+      && !j.completed_at
+      && !inflight.has(j.digest)).length;
   if (!confirm(
-    `Clear ${stale} 'running' job(s) with no artefact on the server?\n` +
-    `(Queued and done jobs are NOT touched. Currently-running ` +
-    `sessions are protected via the live inflight signal.)`)) {
+    `Clear up to ${stale} 'running' job(s) with no artefact on the ` +
+    `server?\n(Queued and done jobs are NOT touched. ` +
+    `Currently-running sessions are protected via the live inflight ` +
+    `signal, and DONE/.plan files younger than ~30s are protected ` +
+    `against the publish-lag race -- the actual count may be lower.)`)) {
     return;
   }
   try {

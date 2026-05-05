@@ -139,6 +139,11 @@ def test_session_runs_and_artefact_has_expected_shape():
     manifest = json.loads(manifest_text)
     assert manifest["n_ops"] == 4
     assert manifest["n_errors"] >= 1
+    # n_errors > 0 must surface as status="errors" -- the dashboard
+    # and any aggregator scripting on manifest.status depend on the
+    # discriminator; without this assertion a regression that always
+    # emits "ok" would slip through silently.
+    assert manifest["status"] == "errors", manifest
 
     tf = tarfile.open(fileobj=io.BytesIO(tar_out), mode="r:")
     members = set(tf.getnames())

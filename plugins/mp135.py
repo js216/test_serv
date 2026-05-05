@@ -59,7 +59,7 @@ class Mp135Handle:
             self._thread.join(timeout=2.0)
             if self._thread.is_alive():
                 print(f"mp135 uart_close: drain thread on "
-                      f"{self._port!r} did not exit; leaked")
+                      f"{self.port!r} did not exit; leaked")
         try:
             self._ser.close()
         except Exception:

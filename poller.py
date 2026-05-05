@@ -249,6 +249,38 @@ def _count_open_fds():
         return -1
 
 
+def _count_dir_files(path, suffix=""):
+    """Count files in `path` whose name ends with `suffix`. Returns
+    -1 if the dir doesn't exist (so the dashboard can render "?").
+    Used for pending_uploads / refused_spools surfacing.
+    """
+    try:
+        return sum(1 for n in os.listdir(path) if n.endswith(suffix))
+    except OSError:
+        return -1
+
+
+def _redacted_leases(registry):
+    """Token-redacted lease snapshot for the operator-facing
+    leases.json. The lease token is the credential -- redact to
+    a 4-char prefix so the operator can correlate with their own
+    claim's manifest without leaking it to anyone else watching
+    the tunnel.
+    """
+    out = []
+    try:
+        for entry in registry.lease_list():
+            tok = entry.get("token") or ""
+            out.append({
+                "token_prefix": (tok[:4] + "...") if tok else "",
+                "devices": entry.get("devices") or [],
+                "expires_in_s": entry.get("expires_in_s") or 0.0,
+            })
+    except Exception:
+        traceback.print_exc()
+    return out
+
+
 def _self_rss_bytes():
     """RSS in bytes from /proc/self/status (VmRSS line). Returns -1
     on failure. Coupled to Linux; the rest of the bench is too, so
@@ -632,7 +664,12 @@ def _publish_status(registry, plugins_by_name):
     # identity in the header + a few process-health metrics so the
     # operator can spot slow-grow problems (leaked drain threads,
     # leaked file descriptors, runaway memory) BEFORE they cause an
-    # OOM kill on a bench that's been up for months.
+    # OOM kill on a bench that's been up for months. Also includes
+    # PENDING/ + PENDING/refused/ counts so a stuck-tunnel backlog
+    # is visible at a glance instead of requiring an ssh + ls.
+    pending_n = _count_dir_files(PENDING, ".tar")
+    refused_n = _count_dir_files(
+        os.path.join(PENDING, "refused"), ".tar")
     bench = json.dumps({
         "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
         "code_digest": _CODE_DIGEST,
@@ -640,9 +677,21 @@ def _publish_status(registry, plugins_by_name):
         "thread_count": threading.active_count(),
         "open_fd_count": _count_open_fds(),
         "rss_bytes": _self_rss_bytes(),
+        "pending_uploads": pending_n,
+        "refused_spools": refused_n,
     }).encode()
     _write_atomic(os.path.join(STATUS, "bench.json"), bench)
     _push_status("bench.json", bench)
+
+    # leases.json: token-redacted snapshot of live cross-session
+    # leases so a returning operator can see "what's holding dsp.A"
+    # without composing a lease:list plan and reading the artefact.
+    # Tokens are NEVER published here -- only the device list +
+    # remaining seconds. Operator who needs the actual token to
+    # release it has to look at the original claim's manifest.
+    leases = json.dumps(_redacted_leases(registry), indent=2).encode()
+    _write_atomic(os.path.join(STATUS, "leases.json"), leases)
+    _push_status("leases.json", leases)
 
     _publish_inflight()
 
@@ -1057,6 +1106,27 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
 
 
 DRAIN_PER_SPOOL_TIMEOUT_S = 30.0
+# Heuristic for "healthy slow tunnel" budget: assume the tunnel can
+# move at least this many bytes per second. A 100 MiB artefact
+# therefore gets ~100s; a 5 MiB artefact still uses the 30s floor.
+# Scaled cap stays well under DEFAULT_UPLOAD_S=600s, so the bench
+# stays responsive even under sustained slow-tunnel conditions.
+DRAIN_BYTES_PER_S_FLOOR = 1_000_000
+
+
+def _drain_per_spool_timeout(spool_path):
+    """Per-spool upload cap for the main-loop drain. Floor is the
+    constant 30s (covers a wedged tunnel quickly); scales up with
+    file size so a healthy-but-slow tunnel can complete a 100 MiB
+    artefact instead of getting stuck retrying it forever (each
+    attempt failing identically with no progress).
+    """
+    try:
+        size = os.path.getsize(spool_path)
+    except OSError:
+        return DRAIN_PER_SPOOL_TIMEOUT_S
+    scaled = DRAIN_PER_SPOOL_TIMEOUT_S + size / DRAIN_BYTES_PER_S_FLOOR
+    return min(DEFAULT_UPLOAD_S, scaled)
 
 
 def _drain_pending_uploads(timeout_s=None):
@@ -1067,18 +1137,18 @@ def _drain_pending_uploads(timeout_s=None):
     the SSH tunnel is wedged (TCP black-hole, not RST), each upload
     can take the full timeout before giving up. The circuit-breaker
     skips next tick on the first failure, but the FIRST failure
-    still has to actually time out -- so we cap the per-spool
-    timeout to DRAIN_PER_SPOOL_TIMEOUT_S (30s) instead of the
-    foreground DEFAULT_UPLOAD_S (600s). The long timeout is for
-    the foreground _post_artefact path where a worker thread is
-    waiting on its own upload; the main-loop drain just retries
-    next tick, so a tight cap there keeps the loop responsive
-    (cancels still get drained, /plan still gets pulled).
+    still has to actually time out -- so the per-spool timeout is
+    DRAIN_PER_SPOOL_TIMEOUT_S (30s) plus a size-scaled allowance
+    instead of the foreground DEFAULT_UPLOAD_S (600s). The long
+    timeout is for the foreground _post_artefact path where a
+    worker thread is waiting on its own upload; the main-loop
+    drain just retries next tick, so a tight floor keeps the loop
+    responsive (cancels still get drained, /plan still gets pulled)
+    while the size scaling lets large healthy uploads actually
+    complete on slow tunnels.
     """
     if time.monotonic() < _push_circuit_until:
         return
-    if timeout_s is None:
-        timeout_s = DRAIN_PER_SPOOL_TIMEOUT_S
     try:
         names = sorted(os.listdir(PENDING))
     except FileNotFoundError:
@@ -1086,7 +1156,11 @@ def _drain_pending_uploads(timeout_s=None):
     for n in names:
         if not n.endswith(".tar"):
             continue
-        _post_spooled(os.path.join(PENDING, n), timeout_s=timeout_s)
+        path = os.path.join(PENDING, n)
+        per_spool = (timeout_s
+                     if timeout_s is not None
+                     else _drain_per_spool_timeout(path))
+        _post_spooled(path, timeout_s=per_spool)
 
 
 def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):

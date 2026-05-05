@@ -516,6 +516,19 @@ class _Acquire:
             # is held throughout, so two threads can't race to open
             # the same key.
             with reg.lock:
+                # Re-check quarantine: a thread that was queued on
+                # dev_lock.acquire() while a concurrent _Acquire's
+                # pl.open() was hanging would otherwise pass the
+                # outer quarantine check, then proceed to also call
+                # pl.open() against the still-wedged driver. Without
+                # this re-check, N concurrent waiters each pay one
+                # OPEN_TIMEOUT_S before recovering. With it, the
+                # first timeout's quarantine flag fast-fails the
+                # rest immediately.
+                if key in reg.quarantined:
+                    raise BusyError(
+                        f"device {key!r} quarantined while waiting "
+                        f"on dev_lock; a prior open timed out")
                 entry = reg.cache.get(key)
                 if entry is not None:
                     handle = entry[0]
@@ -549,6 +562,23 @@ class _Acquire:
                 # the BusyError handler below correctly releases it.
                 with reg.lock:
                     reg.quarantined.add(key)
+                    # Mirror the quarantine into verify_results so
+                    # the dashboard's verify column shows the device
+                    # as not-OK. Without this, list_devices() carries
+                    # whatever the last verify_sweep wrote (often a
+                    # stale "ok"), and the operator looking at a
+                    # green device row has zero clue why their plans
+                    # keep failing with "quarantined".
+                    reg.verify_results[key] = {
+                        "t": time.time(),
+                        "ok": False,
+                        "verified": False,
+                        "err": (f"quarantined: pl.open() timed out "
+                                f"after {OPEN_TIMEOUT_S:.0f}s mid-"
+                                f"session; clear via POST /devices/"
+                                f"{key}/release after replug"),
+                        "latency_ms": OPEN_TIMEOUT_S * 1e3,
+                    }
                 raise BusyError(
                     f"{key} pl.open() timed out after "
                     f"{OPEN_TIMEOUT_S:.0f}s; quarantined")

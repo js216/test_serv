@@ -112,9 +112,12 @@ as-is; a plain plan.txt body is wrapped in a tar server-side. Response:
 
 ```
 201 {"status": "queued",        "digest": "<sha256>"}
+400 {"status": "empty"}
 409 {"status": "duplicate",     "digest": "<sha256>"}
 409 {"status": "stale_outputs", "digest": "<sha256>"}
-413 {"status": "too_large", "limit": <bytes>}
+413 {"status": "too_large",   "limit": <bytes>}
+429 {"status": "queue_full",  "limit": <jobs>}
+507 {"status": "disk_full"}
 ```
 
 Two optional request headers tune the poller:
@@ -149,10 +152,28 @@ Inspect:
 GET /jobs                     # list every job (queued, running, done)
 GET /devices                  # poller's device-probe snapshot
 GET /ops                      # bench.ops.json (full plugin/op map)
-GET /examples                 # bundled starter plan names
-GET /examples/<name>          # fetch one
-POST /sweep                   # trigger a probe + verify pass
-POST /devices/<id>/release    # drop an idle cached handle
+GET /inflight                 # live tail: per-session events + stream peeks
+GET /bench                    # bench identity + uptime + thread/fd/RSS metrics
+GET /leases                   # token-redacted live lease snapshot
+GET /cancels                  # poller pulls cancel markers (internal use)
+GET /examples                 # bundled starter plan names (filtered to runnable)
+GET /examples/<name>          # plan body as text/plain
+GET /examples/<name>.tar      # plan packed with bundled blobs, ready to /submit
+GET /help                     # one-liner pointer to README
+GET /outputs/<digest>/manifest         # extract just manifest.json from the tar
+GET /outputs/<digest>/file/<member>    # extract one named member
+POST /sweep                   # trigger a probe + verify pass (deferred while busy)
+POST /devices/<id>/release    # drop an idle cached handle; clears quarantine
+```
+
+Cleanup / state-reset operations (operator-grade, dashboard-button):
+
+```
+DELETE /jobs                  # "clear stale": drop DONE/<d>.plan with no
+                              #   OUTPUTS, protected by inflight + 30s mtime
+DELETE /jobs/all              # "wipe": nuke INPUTS, DONE, OUTPUTS, CANCEL
+                              #   (does NOT cancel running sessions; the
+                              #   artefact will reappear when they finish)
 ```
 
 ### plan grammar (complete)

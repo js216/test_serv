@@ -772,7 +772,15 @@ class Session:
         if op.verb not in plugin.ops:
             raise PlanError(f"{op.device}: unknown op {op.verb!r}")
         schema = plugin.ops[op.verb]
-        decoded = decode_args(schema, op.args, self.plan.blobs)
+        try:
+            decoded = decode_args(schema, op.args, self.plan.blobs)
+        except (ValueError, TypeError) as e:
+            # Prepend op location so the plan author sees
+            # "line 7: dsp.A:qspi_write_prbs: missing arg 'chunk_size'"
+            # in errors.log instead of a bare "missing arg 'chunk_size'"
+            # they then have to cross-reference with ops.jsonl.
+            raise type(e)(
+                f"line {op.lineno}: {op.device}:{op.verb}: {e}") from e
 
         key = self._resolve_device(op.device)
         if key in self.pinned:
