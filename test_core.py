@@ -419,6 +419,54 @@ def test_signal_cancel_sigkills_session_subprocs():
     reg.close_all()
 
 
+def test_refresh_survives_a_hung_probe():
+    """A plugin's probe() that hangs in a C call (e.g. ftd2xx's
+    getDeviceInfoDetail wedged on a USB blip) must NOT block the
+    main loop. registry.refresh() runs on the poller's main thread
+    and a hung probe used to wedge the entire bench (no pickups,
+    no cancels, no inflight publishes for 21+ hours).
+
+    refresh() now caps each probe call at PROBE_TIMEOUT_S; a hung
+    probe is logged + skipped so the rest of the plugins still
+    contribute their specs and the tick completes.
+    """
+    import registry as _reg
+
+    class HungPlugin(DevicePlugin):
+        name = "hung"
+
+        def probe(self):
+            # Mimic a C-level wedge by sleeping much longer than the
+            # cap. Test must not block on this.
+            time.sleep(_reg.PROBE_TIMEOUT_S * 3)
+            return [{"id": "0"}]
+
+        def open(self, spec):
+            return type("H", (), {})()
+
+        def close(self, h):
+            pass
+
+    plugins = {"hung": HungPlugin(), "fake": FakePlugin()}
+    reg = DeviceRegistry(plugins)
+    # Shrink the cap for the test so it actually finishes.
+    saved = _reg.PROBE_TIMEOUT_S
+    _reg.PROBE_TIMEOUT_S = 0.5
+    try:
+        t0 = time.monotonic()
+        reg.refresh()
+        elapsed = time.monotonic() - t0
+        # Refresh must return promptly, not block on the hung probe.
+        assert elapsed < 2.0, f"refresh blocked {elapsed:.2f}s on hung probe"
+        # The healthy plugin's specs must still land.
+        assert "fake.0" in reg.specs, reg.specs
+        # The hung plugin contributes nothing this tick.
+        assert "hung.0" not in reg.specs, reg.specs
+    finally:
+        _reg.PROBE_TIMEOUT_S = saved
+        reg.close_all()
+
+
 def test_refresh_does_not_evict_pinned():
     """If a session has acquired a device and refresh runs while
     that device is transiently absent from probe(), the spec must
@@ -874,6 +922,7 @@ def main():
         test_stop_session_clean_termination,
         test_cancel_propagates_to_session,
         test_signal_cancel_sigkills_session_subprocs,
+        test_refresh_survives_a_hung_probe,
         test_refresh_does_not_evict_pinned,
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,

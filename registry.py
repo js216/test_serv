@@ -22,6 +22,16 @@ MAX_LEASES = 256
 # operator doesn't think the bench is wedged.
 VERIFY_OPEN_TIMEOUT_S = 30.0
 
+# Per-plugin probe() wall-clock cap during refresh / refresh_plugin.
+# A plugin's probe call into a third-party C extension (ftd2xx,
+# pyusb, pyft4222) can hang in a kernel USB syscall if the device
+# disappears mid-enumeration -- and `refresh()` runs on the main
+# loop thread, so a stuck probe wedges the entire poller (no
+# pickups, no cancels, no inflight publishes, just a process that
+# looks alive but logs nothing). Wrap each probe in a thread with
+# this cap so a hung driver eats one tick instead of the bench.
+PROBE_TIMEOUT_S = 15.0
+
 
 class DeviceRegistry:
     """Tracks device specs and lends handles on demand.
@@ -72,6 +82,41 @@ class DeviceRegistry:
         # "replug + restart" signal in /devices verify column.
         self.quarantined = set()
 
+    def _probe_with_timeout(self, pname, pl):
+        """Call ``pl.probe()`` with a wall-clock cap so a hung
+        third-party driver (ftd2xx, pyusb, etc) can't wedge the
+        main loop. Returns the spec list, or [] on exception or
+        timeout. The thread is left running on timeout -- C-level
+        blocking syscalls can't be interrupted from Python -- but
+        the next refresh tick will try again and recover once the
+        driver unhangs (or stay [] forever, which is still
+        infinitely better than wedging the whole poller).
+        """
+        result = []
+        err_box = []
+
+        def _do():
+            try:
+                got = pl.probe() or []
+                result.extend(got)
+            except Exception:
+                err_box.append(traceback.format_exc())
+
+        t = threading.Thread(
+            target=_do, daemon=True,
+            name=f"probe-{pname}")
+        t.start()
+        t.join(timeout=PROBE_TIMEOUT_S)
+        if t.is_alive():
+            print(f"refresh: {pname}.probe() timed out after "
+                  f"{PROBE_TIMEOUT_S:.0f}s "
+                  f"(thread leaked, will retry next tick)")
+            return []
+        if err_box:
+            print(f"refresh: {pname}.probe() raised:\n{err_box[0]}")
+            return []
+        return result
+
     def refresh(self):
         """Rescan every plugin's probe() and update specs."""
         # Drop any cached config snapshot so all plugins probe()d in
@@ -86,11 +131,7 @@ class DeviceRegistry:
             pass
         found = {}
         for pname, pl in self.plugins.items():
-            try:
-                specs = pl.probe() or []
-            except Exception:
-                traceback.print_exc()
-                specs = []
+            specs = self._probe_with_timeout(pname, pl)
             for spec in specs:
                 did = spec.get("id")
                 if did is None:
@@ -126,11 +167,7 @@ class DeviceRegistry:
         pl = self.plugins.get(name)
         if pl is None:
             return
-        try:
-            specs = pl.probe() or []
-        except Exception:
-            traceback.print_exc()
-            specs = []
+        specs = self._probe_with_timeout(name, pl)
         found = {}
         for spec in specs:
             did = spec.get("id")
