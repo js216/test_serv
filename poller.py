@@ -54,6 +54,9 @@ STATUS = os.path.join(STATE_DIR, "status")
 RELEASE = os.path.join(STATE_DIR, "release")
 SWEEP = os.path.join(STATE_DIR, "sweep")
 LOG = os.path.join(STATE_DIR, "log.txt")
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+HEARTBEAT_LOG = os.path.join(REPO_DIR, "heartbeat.log")
+HEARTBEAT_INTERVAL_S = 30.0
 # Artefacts produced by run_all are spooled here before the POST to
 # the server. If the POST fails (server restart, SSH-tunnel hiccup),
 # the file stays on bench-side disk and the next main-loop tick
@@ -561,6 +564,12 @@ def _meta_float(headers, key, default, hard_max):
 
 
 _write_atomic = paths.write_atomic
+
+
+def _write_heartbeat(path=HEARTBEAT_LOG, now=None):
+    ts = datetime.fromtimestamp(now or time.time()).isoformat(
+        timespec="seconds")
+    _write_atomic(path, f"{ts}\n".encode())
 
 
 _PUSH_CIRCUIT_OPEN_S = 30.0
@@ -1422,6 +1431,7 @@ def _run_poller():
         pass
 
     last_refresh = time.monotonic()
+    last_heartbeat = 0.0
     base = f"http://localhost:{HTTP_PORT}"
 
     # Useful concurrency is bounded by the number of distinct device
@@ -1447,6 +1457,10 @@ def _run_poller():
 
     try:
         while True:
+            now = time.monotonic()
+            if now - last_heartbeat >= HEARTBEAT_INTERVAL_S:
+                _write_heartbeat()
+                last_heartbeat = now
             _drain_release_markers(registry)
             _drain_sweep_markers(registry, plugins_by_name)
             _drain_cancels()
@@ -1457,7 +1471,7 @@ def _run_poller():
             _publish_inflight()
             _rotate_log_in_loop(LOG)
 
-            if time.monotonic() - last_refresh > DEVICE_REFRESH_S:
+            if now - last_refresh > DEVICE_REFRESH_S:
                 registry.refresh()
                 _publish_status(registry, plugins_by_name)
                 _gc_refused_spools()
