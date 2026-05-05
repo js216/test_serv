@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-License-Identifier: MIT
+# do.sh --- TODO: description
+# Copyright (c) 2026 Jakob Kastelic
 set -e
 
 cat > /etc/udev/rules.d/99-bench-usb.rules <<'EOF'

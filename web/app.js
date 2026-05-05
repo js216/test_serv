@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: MIT
+// app.js --- TODO: description
+// Copyright (c) 2026 Jakob Kastelic
 // test_serv web UI -- vanilla JS, no build step.
 // All status fetches are manual (refresh-now, run-inventory, or the
 // implicit refresh after a plan submit). Submits plans via
