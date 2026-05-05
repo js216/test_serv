@@ -3,6 +3,7 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -240,6 +241,36 @@ def test_server_rest_queue_helpers():
         finally:
             (server.INPUTS, server.OUTPUTS, server.DONE,
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
+
+
+def test_request_path_strips_query_for_static_assets():
+    assert server._request_path("/web/style.css?v=20260505-2") == (
+        "web/style.css")
+    assert server._request_path("/web/app.js?cache=bust") == "web/app.js"
+    assert server._request_path("//[::1") is None
+
+
+def test_static_assets_accept_query_and_disable_cache():
+    httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = httpd.server_address
+        conn = http.client.HTTPConnection(host, port, timeout=5)
+        try:
+            conn.request("GET", "/web/style.css?v=20260505-2")
+            resp = conn.getresponse()
+            body = resp.read()
+        finally:
+            conn.close()
+        assert resp.status == 200, resp.status
+        assert resp.getheader("Content-Type").startswith("text/css")
+        assert resp.getheader("Cache-Control") == "no-store"
+        assert body.startswith(b"/* SPDX-License-Identifier: MIT */")
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        thread.join(timeout=5)
 
 
 def test_queue_job_rejects_resubmit_while_inflight():
@@ -1033,12 +1064,20 @@ def test_check_record_lands_in_manifest():
 
 def test_bench_id_defaults_to_hostname_and_env_overrides():
     old = os.environ.get("TEST_SERV_BENCH_ID")
+    orig_gethostname = socket.gethostname
     try:
         os.environ.pop("TEST_SERV_BENCH_ID", None)
         assert bench_id() == (socket.gethostname() or "unknown")
+        socket.gethostname = lambda: ""
+        assert bench_id() == "unknown"
+        def _raise_hostname():
+            raise OSError("hostname unavailable")
+        socket.gethostname = _raise_hostname
+        assert bench_id() == "unknown"
         os.environ["TEST_SERV_BENCH_ID"] = "bench-alias"
         assert bench_id() == "bench-alias"
     finally:
+        socket.gethostname = orig_gethostname
         if old is None:
             os.environ.pop("TEST_SERV_BENCH_ID", None)
         else:
@@ -1057,6 +1096,8 @@ def main():
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
         test_server_rest_queue_helpers,
+        test_request_path_strips_query_for_static_assets,
+        test_static_assets_accept_query_and_disable_cache,
         test_queue_job_rejects_resubmit_while_inflight,
         test_lazy_handle_cache_and_release,
         test_bounded_sizes,

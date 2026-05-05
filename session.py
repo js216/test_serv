@@ -43,7 +43,11 @@ def bench_id():
     configured = os.environ.get("TEST_SERV_BENCH_ID")
     if configured:
         return configured
-    return socket.gethostname() or "unknown"
+    try:
+        host = socket.gethostname()
+    except OSError:
+        host = ""
+    return host or "unknown"
 
 
 def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,

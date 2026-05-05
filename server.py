@@ -13,6 +13,7 @@ import re
 import tarfile
 import threading
 import time
+import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 
@@ -113,6 +114,13 @@ def _read_file(path):
         with open(path, "rb") as f:
             return f.read()
     except FileNotFoundError:
+        return None
+
+
+def _request_path(raw_path):
+    try:
+        return urllib.parse.urlsplit(raw_path).path.lstrip("/")
+    except ValueError:
         return None
 
 
@@ -502,7 +510,9 @@ class Handler(BaseHTTPRequestHandler):
     # --- dispatch ---
 
     def do_GET(self):
-        path = self.path.lstrip("/")
+        path = _request_path(self.path)
+        if path is None:
+            self.send_response(400); self.end_headers(); return
         if path == "devices":
             return self._send_json(
                 _read_file(os.path.join(STATUS, "devices.json")) or b"[]")
@@ -547,7 +557,9 @@ class Handler(BaseHTTPRequestHandler):
         return self._pickup(path)
 
     def do_POST(self):
-        path = self.path.lstrip("/")
+        path = _request_path(self.path)
+        if path is None:
+            self.send_response(400); self.end_headers(); return
         if path == "submit":
             return self._submit_job()
         # /devices/<id>/release
@@ -568,7 +580,9 @@ class Handler(BaseHTTPRequestHandler):
         # Sole HEAD path: /outputs/<digest>.tar -- cheap completion
         # poll for clients waiting on a job to finish. 200 when the
         # tar is on disk, 404 otherwise. No body either way.
-        path = self.path.lstrip("/")
+        path = _request_path(self.path)
+        if path is None:
+            self.send_response(400); self.end_headers(); return
         m = re.match(r"^outputs/([0-9a-f]{64})\.tar$", path)
         if not m:
             self.send_response(404)
@@ -583,7 +597,9 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_DELETE(self):
-        path = self.path.lstrip("/")
+        path = _request_path(self.path)
+        if path is None:
+            self.send_response(400); self.end_headers(); return
         if path.startswith("outputs/"):
             return self._delete_outputs(path[len("outputs/"):])
         if path == "jobs":
@@ -752,6 +768,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
 
