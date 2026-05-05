@@ -32,15 +32,21 @@ Bench-host system tools (not pip):
 
 ```
 python3 server.py [--port 8080]        # server/client host
-./run_poller.sh                        # bench host (production)
-python3 poller.py                      # bench host (debug)
+python3 poller.py                      # bench host
+python3 poller.py --no-supervisor      # bench host (debug)
 ```
 
-`run_poller.sh` is a tiny supervisor: if the poller crashes (e.g.
-glibc heap-corruption from a third-party C extension), it respawns
-after a 5s cooldown so the bench doesn't go offline until an
-operator notices. `python3 poller.py` is the foreground form for
-debugging, where you want a crash to surface immediately.
+`python3 poller.py` self-supervises: it spawns a worker child and
+respawns on non-zero exit so a third-party C-extension SIGABRT or
+SIGSEGV (libusb, ftd2xx, pyft4222 -- triggered when a USB device
+flaps mid-syscall) doesn't take the bench offline. Clean exits and
+SIGINT/SIGTERM stop the supervisor cleanly. It also re-execs once
+at startup with `GLIBC_TUNABLES=glibc.malloc.tcache_count=0` to
+disable glibc's per-thread malloc cache, which prevents the
+specific tcache-shutdown abort path that is otherwise triggered by
+a leaked libusb thread eventually returning with corrupted heap
+state. Pass `--no-supervisor` for debug runs where you want a
+crash to surface immediately.
 
 `poller.py` must be able to reach `server.py` at `localhost:8080`
 from the bench host, typically via an operator-managed SSH tunnel

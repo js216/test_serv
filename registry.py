@@ -126,13 +126,36 @@ class DeviceRegistry:
         third-party driver (ftd2xx, pyusb, etc) can't wedge the
         main loop. Returns the spec list, or [] on exception or
         timeout. The next refresh tick will try again.
+
+        Guards against firing a second probe of the same plugin
+        while the prior probe's leaked thread is still inside the
+        C library. Two concurrent libusb listdev calls on a flapping
+        bus is exactly the input that drives the underlying drivers
+        into the corrupt state we're trying to avoid.
         """
+        if not hasattr(self, "_probe_inflight"):
+            self._probe_inflight = set()
+            self._probe_inflight_lock = threading.Lock()
+        with self._probe_inflight_lock:
+            if pname in self._probe_inflight:
+                # Prior leaked probe is still running; don't pile on.
+                return []
+            self._probe_inflight.add(pname)
+
+        def _do():
+            try:
+                return pl.probe() or []
+            finally:
+                with self._probe_inflight_lock:
+                    self._probe_inflight.discard(pname)
+
         result, err, timed_out = _run_with_wallclock_timeout(
-            f"probe-{pname}", lambda: pl.probe() or [], PROBE_TIMEOUT_S)
+            f"probe-{pname}", _do, PROBE_TIMEOUT_S)
         if timed_out:
             print(f"refresh: {pname}.probe() timed out after "
                   f"{PROBE_TIMEOUT_S:.0f}s "
-                  f"(thread leaked, will retry next tick)")
+                  f"(thread leaked, will skip this plugin until it "
+                  f"returns)")
             return []
         if err:
             print(f"refresh: {pname}.probe() raised:\n{err}")

@@ -2,6 +2,27 @@
 # poller.py --- Bench-host loop: pick up .plan jobs, run sessions, post tars
 # Copyright (c) 2026 Jakob Kastelic
 
+# Disable glibc's per-thread malloc cache before we import anything
+# heavy, BUT only when run as the main script. When imported as a
+# module (test_core, agent code), don't re-exec the host process.
+# Rationale: when a third-party C extension (libusb / pyusb /
+# pyft4222 / ftd2xx) hits internal corruption -- the failure mode
+# where a USB device flaps mid-syscall -- glibc's
+# tcache_thread_shutdown walks the per-thread cache at thread exit,
+# finds an unaligned chunk, and SIGABRTs the entire process. With
+# tcache_count=0 the cache is never populated, so the shutdown walk
+# is a no-op and the corruption can't fire the abort. Re-exec
+# ourselves once so glibc actually honours the env var (tunables
+# are read at process startup, not at runtime mutation).
+import os as _os, sys as _sys
+if (__name__ == "__main__"
+        and _os.name == "posix"
+        and "GLIBC_TUNABLES" not in _os.environ
+        and not _os.environ.get("_TEST_SERV_TCACHE_OK")):
+    _os.environ["GLIBC_TUNABLES"] = "glibc.malloc.tcache_count=0"
+    _os.environ["_TEST_SERV_TCACHE_OK"] = "1"
+    _os.execv(_sys.executable, [_sys.executable] + _sys.argv)
+
 import hashlib
 import http.client
 import io
@@ -1172,7 +1193,128 @@ def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S):
     _post_spooled(spool, timeout_s=timeout_s)
 
 
+# Supervisor knobs. Match the prior shell-supervisor's behaviour so
+# the move from run_poller.sh to in-process supervision is invisible
+# to the operator.
+SUPERVISOR_COOLDOWN_S = 5.0
+SUPERVISOR_RUN_BUDGET_S = 10.0
+SUPERVISOR_MAX_FAST_FAILS = 5
+# Hidden flag the supervisor passes to its worker child so the child
+# knows not to recurse into another supervisor.
+_WORKER_FLAG = "--_worker"
+
+
+def _supervise():
+    """Respawn the worker child on non-zero exit so a third-party C
+    extension SIGABRT (pyusb / pyft4222 / ftd2xx heap corruption when
+    a USB device flaps mid-syscall) doesn't take the bench offline.
+
+    Folded into poller.py instead of a separate shell script so the
+    operator can't accidentally invoke an un-supervised poller and
+    lose the bench to the next driver glitch. `python3 poller.py`
+    runs the supervisor; the supervisor spawns a worker child with
+    the hidden _WORKER_FLAG and respawns it on crash. Pass
+    --no-supervisor to run un-supervised (debug only).
+
+    Clean exits (rc=0), SIGINT (rc=130 / -SIGINT), and SIGTERM
+    (rc=143 / -SIGTERM) all stop the supervisor; otherwise it
+    respawns after SUPERVISOR_COOLDOWN_S. Five fast-fails in a row
+    abort so an operator with a config error sees the failure
+    instead of the supervisor spinning forever.
+    """
+    import subprocess
+
+    # Pass through any extra args (e.g. --no-supervisor's siblings if
+    # we add some later, or --port / config overrides). argv[0] is
+    # this script's path; everything else is forwarded.
+    extra = [a for a in sys.argv[1:] if a != _WORKER_FLAG]
+
+    child_box = [None]
+
+    def _forward(signum, _frame):
+        c = child_box[0]
+        if c is None or c.poll() is not None:
+            return
+        try:
+            c.send_signal(signum)
+        except Exception:
+            pass
+
+    for sig_name in ("SIGINT", "SIGTERM", "SIGHUP"):
+        sig = getattr(signal, sig_name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, _forward)
+            except (ValueError, OSError):
+                pass
+
+    print(f"{datetime.now()} supervisor: starting worker child "
+          f"(--no-supervisor to run un-supervised for debug)")
+
+    fast_fails = 0
+    while True:
+        argv = [sys.executable, os.path.abspath(__file__),
+                _WORKER_FLAG] + extra
+        start = time.monotonic()
+        try:
+            p = subprocess.Popen(argv)
+        except OSError as e:
+            print(f"{datetime.now()} supervisor: spawn failed: {e}",
+                  file=sys.stderr)
+            return 1
+        child_box[0] = p
+        rc = p.wait()
+        elapsed = time.monotonic() - start
+
+        # Negative rc on POSIX = killed by signal -rc.
+        sig_rc = -rc if rc < 0 else 0
+        if rc == 0:
+            print(f"{datetime.now()} supervisor: worker exited "
+                  f"cleanly (rc=0); not respawning")
+            return 0
+        if rc == 130 or sig_rc == getattr(signal, "SIGINT", 2):
+            print(f"{datetime.now()} supervisor: worker exited via "
+                  f"SIGINT; not respawning")
+            return 0
+        if rc == 143 or sig_rc == getattr(signal, "SIGTERM", 15):
+            print(f"{datetime.now()} supervisor: worker exited via "
+                  f"SIGTERM; not respawning")
+            return 0
+
+        if elapsed < SUPERVISOR_RUN_BUDGET_S:
+            fast_fails += 1
+            print(f"{datetime.now()} supervisor: worker died after "
+                  f"{elapsed:.1f}s (rc={rc}, fast-fail "
+                  f"{fast_fails}/{SUPERVISOR_MAX_FAST_FAILS})",
+                  file=sys.stderr)
+            if fast_fails >= SUPERVISOR_MAX_FAST_FAILS:
+                print(f"{datetime.now()} supervisor: too many fast "
+                      f"fails; giving up so the operator can "
+                      f"investigate", file=sys.stderr)
+                return 1
+        else:
+            fast_fails = 0
+            print(f"{datetime.now()} supervisor: worker died after "
+                  f"{elapsed:.1f}s (rc={rc}); respawning in "
+                  f"{SUPERVISOR_COOLDOWN_S:.0f}s", file=sys.stderr)
+        time.sleep(SUPERVISOR_COOLDOWN_S)
+
+
 def main():
+    # Operator-facing entry: by default we self-supervise. The hidden
+    # _WORKER_FLAG marks the spawned child; --no-supervisor lets the
+    # operator opt out for a debug run where they want a crash to be
+    # immediately visible instead of respawning.
+    if _WORKER_FLAG in sys.argv:
+        sys.argv = [a for a in sys.argv if a != _WORKER_FLAG]
+        return _run_poller()
+    if "--no-supervisor" in sys.argv:
+        sys.argv = [a for a in sys.argv if a != "--no-supervisor"]
+        return _run_poller()
+    return _supervise()
+
+
+def _run_poller():
     os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     os.makedirs(PENDING, mode=0o700, exist_ok=True)
     # Advisory lock on STATE_DIR so a second poller against the same
