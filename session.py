@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import socket
 import sys
 import tarfile
 import threading
@@ -30,6 +31,19 @@ MAX_SESSION_S = 3600.0
 # a third-party C extension. Module-level so tests can shrink them.
 WATCHDOG_SOFT_GRACE_S = 30.0
 WATCHDOG_HARD_GRACE_S = 90.0
+
+
+def bench_id():
+    """Return the bench identity stamped into manifests/status.
+
+    TEST_SERV_BENCH_ID remains an explicit override for fleets or
+    aliases; a single-bench setup should not need config, so default
+    to the host name.
+    """
+    configured = os.environ.get("TEST_SERV_BENCH_ID")
+    if configured:
+        return configured
+    return socket.gethostname() or "unknown"
 
 
 def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
@@ -72,7 +86,7 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
         "required_devices": sorted(required_devices),
         "expectations": list(expectations or []),
         "checks": list(checks or []),
-        "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
+        "bench_id": bench_id(),
         "run_id": run_id,
         "plan_digest": plan_digest,
         "code_digest": code_digest,

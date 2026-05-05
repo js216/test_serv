@@ -141,7 +141,7 @@ function renderBenchId() {
     e.textContent = `bench: ${bid}${tail}`;
     e.className = "bench-id bench-id-set";
   } else {
-    e.textContent = `bench: (unset — set $TEST_SERV_BENCH_ID)${tail}`;
+    e.textContent = `bench: (unknown)${tail}`;
     e.className = "bench-id bench-id-unset";
   }
 }

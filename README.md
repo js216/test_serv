@@ -59,7 +59,7 @@ from the bench host, typically via an operator-managed SSH tunnel
 | `TEST_SERV_DIR`       | state dir for inputs/outputs/done/status     | `~/.local/share/test_serv` (POSIX)     |
 | `TEST_SERV_CONFIG`    | absolute path to `config.json`               | `$TEST_SERV_DIR/config.json` then repo |
 | `TEST_SERV_URL`       | base URL the agent clients post against      | `http://localhost:8080`                |
-| `TEST_SERV_BENCH_ID`  | label embedded in every artefact's manifest  | unset (manifest field stays `null`)    |
+| `TEST_SERV_BENCH_ID`  | override label embedded in every artefact's manifest | host name                       |
 | `TEST_SERV_PORT`      | port the server binds and the poller connects to | `8080`                             |
 
 ### first plan
@@ -287,7 +287,7 @@ manifest.json         status, t0_wall_iso, runtime, streams, files,
                       n_ops, n_errors, required_devices, expectations,
                       checks (machine-readable pass/fail), run_id,
                       plan_digest, code_digest, blob_digests,
-                      bench_id (from $TEST_SERV_BENCH_ID)
+                      bench_id (host name, or $TEST_SERV_BENCH_ID override)
 timeline.log          merged human-sortable timeline (each row prefixed
                       by ISO wall-clock time + monotonic offset)
 ops.jsonl             one JSON record per op: verb, start, end, status

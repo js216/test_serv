@@ -46,7 +46,7 @@ import plan
 import plugins
 from plugin import Op
 from registry import DeviceRegistry
-from session import Session, pack_artefact
+from session import Session, bench_id, pack_artefact
 
 
 STATE_DIR = paths.state_dir()
@@ -692,7 +692,7 @@ def _publish_status(registry, plugins_by_name):
     refused_n = _count_dir_files(
         os.path.join(PENDING, "refused"), ".tar")
     bench = json.dumps({
-        "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
+        "bench_id": bench_id(),
         "code_digest": _CODE_DIGEST,
         "uptime_s": time.monotonic() - _BENCH_START_MONO,
         "thread_count": threading.active_count(),

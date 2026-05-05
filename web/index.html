@@ -12,7 +12,7 @@
   <header>
     <h1>test_serv</h1>
     <div class="status">
-      <span id="bench-id" class="bench-id" title="bench identity ($TEST_SERV_BENCH_ID on the poller's host) plus uptime / thread / fd / RSS metrics. Leaked drain threads or fds growing 1-2 per session over weeks is the early warning for a bench that needs a poller restart."></span>
+      <span id="bench-id" class="bench-id" title="bench identity (hostname by default, or $TEST_SERV_BENCH_ID on the poller's host) plus uptime / thread / fd / RSS metrics. Leaked drain threads or fds growing 1-2 per session over weeks is the early warning for a bench that needs a poller restart."></span>
       <span id="poll-status" class="poll-ok">poll: --</span>
       <button id="refresh-now" type="button" title="Re-fetch /devices and /ops from the server. Cheap; no bench work. Shows the latest snapshot the poller has pushed.">refresh now</button>
       <button id="run-inventory" type="button" title="POST /sweep + run an `inventory` plan. Forces the poller to re-probe USB and identity-verify every device, then push fresh status. Slower; actually exercises the bench. Use after plug/unplug.">run inventory</button>
