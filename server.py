@@ -580,6 +580,9 @@ class Handler(BaseHTTPRequestHandler):
         # /sweep -- re-probe + re-verify all devices on the poller
         if path == "sweep":
             return self._mark_sweep()
+        m = re.match(r"^cancels/([0-9a-f]{64})/stale$", path)
+        if m:
+            return self._resolve_stale_cancel(m.group(1))
         # /status/<name>.json -- poller pushes a status snapshot
         m = re.match(r"^status/([A-Za-z0-9._-]+\.json)$", path)
         if m:
@@ -1101,6 +1104,53 @@ class Handler(BaseHTTPRequestHandler):
         # cancel.
         self.send_response(404)
         self.end_headers()
+
+    def _resolve_stale_cancel(self, digest):
+        """Poller ack for a cancel marker with no local live session.
+
+        DELETE /jobs/<digest> creates CANCEL/<digest> for live sessions.
+        If the current poller later pulls that marker and has no
+        matching _active_sessions entry, the server-side DONE record is
+        stale from an older worker/process. Resolve it immediately so
+        the dashboard does not sit in "cancel pending" forever.
+        """
+        cancel_path = os.path.join(CANCEL, digest)
+        done_path = os.path.join(DONE, f"{digest}.plan")
+        meta_path = f"{done_path}.meta"
+        output_path = os.path.join(OUTPUTS, f"{digest}.tar")
+        if not os.path.exists(cancel_path):
+            return self._send_json(
+                json.dumps({"status": "no_cancel",
+                            "digest": digest}).encode(), status=404)
+        if digest in _inflight_digests():
+            return self._send_json(
+                json.dumps({"status": "inflight",
+                            "digest": digest}).encode(), status=409)
+        removed = []
+        if os.path.exists(output_path):
+            # Job finished; the upload path normally removes CANCEL.
+            # Do only that cleanup here and leave DONE/OUTPUTS intact
+            # so the result remains visible as done/canceled/errors.
+            try:
+                os.unlink(cancel_path)
+                removed.append("cancel")
+            except FileNotFoundError:
+                pass
+            return self._send_json(
+                json.dumps({"status": "done",
+                            "digest": digest,
+                            "removed": removed}).encode())
+        for label, path in (("done", done_path), ("meta", meta_path),
+                            ("cancel", cancel_path)):
+            try:
+                os.unlink(path)
+                removed.append(label)
+            except FileNotFoundError:
+                pass
+        return self._send_json(
+            json.dumps({"status": "stale_canceled",
+                        "digest": digest,
+                        "removed": removed}).encode())
 
     def _prune_stale_jobs(self):
         removed = prune_stale_jobs()

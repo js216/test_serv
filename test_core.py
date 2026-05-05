@@ -1089,6 +1089,73 @@ def test_prune_skips_inflight_digests():
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
 
 
+def test_stale_cancel_resolution_removes_orphan_running_record():
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dirs = (server.INPUTS, server.OUTPUTS, server.DONE,
+                    server.STATUS, server.RELEASE, server.SWEEP,
+                    server.CANCEL)
+        server.INPUTS = os.path.join(tmp, "inputs")
+        server.OUTPUTS = os.path.join(tmp, "outputs")
+        server.DONE = os.path.join(tmp, "done")
+        server.STATUS = os.path.join(tmp, "status")
+        server.RELEASE = os.path.join(tmp, "release")
+        server.SWEEP = os.path.join(tmp, "sweep")
+        server.CANCEL = os.path.join(tmp, "cancel")
+        for d in (server.INPUTS, server.OUTPUTS, server.DONE,
+                  server.STATUS, server.RELEASE, server.SWEEP,
+                  server.CANCEL):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            stale = "d" * 64
+            live = "e" * 64
+            for digest in (stale, live):
+                with open(os.path.join(server.DONE, f"{digest}.plan"),
+                          "wb") as f:
+                    f.write(b"plan")
+                with open(os.path.join(server.CANCEL, digest), "wb"):
+                    pass
+            with open(os.path.join(server.STATUS, "inflight.json"),
+                      "wb") as f:
+                f.write(json.dumps([{"digest": live}]).encode())
+
+            host, port = httpd.server_address
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                conn.request("POST", f"/cancels/{stale}/stale", body=b"")
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+            finally:
+                conn.close()
+            assert resp.status == 200, resp.status
+            assert body["status"] == "stale_canceled", body
+            assert not os.path.exists(
+                os.path.join(server.DONE, f"{stale}.plan"))
+            assert not os.path.exists(os.path.join(server.CANCEL, stale))
+
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                conn.request("POST", f"/cancels/{live}/stale", body=b"")
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+            finally:
+                conn.close()
+            assert resp.status == 409, (resp.status, body)
+            assert body["status"] == "inflight", body
+            assert os.path.exists(os.path.join(server.CANCEL, live))
+            assert os.path.exists(
+                os.path.join(server.DONE, f"{live}.plan"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            (server.INPUTS, server.OUTPUTS, server.DONE,
+             server.STATUS, server.RELEASE, server.SWEEP,
+             server.CANCEL) = old_dirs
+
+
 def test_delete_outputs_no_op_when_nothing_to_delete():
     """An agent's DELETE /outputs/<digest> can race a fresh re-pickup
     of the same digest: agent thinks it's cleaning up after a fetch,
@@ -1264,6 +1331,7 @@ def main():
         test_lease_claim_rejects_lease_pseudo_device,
         test_failure_artefact_carries_identity_fields,
         test_prune_skips_inflight_digests,
+        test_stale_cancel_resolution_removes_orphan_running_record,
         test_delete_outputs_no_op_when_nothing_to_delete,
         test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,

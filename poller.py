@@ -837,15 +837,25 @@ def _drain_cancels():
         with _active_lock:
             sess = _active_sessions.get(d)
         if sess is None:
-            # Job already completed (artefact upload unlinks the
-            # marker server-side) or hasn't been picked up by this
-            # poller yet. Either way, nothing to signal right now;
-            # next tick will re-check.
+            # The current poller has no such live session. Resolve the
+            # server-side DONE/CANCEL record now; otherwise the UI can
+            # show "cancel pending" forever for a stale running row
+            # left behind by a crashed/restarted worker.
+            _resolve_stale_cancel(d)
             continue
         sess.signal_cancel()
         with _signaled_lock:
             _signaled_cancels.add(d)
         print(datetime.now(), f"[{d[:8]}] cancel signaled")
+
+
+def _resolve_stale_cancel(digest):
+    base = f"http://localhost:{HTTP_PORT}"
+    try:
+        _post(f"{base}/cancels/{digest}/stale", b"", timeout=5.0)
+        print(datetime.now(), f"[{digest[:8]}] stale cancel resolved")
+    except Exception:
+        pass
 
 
 def _drain_release_markers(registry):
