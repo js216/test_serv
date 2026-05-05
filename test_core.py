@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import socket
 import tempfile
 import tarfile
 import threading
@@ -15,7 +16,7 @@ import plan
 import server
 from plugin import DevicePlugin, Op
 from registry import DeviceRegistry
-from session import Session, pack_artefact
+from session import Session, bench_id, pack_artefact
 
 
 # --- fake plugin ---------------------------------------------------------
@@ -1030,6 +1031,20 @@ def test_check_record_lands_in_manifest():
     reg.close_all()
 
 
+def test_bench_id_defaults_to_hostname_and_env_overrides():
+    old = os.environ.get("TEST_SERV_BENCH_ID")
+    try:
+        os.environ.pop("TEST_SERV_BENCH_ID", None)
+        assert bench_id() == (socket.gethostname() or "unknown")
+        os.environ["TEST_SERV_BENCH_ID"] = "bench-alias"
+        assert bench_id() == "bench-alias"
+    finally:
+        if old is None:
+            os.environ.pop("TEST_SERV_BENCH_ID", None)
+        else:
+            os.environ["TEST_SERV_BENCH_ID"] = old
+
+
 # --- runner --------------------------------------------------------------
 
 def main():
@@ -1064,6 +1079,7 @@ def main():
         test_delete_outputs_no_op_when_nothing_to_delete,
         test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,
+        test_bench_id_defaults_to_hostname_and_env_overrides,
     ]
     failed = 0
     for t in tests:
