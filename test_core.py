@@ -625,6 +625,55 @@ def test_refresh_survives_a_hung_probe():
         reg.close_all()
 
 
+def test_hung_probe_keeps_last_good_specs():
+    """A timed-out probe is not proof that devices vanished. Keep the
+    last good plugin specs so a wedged fpga.probe() cannot erase
+    fpga.* from /devices while the OS still enumerates the hardware.
+    A later successful empty probe is still allowed to remove them.
+    """
+    import registry as _reg
+
+    class FlakyProbePlugin(DevicePlugin):
+        name = "flaky"
+
+        def __init__(self):
+            self.mode = "present"
+
+        def probe(self):
+            if self.mode == "hang":
+                time.sleep(_reg.PROBE_TIMEOUT_S * 3)
+                return [{"id": "0"}]
+            if self.mode == "absent":
+                return []
+            return [{"id": "0"}]
+
+        def open(self, spec):
+            return type("H", (), {})()
+
+        def close(self, h):
+            pass
+
+    flaky = FlakyProbePlugin()
+    reg = DeviceRegistry({"flaky": flaky})
+    saved = _reg.PROBE_TIMEOUT_S
+    _reg.PROBE_TIMEOUT_S = 0.2
+    try:
+        reg.refresh()
+        assert "flaky.0" in reg.specs, reg.specs
+        flaky.mode = "hang"
+        reg.refresh()
+        assert "flaky.0" in reg.specs, (
+            "timed-out probe must retain the last good spec")
+        time.sleep(_reg.PROBE_TIMEOUT_S * 3.5)
+        flaky.mode = "absent"
+        reg.refresh()
+        assert "flaky.0" not in reg.specs, (
+            "successful empty probe must still evict absent devices")
+    finally:
+        _reg.PROBE_TIMEOUT_S = saved
+        reg.close_all()
+
+
 def test_refresh_does_not_evict_pinned():
     """If a session has acquired a device and refresh runs while
     that device is transiently absent from probe(), the spec must
@@ -1107,6 +1156,7 @@ def main():
         test_session_watchdog_hard_exits_when_wedged,
         test_acquire_open_timeout_quarantines_and_doesnt_wedge,
         test_refresh_survives_a_hung_probe,
+        test_hung_probe_keeps_last_good_specs,
         test_refresh_does_not_evict_pinned,
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,

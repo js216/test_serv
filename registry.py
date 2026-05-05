@@ -44,6 +44,8 @@ PROBE_TIMEOUT_S = 15.0
 # real *IDN? round-trip on the scope).
 OPEN_TIMEOUT_S = 60.0
 
+_KEEP_PREVIOUS_SPECS = object()
+
 
 def _run_with_wallclock_timeout(label, fn, timeout_s):
     """Run ``fn()`` in a daemon thread with a wall-clock cap.
@@ -124,8 +126,10 @@ class DeviceRegistry:
     def _probe_with_timeout(self, pname, pl):
         """Call ``pl.probe()`` with a wall-clock cap so a hung
         third-party driver (ftd2xx, pyusb, etc) can't wedge the
-        main loop. Returns the spec list, or [] on exception or
-        timeout. The next refresh tick will try again.
+        main loop. Returns the spec list on success, or
+        _KEEP_PREVIOUS_SPECS on exception/timeout. A successful []
+        means "devices are absent"; a failed probe means "unknown,
+        keep the last good view".
 
         Guards against firing a second probe of the same plugin
         while the prior probe's leaked thread is still inside the
@@ -139,7 +143,7 @@ class DeviceRegistry:
         with self._probe_inflight_lock:
             if pname in self._probe_inflight:
                 # Prior leaked probe is still running; don't pile on.
-                return []
+                return _KEEP_PREVIOUS_SPECS
             self._probe_inflight.add(pname)
 
         def _do():
@@ -156,11 +160,16 @@ class DeviceRegistry:
                   f"{PROBE_TIMEOUT_S:.0f}s "
                   f"(thread leaked, will skip this plugin until it "
                   f"returns)")
-            return []
+            return _KEEP_PREVIOUS_SPECS
         if err:
             print(f"refresh: {pname}.probe() raised:\n{err}")
-            return []
+            return _KEEP_PREVIOUS_SPECS
         return result or []
+
+    def _keep_existing_plugin_specs_locked(self, found, pname):
+        for key, val in self.specs.items():
+            if val[0] == pname:
+                found[key] = val
 
     def refresh(self):
         """Rescan every plugin's probe() and update specs."""
@@ -177,6 +186,10 @@ class DeviceRegistry:
         found = {}
         for pname, pl in self.plugins.items():
             specs = self._probe_with_timeout(pname, pl)
+            if specs is _KEEP_PREVIOUS_SPECS:
+                with self.lock:
+                    self._keep_existing_plugin_specs_locked(found, pname)
+                continue
             for spec in specs:
                 did = spec.get("id")
                 if did is None:
@@ -213,6 +226,8 @@ class DeviceRegistry:
         if pl is None:
             return
         specs = self._probe_with_timeout(name, pl)
+        if specs is _KEEP_PREVIOUS_SPECS:
+            return
         found = {}
         for spec in specs:
             did = spec.get("id")
