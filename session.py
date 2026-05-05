@@ -323,6 +323,9 @@ class Session:
         # observe the signal until the op returns.
         self.canceled = False
         self.cancel_event = threading.Event()
+        # Plugins that need to make "check canceled, then arm/start a
+        # killable child" atomic against signal_cancel use this lock.
+        self.cancel_lock = threading.Lock()
 
     # --- timeline recording ---
 
@@ -393,16 +396,17 @@ class Session:
         the child immediately rather than waiting on the op's
         200ms-poll loop. Idempotent on the kill path too.
         """
-        self.canceled = True
-        self.cancel_event.set()
-        self.log_event("CTRL", "session", "cancel requested")
-        try:
-            from poller import kill_session_subprocs
-            kill_session_subprocs(self)
-        except ImportError:
-            pass
-        except Exception:
-            pass
+        with self.cancel_lock:
+            self.canceled = True
+            self.cancel_event.set()
+            self.log_event("CTRL", "session", "cancel requested")
+            try:
+                from poller import kill_session_subprocs
+                kill_session_subprocs(self)
+            except ImportError:
+                pass
+            except Exception:
+                pass
 
     def _prescan_lease_resume(self):
         """If the plan contains ``lease:resume token=...`` anywhere,

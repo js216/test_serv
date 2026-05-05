@@ -3,6 +3,10 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import threading
+import os
+import subprocess
+import sys
+import tempfile
 import time
 import traceback
 
@@ -218,6 +222,9 @@ def _op_reset(session, h, args):
 
 def _op_boot(session, h, args):
     ldr = args["ldr"]
+    timeout_ms = int(args["timeout_ms"])
+    if timeout_ms <= 0:
+        raise ValueError("dsp:boot timeout_ms must be > 0")
     # LDR is ASCII hex, one byte per line. Prefix 0x03 = BDMA boot.
     buf = bytearray([0x03])
     for line in ldr.decode("ascii", errors="strict").split():
@@ -228,14 +235,148 @@ def _op_boot(session, h, args):
     padded = ((n + CHUNK - 1) // CHUNK) * CHUNK
     if padded != n:
         buf += bytes(padded - n)
-    dev = _open_master(h.ft4222_desc, clk_div=8, mode=1, flags=0)
+    _boot_subprocess(session, h.ft4222_desc, bytes(buf),
+                     timeout_ms / 1000.0)
+
+
+def _track_subproc(proc, session=None):
     try:
-        for i in range(0, padded, CHUNK):
-            session.bail_if_canceled(f"dsp:boot @ {i}/{padded}B")
-            last = (i + CHUNK) >= padded
-            dev.spiMaster_SingleWrite(bytes(buf[i:i+CHUNK]), last)
+        from poller import register_subprocess
+        register_subprocess(proc, session=session)
+    except ImportError:
+        pass
+
+
+def _untrack_subproc(proc):
+    try:
+        from poller import unregister_subprocess
+        unregister_subprocess(proc)
+    except ImportError:
+        pass
+
+
+def _reap_subproc_later(proc):
+    def _run():
+        try:
+            proc.wait()
+        except Exception:
+            pass
+        _untrack_subproc(proc)
+
+    threading.Thread(
+        target=_run, daemon=True, name="dsp-boot-reaper").start()
+
+
+def _kill_and_communicate(proc, timeout_s):
+    proc.kill()
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout_s)
+        return stdout, stderr, True
+    except subprocess.TimeoutExpired:
+        _reap_subproc_later(proc)
+        return "", "", False
+
+
+def _boot_subprocess(session, ft4222_desc, payload, timeout_s):
+    session.bail_if_canceled("dsp:boot before helper spawn")
+    fd, path = tempfile.mkstemp(
+        prefix="test_serv_dsp_boot_", suffix=".bin")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        code = r'''
+import sys
+from plugins import dsp
+
+desc = sys.argv[1]
+path = sys.argv[2]
+# Parent writes one byte only after this Popen is registered for
+# cancellation. Until then the helper must not touch FT4222.
+sys.stdin.buffer.read(1)
+with open(path, "rb") as f:
+    payload = f.read()
+dev = dsp._open_master(desc, clk_div=8, mode=1, flags=0)
+try:
+    chunk = 1024
+    total = len(payload)
+    for off in range(0, total, chunk):
+        part = payload[off:off + chunk]
+        last = (off + chunk) >= total
+        dev.spiMaster_SingleWrite(bytes(part), last)
+        print(f"{off + len(part)}/{total}", flush=True)
+finally:
+    dev.close()
+'''
+        proc = subprocess.Popen(
+            [sys.executable, "-c", code, ft4222_desc, path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True)
+        _track_subproc(proc, session=session)
+        deadline = time.monotonic() + timeout_s
+        reaped = False
+        try:
+            with session.cancel_lock:
+                if session.canceled:
+                    stdout, stderr, reaped = _kill_and_communicate(proc, 2.0)
+                    if not reaped:
+                        raise RuntimeError(
+                            "dsp:boot canceled before helper start but helper "
+                            "did not exit after SIGKILL")
+                    raise RuntimeError(
+                        "dsp:boot canceled via DELETE /jobs/<digest>")
+                try:
+                    proc.stdin.write("x")
+                    proc.stdin.flush()
+                    proc.stdin.close()
+                    proc.stdin = None
+                except (BrokenPipeError, OSError):
+                    pass
+            while True:
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.2)
+                    reaped = True
+                    break
+                except subprocess.TimeoutExpired:
+                    if session.canceled:
+                        stdout, stderr, reaped = _kill_and_communicate(
+                            proc, 2.0)
+                        if not reaped:
+                            raise RuntimeError(
+                                "dsp:boot canceled via DELETE /jobs/<digest> "
+                                "but helper did not exit after SIGKILL")
+                        raise RuntimeError(
+                            "dsp:boot canceled via DELETE /jobs/<digest>")
+                    if time.monotonic() > deadline:
+                        stdout, stderr, reaped = _kill_and_communicate(
+                            proc, 2.0)
+                        if not reaped:
+                            raise TimeoutError(
+                                f"dsp:boot timed out after "
+                                f"{timeout_s:.1f}s and helper did not "
+                                f"exit after SIGKILL")
+                        tail = (stderr or stdout or "").strip().splitlines()
+                        detail = tail[-1] if tail else "no child output"
+                        raise TimeoutError(
+                            f"dsp:boot timed out after "
+                            f"{timeout_s:.1f}s: {detail}")
+        finally:
+            if reaped or proc.poll() is not None:
+                _untrack_subproc(proc)
+        if session.canceled:
+            raise RuntimeError("dsp:boot canceled via DELETE /jobs/<digest>")
+        if proc.returncode != 0:
+            tail = (stderr or stdout or "").strip().splitlines()
+            detail = tail[-1] if tail else f"rc={proc.returncode}"
+            raise RuntimeError(f"dsp:boot helper failed: {detail}")
+        if stdout:
+            last = stdout.strip().splitlines()[-1]
+            session.log_event("DSP", "dsp:boot", f"wrote {last}")
     finally:
-        dev.close()
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
 
 
 def _op_uart_open(session, h, args):
@@ -590,8 +731,11 @@ class DspPlugin(DevicePlugin):
     ops = {
         "reset": Op(args={}, doc="Pulse expander reset + reinit.",
                     run=_op_reset),
-        "boot": Op(args={"ldr": "blob"},
-                   doc="Load LDR firmware via FT4222 QSPI boot path.",
+        "boot": Op(args={"ldr": "blob", "timeout_ms": "int"},
+                   doc=("Load LDR firmware via FT4222 QSPI boot path. "
+                        "timeout_ms is mandatory and bounds the native "
+                        "FT4222 transfer helper; timeout/cancel kills "
+                        "the helper process."),
                    run=_op_boot),
         "uart_open": Op(args={}, doc="Start UART capture into dsp.uart.",
                         run=_op_uart_open),

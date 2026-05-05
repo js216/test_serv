@@ -17,7 +17,7 @@ fpga:uart_expect sentinel="OBSERVER READY" timeout_ms=5000
 
 dsp:reset
 dsp:uart_open
-dsp:boot ldr=@pattern.ldr
+dsp:boot ldr=@pattern.ldr timeout_ms=10000
 
 # Boot settles, then send pattern over QSPI single-lane at 5 MHz.
 delay ms=200

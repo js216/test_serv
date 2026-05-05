@@ -832,6 +832,126 @@ def test_pending_upload_drain_kick_is_nonblocking():
     assert calls == [1.0], calls
 
 
+def test_dsp_boot_requires_timeout_and_kills_hung_helper():
+    import subprocess
+    from plugins import dsp
+
+    assert dsp.DspPlugin.ops["boot"].args == {
+        "ldr": "blob", "timeout_ms": "int"}
+    assert "timeout_ms is mandatory" in dsp.DspPlugin.ops["boot"].doc
+
+    class FakeProc:
+        returncode = None
+        killed = False
+        stdin = io.StringIO()
+
+        def communicate(self, timeout=None):
+            if self.killed:
+                self.returncode = -9
+                return "", "native spin"
+            raise subprocess.TimeoutExpired(["fake"], timeout)
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            self.returncode = -9
+            return self.returncode
+
+        def poll(self):
+            return self.returncode
+
+    class FakeSession:
+        canceled = False
+        events = []
+        cancel_lock = threading.Lock()
+
+        def bail_if_canceled(self, where):
+            if self.canceled:
+                raise RuntimeError(f"{where} canceled")
+
+        def log_event(self, *args):
+            self.events.append(args)
+
+    saved_popen = dsp.subprocess.Popen
+    proc = FakeProc()
+    dsp.subprocess.Popen = lambda *a, **k: proc
+    try:
+        try:
+            dsp._boot_subprocess(FakeSession(), "FT4222 A", b"x" * 1024,
+                                 timeout_s=0.01)
+            raise AssertionError("hung helper should time out")
+        except TimeoutError as e:
+            assert "dsp:boot timed out" in str(e), e
+            assert proc.killed, "hung helper was not killed"
+    finally:
+        dsp.subprocess.Popen = saved_popen
+
+
+def test_dsp_boot_cancel_race_reports_cancel():
+    import subprocess
+    from plugins import dsp
+
+    class FakeProc:
+        returncode = -9
+        stdin = io.StringIO()
+
+        def communicate(self, timeout=None):
+            return "", ""
+
+        def kill(self):
+            pass
+
+        def poll(self):
+            return self.returncode
+
+    class FakeSession:
+        canceled = True
+        cancel_lock = threading.Lock()
+
+        def bail_if_canceled(self, where):
+            if self.canceled:
+                raise RuntimeError(f"{where} canceled")
+
+    saved_popen = dsp.subprocess.Popen
+    dsp.subprocess.Popen = lambda *a, **k: FakeProc()
+    try:
+        try:
+            dsp._boot_subprocess(FakeSession(), "FT4222 A", b"x" * 1024,
+                                 timeout_s=1.0)
+            raise AssertionError("canceled helper should raise")
+        except RuntimeError as e:
+            assert "canceled" in str(e), e
+    finally:
+        dsp.subprocess.Popen = saved_popen
+
+
+def test_dsp_boot_already_canceled_does_not_spawn_helper():
+    from plugins import dsp
+
+    class FakeSession:
+        canceled = True
+        cancel_lock = threading.Lock()
+
+        def bail_if_canceled(self, where):
+            if self.canceled:
+                raise RuntimeError(f"{where} canceled")
+
+    calls = []
+    saved_popen = dsp.subprocess.Popen
+    dsp.subprocess.Popen = lambda *a, **k: calls.append((a, k))
+    try:
+        try:
+            dsp._boot_subprocess(FakeSession(), "FT4222 A", b"x" * 1024,
+                                 timeout_s=1.0)
+            raise AssertionError("already-canceled boot should raise")
+        except RuntimeError as e:
+            assert "canceled" in str(e), e
+        assert calls == [], "helper spawned for already-canceled session"
+    finally:
+        dsp.subprocess.Popen = saved_popen
+
+
 def test_supervisor_heartbeat_stale_uses_monotonic_age():
     import poller
     stale, age = poller._heartbeat_stale(1000.0, now=1119.0)
@@ -1399,6 +1519,9 @@ def main():
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
         test_pending_upload_drain_kick_is_nonblocking,
+        test_dsp_boot_requires_timeout_and_kills_hung_helper,
+        test_dsp_boot_cancel_race_reports_cancel,
+        test_dsp_boot_already_canceled_does_not_spawn_helper,
         test_supervisor_heartbeat_stale_uses_monotonic_age,
         test_watchdog_log_records_before_and_after_process_snapshots,
         test_lease_lifecycle,

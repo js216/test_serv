@@ -5,6 +5,6 @@
 
 dsp:reset
 dsp:uart_open
-dsp:boot ldr=@blink.ldr
+dsp:boot ldr=@blink.ldr timeout_ms=10000
 delay ms=5000
 dsp:uart_close

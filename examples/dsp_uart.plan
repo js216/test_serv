@@ -11,7 +11,7 @@ expect "DSP boots from uart.ldr and emits UART traffic within 3s"
 
 dsp:reset
 dsp:uart_open
-dsp:boot ldr=@uart.ldr
+dsp:boot ldr=@uart.ldr timeout_ms=10000
 delay ms=3000
 dsp:uart_close
 mark tag=done
