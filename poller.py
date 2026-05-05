@@ -1230,13 +1230,21 @@ def _supervise():
     extra = [a for a in sys.argv[1:] if a != _WORKER_FLAG]
 
     child_box = [None]
+    signal_counts = {}
 
     def _forward(signum, _frame):
+        signal_counts[signum] = signal_counts.get(signum, 0) + 1
         c = child_box[0]
         if c is None or c.poll() is not None:
             return
         try:
-            c.send_signal(signum)
+            if (signum == getattr(signal, "SIGINT", None)
+                    and signal_counts[signum] >= 2):
+                print(f"{datetime.now()} supervisor: second SIGINT; "
+                      f"killing worker child", file=sys.stderr)
+                c.kill()
+            else:
+                c.send_signal(signum)
         except Exception:
             pass
 

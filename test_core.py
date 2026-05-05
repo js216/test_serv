@@ -674,6 +674,49 @@ def test_hung_probe_keeps_last_good_specs():
         reg.close_all()
 
 
+def test_ftd2xx_enumeration_timeout_stays_out_of_process():
+    from plugins import _usb
+    saved_run = _usb.subprocess.run
+    try:
+        def _timeout(*args, **kwargs):
+            raise _usb.subprocess.TimeoutExpired(args[0], kwargs["timeout"])
+        _usb.subprocess.run = _timeout
+        assert _usb.ftd2xx_devices() is None
+    finally:
+        _usb.subprocess.run = saved_run
+
+
+def test_fpga_program_cancel_kills_helper_process():
+    from plugins import fpga
+
+    class FakeProc:
+        def __init__(self):
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):
+            return -9
+
+    proc = FakeProc()
+    saved_popen = fpga.subprocess.Popen
+    try:
+        fpga.subprocess.Popen = lambda *a, **kw: proc
+        sess = type("S", (), {"runtime_s": 1.0, "canceled": True})()
+        try:
+            fpga._program_flash_subprocess(b"x", "desc", None, sess)
+            raise AssertionError("canceled helper should raise")
+        except RuntimeError as e:
+            assert "canceled" in str(e), e
+        assert proc.killed, "canceled program did not kill helper"
+    finally:
+        fpga.subprocess.Popen = saved_popen
+
+
 def test_refresh_does_not_evict_pinned():
     """If a session has acquired a device and refresh runs while
     that device is transiently absent from probe(), the spec must
@@ -1157,6 +1200,8 @@ def main():
         test_acquire_open_timeout_quarantines_and_doesnt_wedge,
         test_refresh_survives_a_hung_probe,
         test_hung_probe_keeps_last_good_specs,
+        test_ftd2xx_enumeration_timeout_stays_out_of_process,
+        test_fpga_program_cancel_kills_helper_process,
         test_refresh_does_not_evict_pinned,
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,

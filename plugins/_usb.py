@@ -3,6 +3,12 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import config
+import json
+import subprocess
+import sys
+
+
+FTD2XX_ENUM_TIMEOUT_S = 10.0
 
 
 def _int(v):
@@ -161,30 +167,46 @@ def ftd2xx_devices():
     FT2232H units, so an iSerial pin is the only way to be sure
     which one we're about to program.
     """
+    code = r'''
+import json
+try:
+    import ftd2xx
+except ImportError:
+    print("null")
+    raise SystemExit(0)
+try:
+    n = ftd2xx.createDeviceInfoList()
+except Exception:
+    print("null")
+    raise SystemExit(0)
+out = []
+for i in range(n):
     try:
-        import ftd2xx
-    except ImportError:
-        return None
-    try:
-        n = ftd2xx.createDeviceInfoList()
+        d = ftd2xx.getDeviceInfoDetail(i)
     except Exception:
+        continue
+    ser = d.get("serial")
+    desc = d.get("description")
+    if isinstance(ser, bytes):
+        ser = ser.decode(errors="replace")
+    if isinstance(desc, bytes):
+        desc = desc.decode(errors="replace")
+    out.append({"index": i, "serial": ser or "", "description": desc or ""})
+print(json.dumps(out))
+'''
+    try:
+        p = subprocess.run(
+            [sys.executable, "-c", code],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=FTD2XX_ENUM_TIMEOUT_S, check=False)
+    except (OSError, subprocess.TimeoutExpired):
         return None
-    out = []
-    for i in range(n):
-        try:
-            d = ftd2xx.getDeviceInfoDetail(i)
-        except Exception:
-            continue
-        ser = d.get("serial")
-        desc = d.get("description")
-        if isinstance(ser, bytes):
-            ser = ser.decode(errors="replace")
-        if isinstance(desc, bytes):
-            desc = desc.decode(errors="replace")
-        out.append({"index": i,
-                    "serial": ser or "",
-                    "description": desc or ""})
-    return out
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(p.stdout)
+    except (TypeError, ValueError):
+        return None
 
 
 def winusb_device_present(vid, pid, serial=None):

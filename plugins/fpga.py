@@ -3,6 +3,10 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import sys
+import json
+import os
+import subprocess
+import tempfile
 import threading
 import time
 
@@ -15,6 +19,7 @@ from ._text import decode_escapes, expect_timeout_msg
 FT2232H_DESC_A_DEFAULT = "Dual RS232-HS A"    # MPSSE channel
 FT2232H_DESC_B_DEFAULT = "Dual RS232-HS B"    # UART channel
 FPGA_BAUD_DEFAULT = 115200
+FPGA_PROGRAM_GRACE_S = 5.0
 
 
 def _lazy_ftd2xx():
@@ -142,7 +147,8 @@ def _wait_wip(dev, session=None):
 
 def _erase(dev, nbytes, session=None):
     for addr in range(0, nbytes, SECTOR):
-        session.bail_if_canceled(f"fpga:erase @ {addr}/{nbytes}B")
+        if session is not None:
+            session.bail_if_canceled(f"fpga:erase @ {addr}/{nbytes}B")
         _cmd(dev, [0x06])
         _cmd(dev, [0xD8,
                    (addr >> 16) & 0xff,
@@ -153,7 +159,8 @@ def _erase(dev, nbytes, session=None):
 
 def _write(dev, buf, session=None):
     for off in range(0, len(buf), PAGE):
-        session.bail_if_canceled(f"fpga:write @ {off}/{len(buf)}B")
+        if session is not None:
+            session.bail_if_canceled(f"fpga:write @ {off}/{len(buf)}B")
         chunk = bytes(buf[off:off + PAGE])
         _cmd(dev, [0x06])
         _cmd(dev, [0x02,
@@ -164,7 +171,8 @@ def _write(dev, buf, session=None):
 
 
 def _verify(dev, buf, session=None):
-    session.bail_if_canceled("fpga:verify (read-back)")
+    if session is not None:
+        session.bail_if_canceled("fpga:verify (read-back)")
     got = _xfer(dev, [0x03, 0, 0, 0], len(buf), session=session)
     if got == buf:
         return
@@ -205,6 +213,65 @@ def _program_flash(bitstream, ft2232h_desc, ft2232h_serial, session=None):
     finally:
         dev.setBitMode(0, 0)
         dev.close()
+
+
+def _program_flash_subprocess(bitstream, ft2232h_desc, ft2232h_serial,
+                              session):
+    """Run the unsafe ftd2xx flash path in a child process.
+
+    ftd2xx can wedge inside a C call while holding the GIL. If that
+    happens in the poller process, Ctrl-C, watchdogs, and the main
+    loop all stop. A child process gives the parent a real kill
+    boundary.
+    """
+    timeout_s = min(session.runtime_s or 600.0, 3600.0) + FPGA_PROGRAM_GRACE_S
+    with tempfile.NamedTemporaryFile(prefix="test-serv-fpga-",
+                                     suffix=".bin", delete=False) as f:
+        f.write(bitstream)
+        bit_path = f.name
+    payload = json.dumps({
+        "bit_path": bit_path,
+        "ft2232h_desc": ft2232h_desc,
+        "ft2232h_serial": ft2232h_serial,
+    })
+    code = (
+        "import json, sys\n"
+        "from plugins.fpga import _program_flash\n"
+        "cfg = json.loads(sys.argv[1])\n"
+        "with open(cfg['bit_path'], 'rb') as f:\n"
+        "    bitstream = f.read()\n"
+        "_program_flash(bitstream, cfg['ft2232h_desc'], "
+        "cfg.get('ft2232h_serial'), session=None)\n"
+    )
+    p = subprocess.Popen(
+        [sys.executable, "-c", code, payload],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.monotonic() + timeout_s
+    try:
+        while True:
+            rc = p.poll()
+            if rc is not None:
+                out, err = p.communicate(timeout=1.0)
+                if rc == 0:
+                    return
+                tail = (err or out or "").strip().splitlines()
+                msg = tail[-1] if tail else f"exit status {rc}"
+                raise RuntimeError(f"fpga program helper failed: {msg}")
+            if session.canceled:
+                p.kill()
+                p.wait(timeout=2.0)
+                raise RuntimeError("fpga program canceled")
+            if time.monotonic() > deadline:
+                p.kill()
+                p.wait(timeout=2.0)
+                raise RuntimeError(
+                    f"fpga program helper timed out after {timeout_s:.0f}s")
+            time.sleep(0.05)
+    finally:
+        try:
+            os.unlink(bit_path)
+        except OSError:
+            pass
 
 
 def _find_icestick_uart(uart_desc, auto):
@@ -321,8 +388,8 @@ class FpgaHandle:
 # --- ops ---
 
 def _op_program(session, h, args):
-    _program_flash(bytes(args["bin"]), h.ft2232h_desc, h.ft2232h_serial,
-                   session=session)
+    _program_flash_subprocess(
+        bytes(args["bin"]), h.ft2232h_desc, h.ft2232h_serial, session)
 
 
 def _op_uart_open(session, h, args):
