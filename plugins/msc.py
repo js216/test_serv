@@ -4,12 +4,24 @@
 
 import glob
 import os
+import time
 
 import config
 from plugin import DevicePlugin, Op
 
 
 CHUNK_BYTES = 1 << 20
+
+
+def _check_min_rate(op_name, total, elapsed_s, min_rate_Bps):
+    if not min_rate_Bps:
+        return
+    if elapsed_s <= 0:
+        return
+    rate = total / elapsed_s
+    if rate < min_rate_Bps:
+        raise TimeoutError(
+            f"{op_name} too slow: {rate:.0f} B/s < {min_rate_Bps} B/s")
 
 
 def _norm_hex(v):
@@ -82,9 +94,11 @@ class MscHandle:
 def _op_write(session, h, args):
     data = bytes(args["data"])
     offset_lba = args.get("offset_lba") or 0
+    min_rate_Bps = args.get("min_rate_Bps")
     offset = offset_lba * h.block_size
     _refuse_if_mounted(h.device)
     total = len(data)
+    t0 = time.monotonic()
     fd = os.open(h.device, os.O_WRONLY)
     try:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -108,12 +122,16 @@ def _op_write(session, h, args):
     session.log_event(
         "MSC", "msc:write",
         f"wrote {total}B to {h.device} @ LBA {offset_lba}")
+    _check_min_rate("msc:write", total, time.monotonic() - t0,
+                    min_rate_Bps)
 
 
 def _op_read(session, h, args):
     n = args["n"]
     offset_lba = args.get("offset_lba") or 0
+    min_rate_Bps = args.get("min_rate_Bps")
     offset = offset_lba * h.block_size
+    t0 = time.monotonic()
     fd = os.open(h.device, os.O_RDONLY)
     try:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -130,6 +148,7 @@ def _op_read(session, h, args):
     session.log_event(
         "MSC", "msc:read",
         f"read {n}B from {h.device} @ LBA {offset_lba}")
+    _check_min_rate("msc:read", n, time.monotonic() - t0, min_rate_Bps)
 
 
 def _op_verify(session, h, args):
@@ -188,18 +207,22 @@ class MscPlugin(DevicePlugin):
     ops = {
         "write": Op(
             args={"data": "blob"},
-            optional_args={"offset_lba": "int"},
+            optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
             doc=("Write a blob to the resolved block device. "
                  "offset_lba defaults to 0; units are block_size "
                  "(512 B for STM32MP1 baremetal MSC). Refuses if "
-                 "any partition under the device is mounted."),
+                 "any partition under the device is mounted. "
+                 "min_rate_Bps fails the op if effective write rate "
+                 "falls below the requested byte/s floor."),
             run=_op_write),
         "read": Op(
             args={"n": "int"},
-            optional_args={"offset_lba": "int"},
+            optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
             doc=("Read n bytes from the resolved block device starting at "
                  "offset_lba (default 0); bytes go into stream msc.read "
-                 "in the artefact tarball."),
+                 "in the artefact tarball. min_rate_Bps fails the op if "
+                 "effective read rate falls below the requested byte/s "
+                 "floor."),
             run=_op_read),
         "verify": Op(
             args={"data": "blob"},
