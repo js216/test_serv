@@ -11,9 +11,11 @@ from datetime import datetime
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 HEARTBEAT = os.path.join(REPO_DIR, "heartbeat.log")
+WATCHDOG_LOG = os.path.join(REPO_DIR, "watchdog.log")
 CHECK_INTERVAL_S = 300.0
 STALE_AFTER_S = 120.0
 PKILL_PATTERN = "python3.*poller.py"
+PS_CMD = ["ps", "-eo", "pid,ppid,stat,etime,cmd"]
 
 
 def heartbeat_age_s(path=HEARTBEAT, now=None):
@@ -35,6 +37,55 @@ def kill_poller():
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def _read_tail(path, max_bytes=4096):
+    try:
+        with open(path, "rb") as f:
+            try:
+                f.seek(-max_bytes, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            return f.read().decode("utf-8", "replace")
+    except OSError as e:
+        return f"<unavailable: {e}>"
+
+
+def _poller_processes():
+    try:
+        out = subprocess.check_output(
+            PS_CMD, text=True, stderr=subprocess.STDOUT)
+    except (OSError, subprocess.CalledProcessError) as e:
+        return f"<ps failed: {e}>"
+    lines = [ln for ln in out.splitlines()
+             if "poller.py" in ln or "timeout -s 9 3600" in ln]
+    return "\n".join(lines) if lines else "<none>"
+
+
+def _append_watchdog_log(*, age, detail, pkill_result):
+    stamp = datetime.now().isoformat(timespec="seconds")
+    hb_stat = "<missing>"
+    try:
+        st = os.stat(HEARTBEAT)
+        hb_stat = (f"mtime={datetime.fromtimestamp(st.st_mtime).isoformat(timespec='seconds')} "
+                   f"size={st.st_size} mode={oct(st.st_mode & 0o777)}")
+    except OSError as e:
+        hb_stat = f"<stat failed: {e}>"
+    entry = (
+        f"=== {stamp} watchdog kill ===\n"
+        f"reason: heartbeat stale ({detail})\n"
+        f"age_s: {age if age is not None else 'missing'}\n"
+        f"heartbeat_path: {HEARTBEAT}\n"
+        f"heartbeat_stat: {hb_stat}\n"
+        f"heartbeat_tail:\n{_read_tail(HEARTBEAT)}\n"
+        f"processes_before/around_kill:\n{_poller_processes()}\n"
+        f"pkill_cmd: pkill -9 -f {PKILL_PATTERN!r}\n"
+        f"pkill_rc: {pkill_result.returncode}\n\n"
+    )
+    with open(WATCHDOG_LOG, "a", encoding="utf-8") as f:
+        f.write(entry)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def main():
     while True:
         age = heartbeat_age_s()
@@ -45,6 +96,8 @@ def main():
                   f"running pkill -9 -f {PKILL_PATTERN!r}",
                   flush=True)
             result = kill_poller()
+            _append_watchdog_log(age=age, detail=detail,
+                                 pkill_result=result)
             print(f"{datetime.now().isoformat(timespec='seconds')} "
                   f"pkill finished rc={result.returncode}",
                   flush=True)

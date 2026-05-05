@@ -798,6 +798,40 @@ def test_spool_unique_per_attempt():
             poller.PENDING = old_pending
 
 
+def test_pending_upload_drain_kick_is_nonblocking():
+    """A stuck tunnel upload retry must not stop the poll loop."""
+    import poller
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    saved = poller._drain_pending_uploads
+
+    def _slow(timeout_s=None):
+        calls.append(timeout_s)
+        started.set()
+        release.wait(timeout=2.0)
+
+    poller._drain_pending_uploads = _slow
+    try:
+        t0 = time.monotonic()
+        assert poller._kick_pending_upload_drain(timeout_s=1.0)
+        assert started.wait(timeout=1.0), "drain thread did not start"
+        assert time.monotonic() - t0 < 0.5
+        assert not poller._kick_pending_upload_drain(timeout_s=1.0)
+    finally:
+        release.set()
+        poller._drain_pending_uploads = saved
+        # Wait briefly for the drain lock to be released so later
+        # tests/importers do not inherit a locked singleton.
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            if poller._pending_drain_lock.acquire(blocking=False):
+                poller._pending_drain_lock.release()
+                break
+            time.sleep(0.01)
+    assert calls == [1.0], calls
+
+
 def test_lease_lifecycle():
     """Full lease flow: claim -> resume from another session ->
     blocks_acquire rejects an unrelated session -> release.
@@ -1222,6 +1256,7 @@ def main():
         test_refresh_does_not_evict_pinned,
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
+        test_pending_upload_drain_kick_is_nonblocking,
         test_lease_lifecycle,
         test_lease_release_honors_explicit_token_without_resume,
         test_expect_lands_in_manifest,

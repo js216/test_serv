@@ -3,3 +3,4 @@
 __pycache__/
 .codex
 heartbeat.log
+watchdog.log

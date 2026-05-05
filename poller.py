@@ -426,6 +426,21 @@ PROGRESS_BYTES_PER_DOT = 1 << 20     # 1 MiB
 _HTTP_CHUNK = 64 * 1024              # send/recv granularity
 
 
+def _timeout_left(deadline, cap=5.0):
+    left = deadline - time.monotonic()
+    if left <= 0:
+        raise TimeoutError("HTTP transfer deadline exceeded")
+    return min(cap, left)
+
+
+def _set_urlopen_timeout(response, deadline):
+    timeout = _timeout_left(deadline)
+    try:
+        response.fp.raw._sock.settimeout(timeout)
+    except Exception:
+        pass
+
+
 def _fmt_rate(nbytes, seconds):
     if seconds <= 0:
         return "?"
@@ -461,18 +476,23 @@ def _progress_dots(label, total, advance, started=None, done_bytes=None):
 
 
 def _get(url, timeout=30.0):
-    with urllib.request.urlopen(url, timeout=timeout) as r:
+    deadline = time.monotonic() + timeout
+    with urllib.request.urlopen(url, timeout=_timeout_left(deadline)) as r:
         cl = r.getheader("Content-Length")
         try:
             cl_int = int(cl) if cl is not None else None
         except ValueError:
             cl_int = None
+        buf = bytearray()
         if cl_int is not None and cl_int >= PROGRESS_THRESHOLD:
-            buf = bytearray()
             tally = 0
             started = time.monotonic()
             _progress_dots(f"GET {url}", cl_int, 0)
             while len(buf) < cl_int:
+                # urlopen's timeout is per socket operation, not a
+                # transfer deadline. Re-arm a small timeout per chunk
+                # and enforce the caller's total budget ourselves.
+                _set_urlopen_timeout(r, deadline)
                 chunk = r.read(min(_HTTP_CHUNK, cl_int - len(buf)))
                 if not chunk:
                     break
@@ -482,9 +502,21 @@ def _get(url, timeout=30.0):
                     _progress_dots("", 0, tally)
                     tally %= PROGRESS_BYTES_PER_DOT
             _progress_dots("", 0, -1, started=started, done_bytes=len(buf))
-            body = bytes(buf)
+        elif cl_int is not None:
+            while len(buf) < cl_int:
+                _set_urlopen_timeout(r, deadline)
+                chunk = r.read(min(_HTTP_CHUNK, cl_int - len(buf)))
+                if not chunk:
+                    break
+                buf += chunk
         else:
-            body = r.read()
+            while True:
+                _set_urlopen_timeout(r, deadline)
+                chunk = r.read(_HTTP_CHUNK)
+                if not chunk:
+                    break
+                buf += chunk
+        body = bytes(buf)
         return r.status, body, dict(r.headers)
 
 
@@ -513,12 +545,16 @@ def _post_streamed(url, data, timeout):
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
-    conn = http.client.HTTPConnection(host, port, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    conn = http.client.HTTPConnection(
+        host, port, timeout=_timeout_left(deadline))
     try:
         conn.connect()
+        conn.sock.settimeout(_timeout_left(deadline))
         conn.putrequest("POST", path)
         conn.putheader("Content-Length", str(len(data)))
         conn.putheader("Content-Type", "application/octet-stream")
+        conn.sock.settimeout(_timeout_left(deadline))
         conn.endheaders()
         sent = 0
         tally = 0
@@ -526,6 +562,7 @@ def _post_streamed(url, data, timeout):
         _progress_dots(f"POST {url}", len(data), 0)
         mv = memoryview(data)
         while sent < len(data):
+            conn.sock.settimeout(_timeout_left(deadline))
             n = min(_HTTP_CHUNK, len(data) - sent)
             conn.send(mv[sent:sent + n])
             sent += n
@@ -534,8 +571,11 @@ def _post_streamed(url, data, timeout):
                 _progress_dots("", 0, tally)
                 tally %= PROGRESS_BYTES_PER_DOT
         _progress_dots("", 0, -1, started=started, done_bytes=sent)
+        conn.sock.settimeout(_timeout_left(deadline))
         resp = conn.getresponse()
         # Drain so the connection can be reused / closed cleanly.
+        if conn.sock is not None:
+            conn.sock.settimeout(_timeout_left(deadline))
         body = resp.read()
         # Mirror urllib.urlopen semantics: raise on non-2xx so the
         # spool-aware retry path in _post_spooled can distinguish 409
@@ -1230,6 +1270,32 @@ def _drain_pending_uploads(timeout_s=None):
         _post_spooled(path, timeout_s=per_spool)
 
 
+_pending_drain_lock = threading.Lock()
+
+
+def _kick_pending_upload_drain(timeout_s=None):
+    """Start one background pending-upload drain if none is active.
+
+    Upload retries are tunnel-facing and can take their timeout budget
+    under packet loss. They must not run inline on the poll loop,
+    because stale heartbeat means "poll loop stopped".
+    """
+    if time.monotonic() < _push_circuit_until:
+        return False
+    if not _pending_drain_lock.acquire(blocking=False):
+        return False
+
+    def _run():
+        try:
+            _drain_pending_uploads(timeout_s=timeout_s)
+        finally:
+            _pending_drain_lock.release()
+
+    threading.Thread(
+        target=_run, daemon=True, name="pending-upload-drain").start()
+    return True
+
+
 def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S,
                    try_now=True):
     """Spool the artefact to disk first, then try to upload. If the
@@ -1480,7 +1546,7 @@ def _run_poller():
             _drain_release_markers(registry)
             _drain_sweep_markers(registry, plugins_by_name)
             _drain_cancels()
-            _drain_pending_uploads()
+            _kick_pending_upload_drain()
             # Refresh the live-tail snapshot every poll tick so the
             # dashboard sees in-flight events + stream tails with
             # ~2.5s latency rather than waiting for the artefact.
