@@ -419,6 +419,62 @@ def test_signal_cancel_sigkills_session_subprocs():
     reg.close_all()
 
 
+def test_acquire_open_timeout_quarantines_and_doesnt_wedge():
+    """Round-13 Y-CRIT1: pl.open() in _Acquire.__enter__ must have
+    a wall-clock cap; a hung open used to hold dev_lock + a worker
+    slot indefinitely with no path to recovery (the runtime_s
+    deadline can't fire because the session never reaches its next
+    op boundary).
+
+    A hung open should: (a) return control quickly (BusyError),
+    (b) quarantine the key so subsequent acquires fast-fail
+    instead of also hanging.
+    """
+    import registry as _reg
+
+    class HungOpenPlugin(DevicePlugin):
+        name = "hungopen"
+        ops = {"tick": Op(args={}, doc="", run=_noop)}
+
+        def probe(self):
+            return [{"id": "0"}]
+
+        def open(self, spec):
+            time.sleep(_reg.OPEN_TIMEOUT_S * 3)
+            return type("H", (), {})()
+
+        def close(self, h):
+            pass
+
+    plugins = {"hungopen": HungOpenPlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    saved = _reg.OPEN_TIMEOUT_S
+    _reg.OPEN_TIMEOUT_S = 0.5
+    try:
+        from plugin import BusyError
+        t0 = time.monotonic()
+        try:
+            with reg.acquire("hungopen.0"):
+                raise AssertionError("acquire of hung-open should not return")
+        except BusyError as e:
+            elapsed = time.monotonic() - t0
+            assert "timed out" in str(e) or "quarantined" in str(e), e
+            assert elapsed < 2.0, f"acquire blocked {elapsed:.2f}s on hung open"
+        # Subsequent acquire must fast-fail (quarantined).
+        t1 = time.monotonic()
+        try:
+            with reg.acquire("hungopen.0"):
+                raise AssertionError("quarantined key must refuse acquire")
+        except BusyError as e:
+            elapsed2 = time.monotonic() - t1
+            assert "quarantined" in str(e), e
+            assert elapsed2 < 0.2, (
+                f"quarantined acquire took {elapsed2:.3f}s; should be ~instant")
+    finally:
+        _reg.OPEN_TIMEOUT_S = saved
+        reg.close_all()
+
+
 def test_refresh_survives_a_hung_probe():
     """A plugin's probe() that hangs in a C call (e.g. ftd2xx's
     getDeviceInfoDetail wedged on a USB blip) must NOT block the
@@ -922,6 +978,7 @@ def main():
         test_stop_session_clean_termination,
         test_cancel_propagates_to_session,
         test_signal_cancel_sigkills_session_subprocs,
+        test_acquire_open_timeout_quarantines_and_doesnt_wedge,
         test_refresh_survives_a_hung_probe,
         test_refresh_does_not_evict_pinned,
         test_dispatch_rejects_garbage_plan,

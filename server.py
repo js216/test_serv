@@ -1134,13 +1134,35 @@ class Handler(BaseHTTPRequestHandler):
     # --- examples ---
 
     def _list_examples(self):
+        # Only list plans whose @blob references all resolve in
+        # examples/. The dashboard offers these in a dropdown; if a
+        # plan that needs blobs we don't ship lands there, the
+        # operator picks it, clicks submit, and gets an opaque 404.
+        # Better to just hide it. Plans with no @blob refs (the
+        # majority of bundled examples: inventory, lease_*, dsp_uart,
+        # fpga_uart, fpga_blink, ...) always pass.
         try:
             entries = sorted(
                 e for e in os.listdir(EXAMPLES) if e.endswith(".plan")
             )
         except FileNotFoundError:
-            entries = []
-        return self._send_json(json.dumps(entries).encode())
+            return self._send_json(b"[]")
+        out = []
+        for name in entries:
+            text = _read_file(os.path.join(EXAMPLES, name))
+            if text is None:
+                continue
+            try:
+                refs = plan.collect_blob_refs(text.decode("utf-8"))
+            except Exception:
+                refs = set()
+            missing = [
+                r for r in refs
+                if not os.path.exists(os.path.join(EXAMPLES, r))]
+            if missing:
+                continue
+            out.append(name)
+        return self._send_json(json.dumps(out).encode())
 
     def _fetch_example(self, name):
         # Two forms:

@@ -95,14 +95,37 @@ def _load_with_includes(path):
 
 def _shallow_merge(dst, src):
     """Dict update with one level of nesting: per-plugin sections
-    merge their instances + scalar settings rather than wholesale
-    replacing each other.
+    merge their scalar fields and inner dicts.
+
+    Lists (the canonical case is each plugin's ``instances`` list)
+    are NOT merged element-wise -- the second file's list replaces
+    the first file's. This is a deliberate constraint to keep the
+    merge predictable, but it means an operator splitting a
+    multi-bench config into includes must put each plugin's full
+    instance list in exactly one file. Print a one-line warning on
+    every replacement so a misconfiguration surfaces immediately
+    (operator otherwise silently loses devices).
     """
+    import sys as _sys
     for k, v in src.items():
-        if (isinstance(v, dict) and isinstance(dst.get(k), dict)):
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
             for k2, v2 in v.items():
+                if (isinstance(v2, list)
+                        and isinstance(dst[k].get(k2), list)
+                        and dst[k][k2]):
+                    _sys.stderr.write(
+                        f"config: {k}.{k2} list replaced "
+                        f"({len(dst[k][k2])} entries -> {len(v2)}); "
+                        f"merge across includes is shallow, put each "
+                        f"plugin's full instance list in one file\n")
                 dst[k][k2] = v2
         else:
+            if (isinstance(v, list)
+                    and isinstance(dst.get(k), list)
+                    and dst[k]):
+                _sys.stderr.write(
+                    f"config: {k} list replaced "
+                    f"({len(dst[k])} entries -> {len(v)})\n")
             dst[k] = v
 
 

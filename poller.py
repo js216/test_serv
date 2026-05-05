@@ -58,9 +58,15 @@ class _Tee:
     _SAFE_TEE_ERRORS = (BrokenPipeError, ValueError)
 
     def __init__(self, *streams):
-        self._streams = streams
+        # streams[0] is the original stdout/stderr; streams[1+] are
+        # log files we may rotate. Stored mutably so rotate_log()
+        # can swap the file under us atomically from another thread.
+        self._streams = list(streams)
+        self._lock = threading.Lock()
     def write(self, s):
-        for st in self._streams:
+        with self._lock:
+            streams = list(self._streams)
+        for st in streams:
             try:
                 st.write(s)
                 st.flush()
@@ -68,11 +74,17 @@ class _Tee:
                 pass
         return len(s)
     def flush(self):
-        for st in self._streams:
+        with self._lock:
+            streams = list(self._streams)
+        for st in streams:
             try:
                 st.flush()
             except self._SAFE_TEE_ERRORS:
                 pass
+    def replace_log(self, old_log, new_log):
+        with self._lock:
+            self._streams = [new_log if s is old_log else s
+                             for s in self._streams]
 
 
 # log.txt rotation: if the file already has >LOG_ROTATE_BYTES at
@@ -96,6 +108,87 @@ def _rotate_log_if_large(path):
         os.rename(path, backup)
     except OSError:
         pass
+
+
+# Mutable holder so the main loop's rotation helper can swap the
+# log file under sys.stdout/_Tee atomically without restarting the
+# poller. Set in main() right after the initial open.
+_log_f = [None]
+
+# Refused-spool retention window. Anything in PENDING/refused/ older
+# than this is unlinked: the operator either resubmitted the digest
+# and copied the spool back manually, or has decided the artefact
+# isn't worth recovering. Without this GC the dir grows unboundedly
+# in long-uptime deployments.
+REFUSED_RETENTION_S = 30 * 24 * 3600  # 30 days
+
+
+def _gc_refused_spools(now=None):
+    """Walk PENDING/refused/ and unlink files older than retention.
+    Cheap (one listdir + per-file stat); called once per refresh tick.
+    """
+    refused = os.path.join(PENDING, "refused")
+    try:
+        names = os.listdir(refused)
+    except FileNotFoundError:
+        return
+    cutoff = (now or time.time()) - REFUSED_RETENTION_S
+    removed = 0
+    for n in names:
+        p = os.path.join(refused, n)
+        try:
+            if os.stat(p).st_mtime < cutoff:
+                os.unlink(p)
+                removed += 1
+        except OSError:
+            pass
+    if removed:
+        print(datetime.now(),
+              f"GC: removed {removed} expired spool(s) from "
+              f"PENDING/refused/ (older than "
+              f"{REFUSED_RETENTION_S // 86400} days)")
+
+
+def _rotate_log_in_loop(path):
+    """Mid-loop log rotation. Called from the main loop tick. The
+    startup-only _rotate_log_if_large bounds growth to one window;
+    without this, a poller that runs for months/years grows log.txt
+    unboundedly (the user's stated goal is "run unsupervised for
+    years"). Cheap: a single getsize() per tick.
+    """
+    if _log_f[0] is None:
+        return
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size < LOG_ROTATE_BYTES:
+        return
+    backup = path + ".1"
+    try:
+        if os.path.exists(backup):
+            os.unlink(backup)
+        os.rename(path, backup)
+    except OSError:
+        return
+    try:
+        new_f = open(
+            path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    old_f = _log_f[0]
+    # Atomically swap stdout/stderr Tee's reference to the log file
+    # so any concurrent print() lands cleanly in the new file.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "replace_log"):
+            stream.replace_log(old_f, new_f)
+    _log_f[0] = new_f
+    try:
+        old_f.close()
+    except Exception:
+        pass
+    print(datetime.now(),
+          f"log rotated -> {backup} (new file: {path})")
 
 HTTP_PORT = int(os.environ.get("TEST_SERV_PORT", "8080"))
 
@@ -133,6 +226,37 @@ def _compute_code_digest():
 
 _CODE_DIGEST = _compute_code_digest()
 
+# Wall-clock origin used by /bench's `uptime_s`. Doesn't reset
+# across run_poller.sh respawn (each respawn is a fresh process).
+_BENCH_START_MONO = time.monotonic()
+
+
+def _count_open_fds():
+    """Cheap process-fd-count via /proc/self/fd. Returns -1 if not
+    available (non-Linux, sandboxed). Surfaces in bench.json so the
+    operator can spot a leaked-fd trend over weeks of uptime.
+    """
+    try:
+        return len(os.listdir("/proc/self/fd"))
+    except OSError:
+        return -1
+
+
+def _self_rss_bytes():
+    """RSS in bytes from /proc/self/status (VmRSS line). Returns -1
+    on failure. Coupled to Linux; the rest of the bench is too, so
+    not worth a portable fallback today.
+    """
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    return int(parts[1]) * 1024  # kB -> B
+    except OSError:
+        pass
+    return -1
+
 
 _poller_lock_fd = None
 
@@ -148,9 +272,12 @@ def _acquire_poller_lock():
     global _poller_lock_fd
     import fcntl
     path = os.path.join(STATE_DIR, "poller.lock")
-    # O_TRUNC so a previous poller's pid line doesn't leave stale tail
-    # bytes in the file when a different-pid poller wins the lock.
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+    # Open WITHOUT O_TRUNC: if another poller holds the flock, we
+    # must NOT erase its pid line (the operator running `cat
+    # poller.lock` to see which pid still owns it would otherwise
+    # find an empty file). The lock-file contents are only
+    # rewritten if we win the flock.
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -159,9 +286,12 @@ def _acquire_poller_lock():
             f"another poller already holds {path!r}; refusing to "
             f"start. If you're sure no other poller is running, "
             f"rm the lock file.")
-    # Hold the fd for the lifetime of the process.
+    # Hold the fd for the lifetime of the process. We won the lock,
+    # so it's now safe to overwrite the pid line.
     _poller_lock_fd = fd
     try:
+        os.ftruncate(fd, 0)
+        os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, f"pid={os.getpid()}\n".encode())
     except OSError:
         pass
@@ -492,12 +622,17 @@ def _publish_status(registry, plugins_by_name):
     _push_status("devices.json", devices)
 
     # bench.json: small file the dashboard reads to render the bench
-    # identity in the header. Lets a multi-bench operator see at a
-    # glance which bench they're talking to right now (vs hunting
-    # through artefacts for manifest.bench_id).
+    # identity in the header + a few process-health metrics so the
+    # operator can spot slow-grow problems (leaked drain threads,
+    # leaked file descriptors, runaway memory) BEFORE they cause an
+    # OOM kill on a bench that's been up for months.
     bench = json.dumps({
         "bench_id": os.environ.get("TEST_SERV_BENCH_ID"),
         "code_digest": _CODE_DIGEST,
+        "uptime_s": time.monotonic() - _BENCH_START_MONO,
+        "thread_count": threading.active_count(),
+        "open_fd_count": _count_open_fds(),
+        "rss_bytes": _self_rss_bytes(),
     }).encode()
     _write_atomic(os.path.join(STATUS, "bench.json"), bench)
     _push_status("bench.json", bench)
@@ -585,11 +720,26 @@ def _drain_release_markers(registry):
             continue
         try:
             ok = registry.release_now(n)
+            # Also clear any quarantine flag on the key so an operator
+            # who replugged a wedged device can recover without
+            # restarting the poller (the prior behaviour required a
+            # full restart to clear quarantined keys, which conflicts
+            # with the "run unsupervised for years" goal).
+            cleared_q = False
+            with registry.lock:
+                if n in registry.quarantined:
+                    registry.quarantined.discard(n)
+                    cleared_q = True
             os.remove(path)
+            tail = " (quarantine cleared)" if cleared_q else ""
             print(datetime.now(), "release",
-                  n, "ok" if ok else "(was not cached / in use)")
+                  n, "ok" if ok else "(was not cached / in use)",
+                  tail)
         except Exception:
             traceback.print_exc()
+
+
+_sweep_deferred_logged = False
 
 
 def _drain_sweep_markers(registry, plugins_by_name):
@@ -613,7 +763,19 @@ def _drain_sweep_markers(registry, plugins_by_name):
     with _active_lock:
         active = len(_active_sessions)
     if active:
+        # Log once per deferral so the operator who clicked "Run
+        # Inventory" on the dashboard at least sees that the click
+        # was received and is waiting for the bench to idle. Without
+        # this, the marker silently sits in SWEEP/ until the queue
+        # drains and the operator thinks nothing happened.
+        global _sweep_deferred_logged
+        if not _sweep_deferred_logged:
+            print(datetime.now(),
+                  f"sweep deferred: {active} session(s) still active "
+                  f"(will run when idle)")
+            _sweep_deferred_logged = True
         return
+    _sweep_deferred_logged = False
     print(datetime.now(), "sweep requested via REST")
     registry.refresh()
     _print_device_table(registry.verify_sweep(), registry)
@@ -870,6 +1032,12 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
               f"POST {name} failed with {e.code} (will retry): {e}")
         return False
     except Exception:
+        # Connection-class failure (URLError, socket.timeout, etc.).
+        # Open the push circuit so the next _drain_pending_uploads
+        # tick skips entirely instead of waiting the full timeout
+        # again on every spool against a wedged tunnel.
+        global _push_circuit_until
+        _push_circuit_until = time.monotonic() + _PUSH_CIRCUIT_OPEN_S
         print(datetime.now(),
               f"POST {name} failed (will retry):",
               traceback.format_exc().splitlines()[-1])
@@ -884,7 +1052,17 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
 def _drain_pending_uploads(timeout_s=DEFAULT_UPLOAD_S):
     """Try to POST every spooled artefact. Called on each main-loop
     tick so a transient server outage doesn't lose work.
+
+    Honours the same circuit-breaker that _push_status uses: when
+    the SSH tunnel is wedged (TCP black-hole, not RST), each upload
+    can take the full timeout (default 600s) before giving up. A
+    handful of stuck spools would block the main loop for an hour
+    or more, halting cancels / sweeps / inflight publishes. When
+    the circuit is open we skip this tick; the next attempt happens
+    when the circuit closes (30s default).
     """
+    if time.monotonic() < _push_circuit_until:
+        return
     try:
         names = sorted(os.listdir(PENDING))
     except FileNotFoundError:
@@ -914,6 +1092,7 @@ def main():
     _acquire_poller_lock()
     _rotate_log_if_large(LOG)
     log_f = open(LOG, "a", buffering=1, encoding="utf-8", errors="replace")
+    _log_f[0] = log_f
     sys.stdout = _Tee(sys.__stdout__, log_f)
     sys.stderr = _Tee(sys.__stderr__, log_f)
     print(datetime.now(), f"state dir: {STATE_DIR}")
@@ -1013,10 +1192,12 @@ def main():
             # dashboard sees in-flight events + stream tails with
             # ~2.5s latency rather than waiting for the artefact.
             _publish_inflight()
+            _rotate_log_in_loop(LOG)
 
             if time.monotonic() - last_refresh > DEVICE_REFRESH_S:
                 registry.refresh()
                 _publish_status(registry, plugins_by_name)
+                _gc_refused_spools()
                 last_refresh = time.monotonic()
 
             # Try to claim a worker slot, but don't block: if all

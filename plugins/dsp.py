@@ -62,8 +62,16 @@ class DspHandle:
         if self._ser is None:
             return
         self._reader_stop.set()
+        # Pre-empt a wedged blocking read (see mp135.uart_close).
+        try:
+            self._ser.cancel_read()
+        except Exception:
+            pass
         if self._reader_thread is not None:
             self._reader_thread.join(timeout=2.0)
+            if self._reader_thread.is_alive():
+                print("dsp uart_close: reader thread did not exit; "
+                      "leaked")
         try:
             self._ser.close()
         except Exception:

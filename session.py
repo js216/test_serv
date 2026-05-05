@@ -489,6 +489,44 @@ class Session:
         # job-atomic invariant the README promises.
         self._session_locked_keys = set(eager_keys)
         self.log_event("LOCK", "session", "acquired; running ops")
+        # Watchdog: the in-loop deadline check at _run_block only
+        # fires at op boundaries. A session stuck inside ONE op's C
+        # call (mp135 serial.read, fpga MPSSE write/read, dsp
+        # FT4222 spiMaster_*, scope inst.query_*) never reaches the
+        # next boundary and runtime_s never enforces. The watchdog
+        # runs in parallel: at runtime_s + soft grace it sets cancel
+        # (which signal_cancel SIGKILLs subprocs), and at + hard
+        # grace it calls os._exit(2) so run_poller.sh respawns the
+        # whole poller. Without this, a wedged op takes the bench
+        # offline indefinitely.
+        SOFT_GRACE_S = 30.0
+        HARD_GRACE_S = 90.0
+        budget_left_s = budget_s + SOFT_GRACE_S
+        self._done_event = threading.Event()
+
+        def _watchdog():
+            if self._done_event.wait(budget_left_s):
+                return  # session ended cleanly
+            self.log_event(
+                "WATCHDOG", "session",
+                f"runtime exceeded {budget_left_s:.0f}s; signaling cancel")
+            try:
+                self.signal_cancel()
+            except Exception:
+                pass
+            if self._done_event.wait(HARD_GRACE_S - SOFT_GRACE_S):
+                return  # cancel observed at next boundary
+            sys.stderr.write(
+                f"\n[{self.session_id}] watchdog: session wedged past "
+                f"{budget_s + HARD_GRACE_S:.0f}s and cancel didn't take; "
+                f"calling os._exit(2) -- run_poller.sh respawns. The "
+                f"in-flight job will be retried by the agent / the "
+                f"artefact may be lost.\n")
+            os._exit(2)
+
+        threading.Thread(
+            target=_watchdog, daemon=True,
+            name=f"watchdog-{self.session_id}").start()
         try:
             self._run_block(self.plan.ops, plugins, deadline)
         except StopSession as e:
@@ -551,6 +589,9 @@ class Session:
             for lk in reversed(eager_locks):
                 lk.release()
             self.log_event("LOCK", "session", "released")
+            # Tell the watchdog we're done so it doesn't fire after a
+            # legitimate completion.
+            self._done_event.set()
 
     def _run_block(self, ops, plugins, deadline):
         for op in ops:

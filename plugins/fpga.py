@@ -277,8 +277,17 @@ class FpgaHandle:
         if self._ser is None:
             return
         self._stop.set()
+        # Pre-empt a wedged blocking read (see mp135.uart_close for
+        # rationale).
+        try:
+            self._ser.cancel_read()
+        except Exception:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                print(f"fpga uart_close: drain thread did not exit; "
+                      f"leaked")
         try:
             self._ser.close()
         except Exception:

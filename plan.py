@@ -3,6 +3,7 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import io
+import re
 import shlex
 import tarfile
 from dataclasses import dataclass
@@ -320,6 +321,18 @@ def extract_description(data):
             if v is not None:
                 return v.raw if hasattr(v, "raw") else v
     return None
+
+
+_BLOB_REF_RE = re.compile(r"(?<![A-Za-z0-9_.@-])@([A-Za-z0-9._-]+)")
+
+
+def collect_blob_refs(plan_text):
+    """Return the set of @blob names referenced in a plan body.
+    Used by server's /examples to filter out plans whose blobs
+    aren't shipped (so the dashboard's example dropdown only
+    offers things that actually run end-to-end).
+    """
+    return set(_BLOB_REF_RE.findall(plan_text))
 
 
 def _check_blob_refs(ops, available):

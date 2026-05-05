@@ -32,6 +32,45 @@ VERIFY_OPEN_TIMEOUT_S = 30.0
 # this cap so a hung driver eats one tick instead of the bench.
 PROBE_TIMEOUT_S = 15.0
 
+# Per-device pl.open() wall-clock cap during _Acquire (every session
+# op that resolves a key calls pl.open via _Acquire). Same hazard
+# as PROBE_TIMEOUT_S but on the session worker thread: a hung open
+# (serial.Serial constructor on a flaky tty, ftd2xx.openByDescription
+# on a wedged FTDI chip, pyvisa.open_resource on a scope mid-reboot)
+# would otherwise hold dev_lock + a worker_slot indefinitely, with
+# no way for the runtime_s deadline to fire because the session
+# never reaches its next op boundary. 60s is more generous than
+# PROBE_TIMEOUT_S since open includes identity handshakes (e.g. a
+# real *IDN? round-trip on the scope).
+OPEN_TIMEOUT_S = 60.0
+
+
+def _run_with_wallclock_timeout(label, fn, timeout_s):
+    """Run ``fn()`` in a daemon thread with a wall-clock cap.
+
+    Returns ``(result, error_text, timed_out)``. On timeout the
+    thread is leaked -- C-level blocking syscalls cannot be
+    interrupted from Python -- but the caller gets control back so
+    the rest of the bench keeps running. Use this for any third-
+    party-C call that cannot be trusted to return promptly: probe,
+    pl.open, verify_sweep's identity handshake.
+    """
+    box = [None, None]   # [result, exception_text]
+
+    def _do():
+        try:
+            box[0] = fn()
+        except Exception:
+            box[1] = traceback.format_exc()
+
+    t = threading.Thread(
+        target=_do, daemon=True, name=f"timeout-{label}")
+    t.start()
+    t.join(timeout=timeout_s)
+    if t.is_alive():
+        return None, None, True
+    return box[0], box[1], False
+
 
 class DeviceRegistry:
     """Tracks device specs and lends handles on demand.
@@ -86,36 +125,19 @@ class DeviceRegistry:
         """Call ``pl.probe()`` with a wall-clock cap so a hung
         third-party driver (ftd2xx, pyusb, etc) can't wedge the
         main loop. Returns the spec list, or [] on exception or
-        timeout. The thread is left running on timeout -- C-level
-        blocking syscalls can't be interrupted from Python -- but
-        the next refresh tick will try again and recover once the
-        driver unhangs (or stay [] forever, which is still
-        infinitely better than wedging the whole poller).
+        timeout. The next refresh tick will try again.
         """
-        result = []
-        err_box = []
-
-        def _do():
-            try:
-                got = pl.probe() or []
-                result.extend(got)
-            except Exception:
-                err_box.append(traceback.format_exc())
-
-        t = threading.Thread(
-            target=_do, daemon=True,
-            name=f"probe-{pname}")
-        t.start()
-        t.join(timeout=PROBE_TIMEOUT_S)
-        if t.is_alive():
+        result, err, timed_out = _run_with_wallclock_timeout(
+            f"probe-{pname}", lambda: pl.probe() or [], PROBE_TIMEOUT_S)
+        if timed_out:
             print(f"refresh: {pname}.probe() timed out after "
                   f"{PROBE_TIMEOUT_S:.0f}s "
                   f"(thread leaked, will retry next tick)")
             return []
-        if err_box:
-            print(f"refresh: {pname}.probe() raised:\n{err_box[0]}")
+        if err:
+            print(f"refresh: {pname}.probe() raised:\n{err}")
             return []
-        return result
+        return result or []
 
     def refresh(self):
         """Rescan every plugin's probe() and update specs."""
@@ -259,40 +281,36 @@ class DeviceRegistry:
             t0 = time.monotonic()
             entry = {"t": time.time(), "ok": False, "verified": False,
                      "err": None, "latency_ms": 0.0}
-            # Run each open() in a thread with a wall-clock timeout so
-            # a hung USB device (rare but does happen on bad cables /
-            # power-glitched chips) doesn't wedge poller startup
-            # forever. The thread is left running on timeout -- C-side
-            # blocking syscalls can't be interrupted from Python -- so
-            # we mark the key quarantined; subsequent acquires fail
-            # fast with BusyError instead of hanging on the dev_lock
-            # the leaked thread is still holding.
-            verified_box = [False]
-            err_box = [None]
-
+            # Run each open() with a wall-clock timeout so a hung USB
+            # device (rare but does happen on bad cables / power-
+            # glitched chips) doesn't wedge poller startup forever.
+            # On timeout we mark the key quarantined; subsequent
+            # acquires fail fast with BusyError instead of hanging on
+            # the dev_lock the leaked thread is still holding.
             def _do():
-                try:
-                    with self.acquire(key) as handle:
-                        verified_box[0] = bool(
-                            getattr(handle, "_identity_verified", False))
-                except Exception as e:
-                    err_box[0] = e
+                with self.acquire(key) as handle:
+                    return bool(
+                        getattr(handle, "_identity_verified", False))
 
-            t = threading.Thread(target=_do, daemon=True)
-            t.start()
-            t.join(timeout=VERIFY_OPEN_TIMEOUT_S)
-            if t.is_alive():
+            verified, err_text, timed_out = _run_with_wallclock_timeout(
+                f"verify-{key}", _do, VERIFY_OPEN_TIMEOUT_S)
+            if timed_out:
                 with self.lock:
                     self.quarantined.add(key)
                 entry["err"] = (f"open timed out after "
                                 f"{VERIFY_OPEN_TIMEOUT_S:.0f}s "
                                 f"(device hung; key quarantined -- "
-                                f"replug + restart poller to clear)")
-            elif err_box[0] is not None:
-                e = err_box[0]
-                entry["err"] = f"{type(e).__name__}: {e}"
+                                f"clear via POST /devices/{key}/release "
+                                f"after replug, or restart the poller)")
+            elif err_text is not None:
+                # Render the last line of the traceback for the
+                # operator (the full traceback is in the timeout
+                # helper but verify_results is meant to be a
+                # one-glance summary).
+                last = err_text.strip().splitlines()[-1] if err_text else ""
+                entry["err"] = last
             else:
-                entry["verified"] = verified_box[0]
+                entry["verified"] = bool(verified)
                 entry["ok"] = True
                 # The sweep's whole point is "open it once and put it
                 # back as if untouched"; close before we move on so a
@@ -507,18 +525,50 @@ class _Acquire:
                     return handle
                 pname, spec = reg.specs[key]
                 pl = reg.plugins[pname]
-            # Plugin call OUTSIDE reg.lock.
-            handle = pl.open(spec)
+            # Plugin call OUTSIDE reg.lock, with a wall-clock cap.
+            # A hung pl.open in C (serial.Serial constructor on a
+            # flaky tty, ftd2xx.openByDescription on a wedged FTDI,
+            # pyvisa.open_resource on a scope mid-reboot) would
+            # otherwise hold dev_lock + a worker_slot indefinitely
+            # with no way for the session's runtime_s deadline to
+            # fire (deadline is op-boundary; we never reach the
+            # next op). Quarantine the key so subsequent acquires
+            # fast-fail rather than queue up behind the leaked
+            # thread.
+            handle, err_text, timed_out = _run_with_wallclock_timeout(
+                f"open-{key}", lambda: pl.open(spec), OPEN_TIMEOUT_S)
+            if timed_out:
+                with reg.lock:
+                    reg.quarantined.add(key)
+                # dev_lock stays held by the leaked thread; do NOT
+                # release it (would let another thread try to open
+                # the same key against the still-wedged driver).
+                # The quarantine flag means future _Acquire on this
+                # key fast-fails before reaching dev_lock.acquire.
+                self._lock = None
+                raise BusyError(
+                    f"{key} pl.open() timed out after "
+                    f"{OPEN_TIMEOUT_S:.0f}s; quarantined")
+            if err_text is not None:
+                last = err_text.strip().splitlines()[-1] if err_text else ""
+                dev_lock.release()
+                raise RuntimeError(f"{key} pl.open() failed: {last}")
             with reg.lock:
                 # Cache may have been populated concurrently by
                 # another acquirer, but we held dev_lock the whole
                 # time so that's impossible; install fresh.
                 reg.cache[key] = [handle, 1]
         except BusyError:
-            dev_lock.release()
+            try:
+                dev_lock.release()
+            except RuntimeError:
+                pass  # already released by the timeout branch
             raise
         except Exception:
-            dev_lock.release()
+            try:
+                dev_lock.release()
+            except RuntimeError:
+                pass
             raise
         self._lock = dev_lock
         self.handle = handle

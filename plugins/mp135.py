@@ -46,8 +46,20 @@ class Mp135Handle:
         if self._ser is None:
             return
         self._stop.set()
+        # Pre-empt a wedged blocking read: pyserial 3.5+ exposes
+        # cancel_read() which interrupts a read() stuck in the
+        # kernel/driver. Without this, a flaky FTDI/USB tty can
+        # leak the drain thread (and its serial fd) forever, since
+        # _drain.read() never returns and join times out.
+        try:
+            self._ser.cancel_read()
+        except Exception:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+            if self._thread.is_alive():
+                print(f"mp135 uart_close: drain thread on "
+                      f"{self._port!r} did not exit; leaked")
         try:
             self._ser.close()
         except Exception:
