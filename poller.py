@@ -120,7 +120,14 @@ _log_f = [None]
 # and copied the spool back manually, or has decided the artefact
 # isn't worth recovering. Without this GC the dir grows unboundedly
 # in long-uptime deployments.
-REFUSED_RETENTION_S = 30 * 24 * 3600  # 30 days
+# 365 days picked over a tighter window because (a) refused spools
+# are tiny relative to bench disk, (b) wall-clock-based GC on a
+# bench whose RTC battery died and then NTP step-forwards by months
+# would otherwise nuke recently-parked spools the operator was
+# counting on (the very high-stakes "I came back to the bench in 6
+# months and the artefact is gone" trap). Trade more disk for more
+# data safety; that's the right tradeoff for an R&D bench.
+REFUSED_RETENTION_S = 365 * 24 * 3600  # 365 days
 
 
 def _gc_refused_spools(now=None):
@@ -1049,20 +1056,29 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
     return True
 
 
-def _drain_pending_uploads(timeout_s=DEFAULT_UPLOAD_S):
+DRAIN_PER_SPOOL_TIMEOUT_S = 30.0
+
+
+def _drain_pending_uploads(timeout_s=None):
     """Try to POST every spooled artefact. Called on each main-loop
     tick so a transient server outage doesn't lose work.
 
     Honours the same circuit-breaker that _push_status uses: when
     the SSH tunnel is wedged (TCP black-hole, not RST), each upload
-    can take the full timeout (default 600s) before giving up. A
-    handful of stuck spools would block the main loop for an hour
-    or more, halting cancels / sweeps / inflight publishes. When
-    the circuit is open we skip this tick; the next attempt happens
-    when the circuit closes (30s default).
+    can take the full timeout before giving up. The circuit-breaker
+    skips next tick on the first failure, but the FIRST failure
+    still has to actually time out -- so we cap the per-spool
+    timeout to DRAIN_PER_SPOOL_TIMEOUT_S (30s) instead of the
+    foreground DEFAULT_UPLOAD_S (600s). The long timeout is for
+    the foreground _post_artefact path where a worker thread is
+    waiting on its own upload; the main-loop drain just retries
+    next tick, so a tight cap there keeps the loop responsive
+    (cancels still get drained, /plan still gets pulled).
     """
     if time.monotonic() < _push_circuit_until:
         return
+    if timeout_s is None:
+        timeout_s = DRAIN_PER_SPOOL_TIMEOUT_S
     try:
         names = sorted(os.listdir(PENDING))
     except FileNotFoundError:

@@ -99,15 +99,47 @@ async function refresh() {
   }
 }
 
+function _fmtUptime(s) {
+  if (s == null || s < 0) return "?";
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d${h}h`;
+  if (h > 0) return `${h}h${m}m`;
+  return `${m}m`;
+}
+
+function _fmtBytes(b) {
+  if (b == null || b < 0) return "?";
+  if (b > 1 << 30) return `${(b / (1 << 30)).toFixed(1)}GiB`;
+  if (b > 1 << 20) return `${(b / (1 << 20)).toFixed(0)}MiB`;
+  if (b > 1 << 10) return `${(b / (1 << 10)).toFixed(0)}KiB`;
+  return `${b}B`;
+}
+
 function renderBenchId() {
   const e = $("#bench-id");
   if (!e) return;
-  const bid = state.bench && state.bench.bench_id;
+  const b = state.bench || {};
+  const bid = b.bench_id;
+  // Process-health metrics: surface so an operator returning to a
+  // bench that's been up for months can spot leaks at a glance.
+  // bench.json carries uptime_s, thread_count, open_fd_count,
+  // rss_bytes; "?" if any are unavailable (non-Linux, sandboxed).
+  const metrics = [];
+  if (b.uptime_s != null) metrics.push(`up ${_fmtUptime(b.uptime_s)}`);
+  if (b.thread_count != null && b.thread_count >= 0)
+    metrics.push(`${b.thread_count} threads`);
+  if (b.open_fd_count != null && b.open_fd_count >= 0)
+    metrics.push(`${b.open_fd_count} fds`);
+  if (b.rss_bytes != null && b.rss_bytes >= 0)
+    metrics.push(`${_fmtBytes(b.rss_bytes)} RSS`);
+  const tail = metrics.length ? ` | ${metrics.join(", ")}` : "";
   if (bid) {
-    e.textContent = `bench: ${bid}`;
+    e.textContent = `bench: ${bid}${tail}`;
     e.className = "bench-id bench-id-set";
   } else {
-    e.textContent = "bench: (unset — set $TEST_SERV_BENCH_ID)";
+    e.textContent = `bench: (unset — set $TEST_SERV_BENCH_ID)${tail}`;
     e.className = "bench-id bench-id-unset";
   }
 }

@@ -538,37 +538,30 @@ class _Acquire:
             handle, err_text, timed_out = _run_with_wallclock_timeout(
                 f"open-{key}", lambda: pl.open(spec), OPEN_TIMEOUT_S)
             if timed_out:
+                # Mark the key quarantined BEFORE releasing dev_lock:
+                # the next acquire that beats us to the lock would
+                # otherwise queue up against the still-wedged driver
+                # too. The quarantine check at the top of __enter__
+                # fast-fails before dev_lock.acquire, so subsequent
+                # callers BusyError immediately.
+                # The leaked thread is running pl.open(), not holding
+                # dev_lock (only this thread did, at line ~507) -- so
+                # the BusyError handler below correctly releases it.
                 with reg.lock:
                     reg.quarantined.add(key)
-                # dev_lock stays held by the leaked thread; do NOT
-                # release it (would let another thread try to open
-                # the same key against the still-wedged driver).
-                # The quarantine flag means future _Acquire on this
-                # key fast-fails before reaching dev_lock.acquire.
-                self._lock = None
                 raise BusyError(
                     f"{key} pl.open() timed out after "
                     f"{OPEN_TIMEOUT_S:.0f}s; quarantined")
             if err_text is not None:
                 last = err_text.strip().splitlines()[-1] if err_text else ""
-                dev_lock.release()
                 raise RuntimeError(f"{key} pl.open() failed: {last}")
             with reg.lock:
                 # Cache may have been populated concurrently by
                 # another acquirer, but we held dev_lock the whole
                 # time so that's impossible; install fresh.
                 reg.cache[key] = [handle, 1]
-        except BusyError:
-            try:
-                dev_lock.release()
-            except RuntimeError:
-                pass  # already released by the timeout branch
-            raise
-        except Exception:
-            try:
-                dev_lock.release()
-            except RuntimeError:
-                pass
+        except BaseException:
+            dev_lock.release()
             raise
         self._lock = dev_lock
         self.handle = handle

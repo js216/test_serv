@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import tarfile
+import threading
 import time
 
 import plan
@@ -417,6 +418,70 @@ def test_signal_cancel_sigkills_session_subprocs():
                 pass
             poller.unregister_subprocess(p)
     reg.close_all()
+
+
+def test_session_watchdog_hard_exits_when_wedged():
+    """Round-14 AA-CRIT1 / BB-CRIT1: when a session is wedged past
+    runtime_s + WATCHDOG_HARD_GRACE_S (e.g. an op that doesn't honor
+    cancel because it's stuck in a C-level USB syscall), the watchdog
+    must call os._exit(2) so run_poller.sh respawns the poller. This
+    is the ONLY escape for a session hung in third-party C code.
+
+    The first cut of this code (commit 9aca226) used `sys.stderr` but
+    forgot `import sys`, so the watchdog raised NameError silently in
+    the daemon thread and os._exit(2) was unreachable -- the bench
+    stayed wedged forever. The watchdog must not be allowed to
+    silently fail.
+    """
+    import session as _session
+
+    # Spy os._exit so the test runner doesn't actually die.
+    exit_calls = []
+    real_exit = os._exit
+    os._exit = lambda code: exit_calls.append(code)
+
+    # Shrink the grace windows so the test takes <1s instead of 90+.
+    saved_soft = _session.WATCHDOG_SOFT_GRACE_S
+    saved_hard = _session.WATCHDOG_HARD_GRACE_S
+    _session.WATCHDOG_SOFT_GRACE_S = 0.05
+    _session.WATCHDOG_HARD_GRACE_S = 0.20
+
+    def _hang(session, h, args):
+        # Sleep way past runtime + hard grace. time.sleep releases
+        # the GIL the same way a C-level USB syscall would, so this
+        # exercises the watchdog's _done_event.wait timeout path
+        # faithfully.
+        time.sleep(5.0)
+
+    class HangPlugin(FakePlugin):
+        name = "hang"
+        ops = {"hang": Op(args={}, doc="sleep through cancel",
+                          run=_hang)}
+
+    parsed = plan.load_tar(plan.pack_tar("hang:hang\n", {}))
+    plugins = {"hang": HangPlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    sess = Session(reg, parsed, runtime_s=0.05)
+
+    # Drive the session in a thread so we can return when the
+    # watchdog fires (the watchdog calls our os._exit spy, but the
+    # _hang thread keeps sleeping; we don't wait for it).
+    t = threading.Thread(target=lambda: sess.run_all(plugins),
+                         daemon=True)
+    t.start()
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and not exit_calls:
+        time.sleep(0.05)
+    try:
+        assert exit_calls == [2], (
+            f"watchdog must call os._exit(2); got {exit_calls!r}. "
+            f"This regressed because someone removed `import sys` "
+            f"or otherwise broke the watchdog body silently.")
+    finally:
+        os._exit = real_exit
+        _session.WATCHDOG_SOFT_GRACE_S = saved_soft
+        _session.WATCHDOG_HARD_GRACE_S = saved_hard
+        reg.close_all()
 
 
 def test_acquire_open_timeout_quarantines_and_doesnt_wedge():
@@ -978,6 +1043,7 @@ def main():
         test_stop_session_clean_termination,
         test_cancel_propagates_to_session,
         test_signal_cancel_sigkills_session_subprocs,
+        test_session_watchdog_hard_exits_when_wedged,
         test_acquire_open_timeout_quarantines_and_doesnt_wedge,
         test_refresh_survives_a_hung_probe,
         test_refresh_does_not_evict_pinned,

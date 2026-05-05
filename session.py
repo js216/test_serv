@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import sys
 import tarfile
 import threading
 import time
@@ -20,6 +21,15 @@ from plugin import BusyError, decode_args
 
 DEFAULT_SESSION_S = 600.0
 MAX_SESSION_S = 3600.0
+
+# Watchdog grace windows past `runtime_s`. At runtime_s + WATCHDOG_
+# SOFT_GRACE_S the watchdog signals cancel (which SIGKILLs subprocs
+# but can't interrupt a wedged C call). At runtime_s + WATCHDOG_
+# HARD_GRACE_S it calls os._exit(2) so run_poller.sh respawns the
+# whole poller -- the only escape from a session truly stuck inside
+# a third-party C extension. Module-level so tests can shrink them.
+WATCHDOG_SOFT_GRACE_S = 30.0
+WATCHDOG_HARD_GRACE_S = 90.0
 
 
 def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
@@ -499,30 +509,47 @@ class Session:
         # grace it calls os._exit(2) so run_poller.sh respawns the
         # whole poller. Without this, a wedged op takes the bench
         # offline indefinitely.
-        SOFT_GRACE_S = 30.0
-        HARD_GRACE_S = 90.0
-        budget_left_s = budget_s + SOFT_GRACE_S
+        budget_left_s = budget_s + WATCHDOG_SOFT_GRACE_S
         self._done_event = threading.Event()
 
         def _watchdog():
-            if self._done_event.wait(budget_left_s):
-                return  # session ended cleanly
-            self.log_event(
-                "WATCHDOG", "session",
-                f"runtime exceeded {budget_left_s:.0f}s; signaling cancel")
             try:
-                self.signal_cancel()
-            except Exception:
-                pass
-            if self._done_event.wait(HARD_GRACE_S - SOFT_GRACE_S):
-                return  # cancel observed at next boundary
-            sys.stderr.write(
-                f"\n[{self.session_id}] watchdog: session wedged past "
-                f"{budget_s + HARD_GRACE_S:.0f}s and cancel didn't take; "
-                f"calling os._exit(2) -- run_poller.sh respawns. The "
-                f"in-flight job will be retried by the agent / the "
-                f"artefact may be lost.\n")
-            os._exit(2)
+                if self._done_event.wait(budget_left_s):
+                    return  # session ended cleanly
+                self.log_event(
+                    "WATCHDOG", "session",
+                    f"runtime exceeded {budget_left_s:.0f}s; "
+                    f"signaling cancel")
+                try:
+                    self.signal_cancel()
+                except Exception:
+                    pass
+                if self._done_event.wait(
+                        WATCHDOG_HARD_GRACE_S - WATCHDOG_SOFT_GRACE_S):
+                    return  # cancel observed at next boundary
+                sys.stderr.write(
+                    f"\n[{self.session_id}] watchdog: session wedged "
+                    f"past "
+                    f"{budget_s + WATCHDOG_HARD_GRACE_S:.0f}s and "
+                    f"cancel didn't take; calling os._exit(2) -- "
+                    f"run_poller.sh respawns. The in-flight job will "
+                    f"be retried by the agent / the artefact may be "
+                    f"lost.\n")
+                os._exit(2)
+            except BaseException:
+                # The watchdog runs in a daemon thread; an unhandled
+                # exception here would silently kill the thread and
+                # leave the bench permanently wedged. Log and force
+                # exit so run_poller.sh still respawns -- a broken
+                # watchdog is no worse than no watchdog, but a SILENT
+                # broken watchdog is the worst case.
+                try:
+                    sys.stderr.write(
+                        f"\n[{self.session_id}] watchdog crashed:\n"
+                        f"{traceback.format_exc()}\n")
+                except Exception:
+                    pass
+                os._exit(2)
 
         threading.Thread(
             target=_watchdog, daemon=True,
