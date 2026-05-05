@@ -71,10 +71,18 @@
     "instances": [
       {
         "id": "evb",
-        "description": "STM32MP135F-DK eval board's bare-metal MSC bootloader (visible only after DFU-flashing main.stm32). iSerial 385836733232.",
+        "description": "STM32MP135F-DK eval board's bare-metal MSC bootloader (visible only after DFU-flashing main.stm32). iSerial 002800425115 -- prefix matches the dfu.evb chip-UID, so this is the ST eval board.",
         "usb_vid": "0x0483",
         "usb_pid": "0x571d",
-        "usb_serial": "385836733232",
+        "usb_serial": "002800425115",
+        "block_size": 512
+      },
+      {
+        "id": "custom",
+        "description": "Custom STM32MP135 PCB (SRS-built). iSerial 001E00065113 -- prefix matches the dfu.custom chip-UID.",
+        "usb_vid": "0x0483",
+        "usb_pid": "0x571d",
+        "usb_serial": "001E00065113",
         "block_size": 512
       }
     ]
