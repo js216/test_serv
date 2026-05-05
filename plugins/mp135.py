@@ -117,10 +117,11 @@ def _op_uart_expect(session, h, args):
     stream = session.stream("mp135.uart")
     deadline = time.monotonic() + timeout_ms / 1000.0
     claim = f"mp135.uart contains {sentinel!r} within {timeout_ms} ms"
+    cursor = {}
     while time.monotonic() < deadline:
         if session.canceled:
             return
-        if sentinel in stream.snapshot_bytes():
+        if stream.contains_bytes(sentinel, cursor):
             session.log_event("EXPECT", "mp135:uart_expect",
                               f"HIT {sentinel!r}")
             session.record_check(

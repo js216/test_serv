@@ -14,6 +14,7 @@ HEARTBEAT = os.path.join(REPO_DIR, "heartbeat.log")
 WATCHDOG_LOG = os.path.join(REPO_DIR, "watchdog.log")
 CHECK_INTERVAL_S = 300.0
 STALE_AFTER_S = 120.0
+KILL_SETTLE_S = 2.0
 PKILL_PATTERN = "python3.*poller.py"
 PS_CMD = ["ps", "-eo", "pid,ppid,stat,etime,cmd"]
 
@@ -60,7 +61,18 @@ def _poller_processes():
     return "\n".join(lines) if lines else "<none>"
 
 
-def _append_watchdog_log(*, age, detail, pkill_result):
+def _settled_poller_processes(timeout_s=KILL_SETTLE_S):
+    deadline = time.monotonic() + timeout_s
+    last = _poller_processes()
+    while time.monotonic() < deadline:
+        time.sleep(0.1)
+        last = _poller_processes()
+    return last, max(0.0, timeout_s - max(0.0, deadline - time.monotonic()))
+
+
+def _append_watchdog_log(*, age, detail, pkill_result,
+                         processes_before, processes_after,
+                         processes_settled, settle_elapsed_s):
     stamp = datetime.now().isoformat(timespec="seconds")
     hb_stat = "<missing>"
     try:
@@ -76,7 +88,10 @@ def _append_watchdog_log(*, age, detail, pkill_result):
         f"heartbeat_path: {HEARTBEAT}\n"
         f"heartbeat_stat: {hb_stat}\n"
         f"heartbeat_tail:\n{_read_tail(HEARTBEAT)}\n"
-        f"processes_before/around_kill:\n{_poller_processes()}\n"
+        f"processes_before_kill:\n{processes_before}\n"
+        f"processes_after_kill_immediate:\n{processes_after}\n"
+        f"processes_after_kill_settled "
+        f"({settle_elapsed_s:.1f}s):\n{processes_settled}\n"
         f"pkill_cmd: pkill -9 -f {PKILL_PATTERN!r}\n"
         f"pkill_rc: {pkill_result.returncode}\n\n"
     )
@@ -95,9 +110,16 @@ def main():
                   f"heartbeat stale ({detail}); "
                   f"running pkill -9 -f {PKILL_PATTERN!r}",
                   flush=True)
+            before = _poller_processes()
             result = kill_poller()
+            after = _poller_processes()
+            settled, settle_elapsed = _settled_poller_processes()
             _append_watchdog_log(age=age, detail=detail,
-                                 pkill_result=result)
+                                 pkill_result=result,
+                                 processes_before=before,
+                                 processes_after=after,
+                                 processes_settled=settled,
+                                 settle_elapsed_s=settle_elapsed)
             print(f"{datetime.now().isoformat(timespec='seconds')} "
                   f"pkill finished rc={result.returncode}",
                   flush=True)

@@ -39,6 +39,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import faulthandler
 from datetime import datetime
 
 import paths
@@ -56,6 +57,7 @@ SWEEP = os.path.join(STATE_DIR, "sweep")
 LOG = os.path.join(STATE_DIR, "log.txt")
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
 HEARTBEAT_LOG = os.path.join(REPO_DIR, "heartbeat.log")
+STACK_DUMP_LOG = os.path.join(REPO_DIR, "stackdump.log")
 HEARTBEAT_INTERVAL_S = 30.0
 # Artefacts produced by run_all are spooled here before the POST to
 # the server. If the POST fails (server restart, SSH-tunnel hiccup),
@@ -138,6 +140,28 @@ def _rotate_log_if_large(path):
 # log file under sys.stdout/_Tee atomically without restarting the
 # poller. Set in main() right after the initial open.
 _log_f = [None]
+_stack_dump_f = [None]
+
+
+def _register_stack_dump():
+    if _stack_dump_f[0] is None:
+        _stack_dump_f[0] = open(
+            STACK_DUMP_LOG, "a", buffering=1,
+            encoding="utf-8", errors="replace")
+    dump_f = _stack_dump_f[0]
+    try:
+        faulthandler.enable(file=dump_f, all_threads=True)
+        sigusr1 = getattr(signal, "SIGUSR1", None)
+        if sigusr1 is not None:
+            try:
+                faulthandler.unregister(sigusr1)
+            except Exception:
+                pass
+            faulthandler.register(
+                sigusr1, file=dump_f, all_threads=True,
+                chain=False)
+    except Exception:
+        pass
 
 # Refused-spool retention window. Anything in PENDING/refused/ older
 # than this is unlinked: the operator either resubmitted the digest
@@ -626,6 +650,21 @@ def _write_heartbeat(path=HEARTBEAT_LOG, now=None):
     ts = datetime.fromtimestamp(now or time.time()).isoformat(
         timespec="seconds")
     _write_atomic(path, f"{ts}\n".encode())
+    _notify_supervisor_heartbeat()
+
+
+def _notify_supervisor_heartbeat():
+    fd_s = os.environ.get(_HEARTBEAT_FD_ENV)
+    if not fd_s:
+        return
+    try:
+        os.write(int(fd_s), b".")
+    except BlockingIOError:
+        pass
+    except OSError:
+        os.environ.pop(_HEARTBEAT_FD_ENV, None)
+    except ValueError:
+        os.environ.pop(_HEARTBEAT_FD_ENV, None)
 
 
 _PUSH_CIRCUIT_OPEN_S = 30.0
@@ -1323,9 +1362,19 @@ def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S,
 SUPERVISOR_COOLDOWN_S = 5.0
 SUPERVISOR_RUN_BUDGET_S = 10.0
 SUPERVISOR_MAX_FAST_FAILS = 5
+SUPERVISOR_HEARTBEAT_CHECK_S = 5.0
+SUPERVISOR_HEARTBEAT_STALE_S = 120.0
+SUPERVISOR_STACK_DUMP_GRACE_S = 1.0
 # Hidden flag the supervisor passes to its worker child so the child
 # knows not to recurse into another supervisor.
 _WORKER_FLAG = "--_worker"
+_HEARTBEAT_FD_ENV = "TEST_SERV_HEARTBEAT_FD"
+
+
+def _heartbeat_stale(last_heartbeat_mono, now=None):
+    now = now or time.monotonic()
+    age = now - last_heartbeat_mono
+    return age > SUPERVISOR_HEARTBEAT_STALE_S, age
 
 
 def _supervise():
@@ -1342,11 +1391,15 @@ def _supervise():
 
     Clean exits (rc=0), SIGINT (rc=130 / -SIGINT), and SIGTERM
     (rc=143 / -SIGTERM) all stop the supervisor; otherwise it
-    respawns after SUPERVISOR_COOLDOWN_S. Five fast-fails in a row
-    abort so an operator with a config error sees the failure
-    instead of the supervisor spinning forever.
+    respawns after SUPERVISOR_COOLDOWN_S. A worker whose heartbeat
+    stops is considered wedged even if the process is still alive:
+    dump Python thread stacks via SIGUSR1, then SIGKILL it so the
+    next generation takes over. Five fast-fails in a row abort so an
+    operator with a config error sees the failure instead of the
+    supervisor spinning forever.
     """
     import subprocess
+    import select
 
     # Pass through any extra args (e.g. --no-supervisor's siblings if
     # we add some later, or --port / config overrides). argv[0] is
@@ -1388,14 +1441,77 @@ def _supervise():
         argv = [sys.executable, os.path.abspath(__file__),
                 _WORKER_FLAG] + extra
         start = time.monotonic()
+        last_heartbeat_mono = start
+        hb_r = hb_w = None
+        env = os.environ.copy()
         try:
-            p = subprocess.Popen(argv)
+            hb_r, hb_w = os.pipe()
+            try:
+                os.set_blocking(hb_w, False)
+            except (AttributeError, OSError):
+                pass
+            os.set_inheritable(hb_w, True)
+            env[_HEARTBEAT_FD_ENV] = str(hb_w)
+            p = subprocess.Popen(argv, pass_fds=(hb_w,), env=env)
         except OSError as e:
+            for fd in (hb_r, hb_w):
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
             print(f"{datetime.now()} supervisor: spawn failed: {e}",
                   file=sys.stderr)
             return 1
+        try:
+            os.close(hb_w)
+        except OSError:
+            pass
         child_box[0] = p
-        rc = p.wait()
+        killed_for_stale_heartbeat = False
+        while True:
+            rc = p.poll()
+            if rc is not None:
+                break
+            try:
+                readable, _, _ = select.select(
+                    [hb_r], [], [], SUPERVISOR_HEARTBEAT_CHECK_S)
+            except (OSError, ValueError):
+                readable = []
+            if readable:
+                try:
+                    data = os.read(hb_r, 4096)
+                except OSError:
+                    data = b""
+                if data:
+                    last_heartbeat_mono = time.monotonic()
+            stale, age = _heartbeat_stale(last_heartbeat_mono)
+            if stale:
+                killed_for_stale_heartbeat = True
+                sigusr1 = getattr(signal, "SIGUSR1", None)
+                dump_msg = ("dumping stacks then "
+                            if sigusr1 is not None
+                            else "stack dump unavailable; ")
+                print(f"{datetime.now()} supervisor: worker heartbeat "
+                      f"stale for {age:.0f}s; {dump_msg}"
+                      f"killing worker pid={p.pid}",
+                      file=sys.stderr)
+                if sigusr1 is not None:
+                    try:
+                        p.send_signal(sigusr1)
+                    except Exception:
+                        pass
+                    time.sleep(SUPERVISOR_STACK_DUMP_GRACE_S)
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                rc = p.wait()
+                break
+        try:
+            os.close(hb_r)
+        except OSError:
+            pass
         elapsed = time.monotonic() - start
 
         # Negative rc on POSIX = killed by signal -rc.
@@ -1413,7 +1529,13 @@ def _supervise():
                   f"SIGTERM; not respawning")
             return 0
 
-        if elapsed < SUPERVISOR_RUN_BUDGET_S:
+        if killed_for_stale_heartbeat:
+            fast_fails = 0
+            print(f"{datetime.now()} supervisor: worker killed after "
+                  f"{elapsed:.1f}s for stale heartbeat (rc={rc}); "
+                  f"respawning in {SUPERVISOR_COOLDOWN_S:.0f}s",
+                  file=sys.stderr)
+        elif elapsed < SUPERVISOR_RUN_BUDGET_S:
             fast_fails += 1
             print(f"{datetime.now()} supervisor: worker died after "
                   f"{elapsed:.1f}s (rc={rc}, fast-fail "
@@ -1459,16 +1581,22 @@ def _run_poller():
     _log_f[0] = log_f
     sys.stdout = _Tee(sys.__stdout__, log_f)
     sys.stderr = _Tee(sys.__stderr__, log_f)
+    _register_stack_dump()
+    _write_heartbeat()
     print(datetime.now(), f"state dir: {STATE_DIR}")
     print(datetime.now(), f"logging to {LOG}")
+    print(datetime.now(), f"stack dumps to {STACK_DUMP_LOG}")
     print(datetime.now(), "loading plugins...")
     plugins_by_name = plugins.load_all()
+    _write_heartbeat()
     print(datetime.now(), "plugins:", sorted(plugins_by_name.keys()))
 
     registry = DeviceRegistry(plugins_by_name)
     registry.refresh()
+    _write_heartbeat()
     print(datetime.now(), "startup verify sweep:")
     registry.verify_sweep()
+    _write_heartbeat()
     _print_device_table(registry.verify_results, registry)
     _publish_status(registry, plugins_by_name)
 

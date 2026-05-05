@@ -143,6 +143,7 @@ class Stream:
         # Running byte total to avoid an O(n) sum on every append.
         self._size = 0
         self._dropped = 0
+        self._truncate_gen = 0
 
     def append(self, data):
         if not data:
@@ -157,6 +158,7 @@ class Stream:
                 _, dropped = self.records.pop(0)
                 self._size -= len(dropped)
                 self._dropped += len(dropped)
+                self._truncate_gen += 1
             # Truncation marker is rendered on every snapshot rather
             # than stored in records[]: a previous version inserted a
             # marker record at index 0 on the first cap-hit, but the
@@ -204,6 +206,42 @@ class Stream:
                     out.append(data)
                     remaining -= len(data)
         return b"".join(reversed(out))
+
+    def contains_bytes(self, needle, cursor=None):
+        """Incrementally search for ``needle`` without joining the stream.
+
+        ``cursor`` is an optional mutable dict kept by a polling caller.
+        On each call we scan only records appended since the previous
+        call plus a short overlap tail for matches that span record
+        boundaries. This keeps UART expect loops O(new bytes) per tick
+        instead of O(total stream bytes) per tick.
+        """
+        if not needle:
+            return True
+        overlap_n = max(0, len(needle) - 1)
+        if cursor is None:
+            cursor = {}
+        with self.lock:
+            start = int(cursor.get("index", 0) or 0)
+            if cursor.get("truncate_gen") != self._truncate_gen:
+                start = 0
+                cursor["tail"] = b""
+            elif start > len(self.records):
+                start = 0
+                cursor["tail"] = b""
+            tail = bytes(cursor.get("tail", b""))
+            found = False
+            for _, data in self.records[start:]:
+                window = tail + data
+                if needle in window:
+                    found = True
+                tail = window[-overlap_n:] if overlap_n else b""
+                if found:
+                    break
+            cursor["index"] = len(self.records)
+            cursor["tail"] = tail
+            cursor["truncate_gen"] = self._truncate_gen
+            return found
 
     def snapshot_timestamped(self):
         with self.lock:

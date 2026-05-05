@@ -832,6 +832,47 @@ def test_pending_upload_drain_kick_is_nonblocking():
     assert calls == [1.0], calls
 
 
+def test_supervisor_heartbeat_stale_uses_monotonic_age():
+    import poller
+    stale, age = poller._heartbeat_stale(1000.0, now=1119.0)
+    assert not stale, (stale, age)
+    stale, age = poller._heartbeat_stale(1000.0, now=1121.0)
+    assert stale, (stale, age)
+
+
+def test_watchdog_log_records_before_and_after_process_snapshots():
+    import watchdog
+
+    class Result:
+        returncode = 0
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old_hb = watchdog.HEARTBEAT
+        old_log = watchdog.WATCHDOG_LOG
+        watchdog.HEARTBEAT = os.path.join(tmp, "heartbeat.log")
+        watchdog.WATCHDOG_LOG = os.path.join(tmp, "watchdog.log")
+        try:
+            with open(watchdog.HEARTBEAT, "w", encoding="utf-8") as f:
+                f.write("2026-05-05T15:49:30\n")
+            watchdog._append_watchdog_log(
+                age=340.0,
+                detail="age=340s",
+                pkill_result=Result(),
+                processes_before="old-poller pid=1",
+                processes_after="new-poller pid=2",
+                processes_settled="<none>",
+                settle_elapsed_s=0.2)
+            with open(watchdog.WATCHDOG_LOG, encoding="utf-8") as f:
+                body = f.read()
+            assert "processes_before_kill:\nold-poller pid=1" in body
+            assert ("processes_after_kill_immediate:\n"
+                    "new-poller pid=2") in body
+            assert "processes_after_kill_settled (0.2s):\n<none>" in body
+        finally:
+            watchdog.HEARTBEAT = old_hb
+            watchdog.WATCHDOG_LOG = old_log
+
+
 def test_lease_lifecycle():
     """Full lease flow: claim -> resume from another session ->
     blocks_acquire rejects an unrelated session -> release.
@@ -986,6 +1027,40 @@ def test_stream_truncation_marker_survives_multiple_cap_hits():
     # Same for the timestamped snapshot (used by render_timeline).
     recs = s.snapshot_timestamped()
     assert any(b"STREAM TRUNCATED" in r[1] for r in recs), recs
+
+
+def test_stream_contains_bytes_incremental_and_cross_record():
+    from session import Stream
+    s = Stream("x", t0=time.monotonic())
+    cursor = {}
+    s.append(b"abc")
+    assert not s.contains_bytes(b"cdef", cursor)
+    # Match spans the previous call's retained tail and this append.
+    s.append(b"def")
+    assert s.contains_bytes(b"cdef", cursor)
+    # A later search with a new cursor still sees historical data.
+    assert s.contains_bytes(b"abcdef", {})
+
+
+def test_stream_contains_bytes_resets_after_truncation():
+    import session as _session
+    from session import Stream
+
+    old_max = _session.STREAM_MAX_BYTES
+    _session.STREAM_MAX_BYTES = 8
+    try:
+        s = Stream("x", t0=time.monotonic())
+        cursor = {}
+        s.append(b"aaaa")
+        assert not s.contains_bytes(b"zz", cursor)
+        # This append evicts the first record. The cursor's numeric
+        # index would otherwise point past the retained records and
+        # skip the new data.
+        s.append(b"bbbbbbbb")
+        s.append(b"zz")
+        assert s.contains_bytes(b"zz", cursor)
+    finally:
+        _session.STREAM_MAX_BYTES = old_max
 
 
 def test_lease_claim_rejects_lease_pseudo_device():
@@ -1324,10 +1399,14 @@ def main():
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
         test_pending_upload_drain_kick_is_nonblocking,
+        test_supervisor_heartbeat_stale_uses_monotonic_age,
+        test_watchdog_log_records_before_and_after_process_snapshots,
         test_lease_lifecycle,
         test_lease_release_honors_explicit_token_without_resume,
         test_expect_lands_in_manifest,
         test_stream_truncation_marker_survives_multiple_cap_hits,
+        test_stream_contains_bytes_incremental_and_cross_record,
+        test_stream_contains_bytes_resets_after_truncation,
         test_lease_claim_rejects_lease_pseudo_device,
         test_failure_artefact_carries_identity_fields,
         test_prune_skips_inflight_digests,
