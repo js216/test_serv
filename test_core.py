@@ -832,6 +832,38 @@ def test_pending_upload_drain_kick_is_nonblocking():
     assert calls == [1.0], calls
 
 
+def test_refused_spool_409_is_backed_off():
+    import poller
+    import urllib.error
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old_pending = poller.PENDING
+        old_post = poller._post
+        old_retry = dict(poller._refused_retry_after)
+        poller.PENDING = os.path.join(tmp, "pending")
+        poller._refused_retry_after.clear()
+        calls = []
+
+        def _refuse(url, body, timeout=None):
+            calls.append(url)
+            raise urllib.error.HTTPError(
+                url, 409, "Conflict", {}, io.BytesIO(b""))
+
+        poller._post = _refuse
+        try:
+            digest = "a" * 64
+            poller._spool_artefact(digest, b"body")
+            poller._drain_pending_uploads(timeout_s=1.0)
+            poller._drain_pending_uploads(timeout_s=1.0)
+            assert len(calls) == 1, calls
+            assert poller._refused_retry_after, "409 did not set backoff"
+        finally:
+            poller.PENDING = old_pending
+            poller._post = old_post
+            poller._refused_retry_after.clear()
+            poller._refused_retry_after.update(old_retry)
+
+
 def test_dsp_boot_requires_timeout_and_kills_hung_helper():
     import subprocess
     from plugins import dsp
@@ -1612,6 +1644,7 @@ def main():
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
         test_pending_upload_drain_kick_is_nonblocking,
+        test_refused_spool_409_is_backed_off,
         test_dsp_boot_requires_timeout_and_kills_hung_helper,
         test_dsp_boot_cancel_race_reports_cancel,
         test_dsp_boot_already_canceled_does_not_spawn_helper,

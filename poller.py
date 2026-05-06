@@ -183,6 +183,12 @@ REFUSED_RETENTION_S = 365 * 24 * 3600  # 365 days
 # retrying for a while so resubmitting the same digest or restoring the
 # server state can recover without remote-shell access to the bench.
 REFUSED_GRACE_S = 6 * 3600  # 6 hours
+# 409 means "server has no matching job record" and is usually not
+# resolved by hammering. Retry occasionally during the grace window
+# so an operator can resubmit the digest, but don't spam the tunnel/log
+# on every busy poll-loop turn.
+REFUSED_RETRY_BACKOFF_S = 5 * 60  # 5 minutes
+_refused_retry_after = {}  # spool_path -> monotonic retry time
 
 
 def _gc_refused_spools(now=None):
@@ -1206,7 +1212,10 @@ def _post_spooled(spool_path, timeout_s=DEFAULT_UPLOAD_S):
                 print(datetime.now(),
                       f"POST {name} refused 409; keeping in "
                       f"{PENDING} for retry for up to "
-                      f"{REFUSED_GRACE_S:.0f}s")
+                      f"{REFUSED_GRACE_S:.0f}s "
+                      f"(next retry in {REFUSED_RETRY_BACKOFF_S:.0f}s)")
+                _refused_retry_after[spool_path] = (
+                    time.monotonic() + REFUSED_RETRY_BACKOFF_S)
                 return False
             # Grace expired. Park under refused/ so the operator can
             # re-POST it manually after re-queueing.
@@ -1313,6 +1322,8 @@ def _drain_pending_uploads(timeout_s=None):
         if not n.endswith(".tar"):
             continue
         path = os.path.join(PENDING, n)
+        if time.monotonic() < _refused_retry_after.get(path, 0.0):
+            continue
         per_spool = (timeout_s
                      if timeout_s is not None
                      else _drain_per_spool_timeout(path))
