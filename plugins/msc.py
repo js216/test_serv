@@ -8,6 +8,7 @@ import time
 
 import config
 from plugin import DevicePlugin, Op
+from ._prbs import XorShift32Bytes
 
 
 CHUNK_BYTES = 1 << 20
@@ -126,6 +127,146 @@ def _op_write(session, h, args):
                     min_rate_Bps)
 
 
+def _write_generated(session, h, *, n, offset_lba, min_rate_Bps,
+                     op_name, make_chunk):
+    offset = offset_lba * h.block_size
+    _refuse_if_mounted(h.device)
+    total = int(n)
+    if total < 0:
+        raise ValueError(f"{op_name}: n must be >= 0")
+    t0 = time.monotonic()
+    fd = os.open(h.device, os.O_WRONLY)
+    try:
+        os.lseek(fd, offset, os.SEEK_SET)
+        written = 0
+        while written < total:
+            session.bail_if_canceled(
+                f"{op_name} @ {written}/{total}B")
+            want = min(CHUNK_BYTES, total - written)
+            chunk = make_chunk(written, want)
+            session.bail_if_canceled(
+                f"{op_name} before write @ {written}/{total}B")
+            pos = 0
+            while pos < len(chunk):
+                session.bail_if_canceled(
+                    f"{op_name} partial write @ {written}/{total}B")
+                nwr = os.write(fd, chunk[pos:])
+                if nwr <= 0:
+                    raise IOError(f"{op_name} stalled at {written}/{total}")
+                pos += nwr
+                written += nwr
+        if not session.canceled:
+            os.fsync(fd)
+    finally:
+        os.close(fd)
+    session.log_event(
+        "MSC", op_name,
+        f"wrote {total}B to {h.device} @ LBA {offset_lba}")
+    _check_min_rate(op_name, total, time.monotonic() - t0, min_rate_Bps)
+
+
+def _op_write_zeroes(session, h, args):
+    n = args["n"]
+    offset_lba = args.get("offset_lba") or 0
+    min_rate_Bps = args.get("min_rate_Bps")
+    zero = b"\0" * CHUNK_BYTES
+    _write_generated(
+        session, h, n=n, offset_lba=offset_lba,
+        min_rate_Bps=min_rate_Bps, op_name="msc:write_zeroes",
+        make_chunk=lambda _off, want: zero[:want])
+
+
+def _op_write_prbs(session, h, args):
+    n = args["n"]
+    offset_lba = args.get("offset_lba") or 0
+    min_rate_Bps = args.get("min_rate_Bps")
+    _write_generated(
+        session, h, n=n, offset_lba=offset_lba,
+        min_rate_Bps=min_rate_Bps, op_name="msc:write_prbs",
+        make_chunk=_prbs_chunker(args["seed"]))
+
+
+def _prbs_chunker(seed):
+    prbs = XorShift32Bytes(int(seed))
+    return lambda _off, want: prbs.read(want)
+
+
+def _verify_generated(session, h, *, n, offset_lba, min_rate_Bps,
+                      op_name, make_chunk):
+    offset = offset_lba * h.block_size
+    total = int(n)
+    if total < 0:
+        raise ValueError(f"{op_name}: n must be >= 0")
+    t0 = time.monotonic()
+    mism = 0
+    first = -1
+    first_window = b""
+    fd = os.open(h.device, os.O_RDONLY)
+    try:
+        os.lseek(fd, offset, os.SEEK_SET)
+        read = 0
+        while read < total:
+            session.bail_if_canceled(f"{op_name} @ {read}/{total}B")
+            want = min(CHUNK_BYTES, total - read)
+            expected = make_chunk(read, want)
+            got = bytearray()
+            while len(got) < want:
+                session.bail_if_canceled(
+                    f"{op_name} read @ {read + len(got)}/{total}B")
+                chunk = os.read(fd, want - len(got))
+                if not chunk:
+                    raise IOError(f"short read at {read + len(got)}/{total}")
+                got += chunk
+            got = bytes(got)
+            for i, (a, b) in enumerate(zip(expected, got)):
+                if a == b:
+                    continue
+                mism += 1
+                if first < 0:
+                    first = read + i
+                    first_window = got[max(0, i - 64):i + 192]
+            read += want
+    finally:
+        os.close(fd)
+    claim = f"{total}B generated pattern match at LBA {offset_lba}"
+    if mism == 0:
+        session.log_event("MSC", op_name, f"OK {total}B @ LBA {offset_lba}")
+        session.record_check(
+            op_name.replace("msc:", "msc_"), h.device, claim, "hit",
+            {"bytes": total, "offset_lba": offset_lba})
+        _check_min_rate(op_name, total, time.monotonic() - t0, min_rate_Bps)
+        return
+    session.stream("msc.verify_mismatch").append(
+        b"--MISMATCH--" + first_window)
+    session.record_check(
+        op_name.replace("msc:", "msc_"), h.device, claim, "miss",
+        {"bytes": total, "offset_lba": offset_lba,
+         "mismatched": mism, "first_diff": first})
+    raise ValueError(
+        f"{op_name} mismatch: {mism}B differ, first at {first}")
+
+
+def _op_verify_zeroes(session, h, args):
+    n = args["n"]
+    offset_lba = args.get("offset_lba") or 0
+    min_rate_Bps = args.get("min_rate_Bps")
+    zero = b"\0" * CHUNK_BYTES
+    _verify_generated(
+        session, h, n=n, offset_lba=offset_lba,
+        min_rate_Bps=min_rate_Bps, op_name="msc:verify_zeroes",
+        make_chunk=lambda _off, want: zero[:want])
+
+
+def _op_verify_prbs(session, h, args):
+    n = args["n"]
+    offset_lba = args.get("offset_lba") or 0
+    min_rate_Bps = args.get("min_rate_Bps")
+    _verify_generated(
+        session, h, n=n, offset_lba=offset_lba,
+        min_rate_Bps=min_rate_Bps, op_name="msc:verify_prbs",
+        make_chunk=_prbs_chunker(args["seed"]))
+
+
 def _op_read(session, h, args):
     n = args["n"]
     offset_lba = args.get("offset_lba") or 0
@@ -224,6 +365,46 @@ class MscPlugin(DevicePlugin):
                  "effective read rate falls below the requested byte/s "
                  "floor."),
             run=_op_read),
+        "write_zeroes": Op(
+            args={"n": "int"},
+            optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
+            doc=("Write n zero bytes to the resolved block device. "
+                 "offset_lba defaults to 0; units are block_size "
+                 "(512 B for STM32MP1 baremetal MSC). Refuses if any "
+                 "partition under the device is mounted. min_rate_Bps "
+                 "fails the op if effective write rate falls below the "
+                 "requested byte/s floor."),
+            run=_op_write_zeroes),
+        "write_prbs": Op(
+            args={"seed": "int", "n": "int"},
+            optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
+            doc=("Write n bytes of deterministic xorshift32 PRBS to the "
+                 "resolved block device. Reproduce/verify the same "
+                 "pattern with verify_prbs using identical seed, n, and "
+                 "offset_lba. offset_lba defaults to 0; min_rate_Bps "
+                 "fails the op if effective write rate falls below the "
+                 "requested byte/s floor."),
+            run=_op_write_prbs),
+        "verify_zeroes": Op(
+            args={"n": "int"},
+            optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
+            doc=("Read n bytes from the resolved block device and verify "
+                 "they are all zero. offset_lba defaults to 0; "
+                 "min_rate_Bps fails the op if effective read rate falls "
+                 "below the requested byte/s floor. Records a "
+                 "machine-checkable msc_verify_zeroes check."),
+            run=_op_verify_zeroes),
+        "verify_prbs": Op(
+            args={"seed": "int", "n": "int"},
+            optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
+            doc=("Read n bytes from the resolved block device and verify "
+                 "they match the deterministic xorshift32 PRBS produced "
+                 "by write_prbs with identical seed, n, and offset_lba. "
+                 "offset_lba defaults to 0; min_rate_Bps fails the op if "
+                 "effective read rate falls below the requested byte/s "
+                 "floor. Records a machine-checkable "
+                 "msc_verify_prbs check."),
+            run=_op_verify_prbs),
         "verify": Op(
             args={"data": "blob"},
             optional_args={"offset_lba": "int"},

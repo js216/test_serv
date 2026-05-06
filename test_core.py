@@ -952,6 +952,99 @@ def test_dsp_boot_already_canceled_does_not_spawn_helper():
         dsp.subprocess.Popen = saved_popen
 
 
+def test_msc_generated_writes_are_reproducible():
+    from plugins import msc
+    from plugins._prbs import prbs_xorshift32
+
+    class FakeSession:
+        canceled = False
+        events = []
+        checks = []
+        streams = {}
+
+        def bail_if_canceled(self, where):
+            if self.canceled:
+                raise RuntimeError(f"{where} canceled")
+
+        def log_event(self, *args):
+            self.events.append(args)
+
+        def record_check(self, *args):
+            self.checks.append(args)
+
+        def stream(self, name):
+            class S:
+                def __init__(self):
+                    self.data = b""
+
+                def append(self, data):
+                    self.data += data
+
+            return self.streams.setdefault(name, S())
+
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(b"\xff" * 4096)
+        f.flush()
+        handle = msc.MscHandle(f.name, block_size=512)
+        session = FakeSession()
+        old_chunk = msc.CHUNK_BYTES
+        saved_read = msc.os.read
+        msc.CHUNK_BYTES = 7
+        try:
+            msc._op_write_zeroes(
+                session, handle, {"n": 16, "offset_lba": 1})
+            msc._op_write_prbs(
+                session, handle,
+                {"seed": 0x12345678, "n": 32, "offset_lba": 2})
+            # Simulate a block device / file returning short reads;
+            # generated verify must accumulate, not fail immediately.
+            msc.os.read = lambda fd, n: saved_read(fd, min(n, 3))
+            msc._op_verify_zeroes(
+                session, handle, {"n": 16, "offset_lba": 1})
+            msc._op_verify_prbs(
+                session, handle,
+                {"seed": 0x12345678, "n": 32, "offset_lba": 2})
+        finally:
+            msc.os.read = saved_read
+            msc.CHUNK_BYTES = old_chunk
+        with open(f.name, "rb") as r:
+            r.seek(512)
+            assert r.read(16) == b"\0" * 16
+            assert r.read(16) == b"\xff" * 16
+            r.seek(1024)
+            got = r.read(32)
+        assert got == prbs_xorshift32(0x12345678, 32), got
+        statuses = [c[3] for c in session.checks]
+        assert statuses == ["hit", "hit"], session.checks
+
+        with open(f.name, "r+b") as w:
+            w.seek(1024 + 5)
+            b = w.read(1)
+            w.seek(1024 + 5)
+            w.write(bytes([b[0] ^ 0xff]))
+        try:
+            msc._op_verify_prbs(
+                session, handle,
+                {"seed": 0x12345678, "n": 32, "offset_lba": 2,
+                 "min_rate_Bps": 10**18})
+            raise AssertionError("corrupt PRBS should fail verify")
+        except ValueError as e:
+            assert "msc:verify_prbs mismatch" in str(e), e
+        assert session.checks[-1][3] == "miss", session.checks[-1]
+        assert b"MISMATCH" in session.streams["msc.verify_mismatch"].data
+
+
+def test_msc_write_prbs_inventory_documents_reproduction():
+    from plugins import msc
+
+    for name in ("write_prbs", "verify_prbs"):
+        op = msc.MscPlugin.ops[name]
+        assert op.args == {"seed": "int", "n": "int"}
+        assert "xorshift32" in op.doc
+        assert "identical seed, n, and offset_lba" in op.doc
+    assert "verify_zeroes" in msc.MscPlugin.ops
+
+
 def test_supervisor_heartbeat_stale_uses_monotonic_age():
     import poller
     stale, age = poller._heartbeat_stale(1000.0, now=1119.0)
@@ -1522,6 +1615,8 @@ def main():
         test_dsp_boot_requires_timeout_and_kills_hung_helper,
         test_dsp_boot_cancel_race_reports_cancel,
         test_dsp_boot_already_canceled_does_not_spawn_helper,
+        test_msc_generated_writes_are_reproducible,
+        test_msc_write_prbs_inventory_documents_reproduction,
         test_supervisor_heartbeat_stale_uses_monotonic_age,
         test_watchdog_log_records_before_and_after_process_snapshots,
         test_lease_lifecycle,
