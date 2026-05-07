@@ -1413,6 +1413,7 @@ def _supervise():
     import subprocess
     import select
 
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
     # Hold the singleton lock in the supervisor, not in each transient
     # worker. This matters when poller.py itself is wrapped by an outer
     # shell loop such as `while true; do timeout 3600 python3 poller.py;

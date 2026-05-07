@@ -91,12 +91,15 @@ def _check_min_rate(op_name, total, elapsed_s, min_rate_Bps):
             f"{op_name} too slow: {rate:.0f} B/s < {min_rate_Bps} B/s")
 
 
-def _read_with_timeout(fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK):
+def _read_with_timeout(fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK,
+                       session=None):
     _check_chunk_size("usbtmc:read", chunk_size)
     deadline = time.monotonic() + timeout_ms / 1000.0
     chunks = []
     total = 0
     while total < length:
+        if session is not None:
+            session.bail_if_canceled(f"usbtmc:read {total}/{length}B")
         remain = max(0.0, deadline - time.monotonic())
         if remain <= 0:
             break
@@ -235,7 +238,7 @@ def _query_bytes(session, h, cmd, length, timeout_ms):
     if written != len(data):
         raise TimeoutError(
             f"usbtmc query write timed out after {written}/{len(data)}B")
-    return _read_with_timeout(h.fd, length, timeout_ms)
+    return _read_with_timeout(h.fd, length, timeout_ms, session=session)
 
 
 def _op_query(session, h, args):

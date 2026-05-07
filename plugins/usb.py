@@ -186,6 +186,9 @@ def _op_control(session, h, args):
         session.log_event("USB", "usb:control",
                           f"IN {len(out)}B: {_hex_bytes(out[:64])}")
     else:
+        if got != len(data):
+            raise IOError(
+                f"usb:control short OUT transfer: {got}/{len(data)}B")
         session.log_event("USB", "usb:control", f"OUT {len(data)}B")
 
 
@@ -195,11 +198,19 @@ def _op_bulk_write(session, h, args):
     if len(data) > MAX_XFER:
         raise ValueError(f"usb:bulk_write too large: {len(data)}B")
     h.claim(args.get("interface"), bool(args.get("detach") or False))
-    session.bail_if_canceled("usb:bulk_write")
-    n = dev.write(args["endpoint"], data, timeout=args.get("timeout_ms")
-                  or 1000)
+    timeout_ms = args.get("timeout_ms") or 1000
+    written = 0
+    while written < len(data):
+        session.bail_if_canceled(
+            f"usb:bulk_write {written}/{len(data)}B")
+        n = dev.write(args["endpoint"], data[written:],
+                      timeout=timeout_ms)
+        if n <= 0:
+            raise IOError(
+                f"usb:bulk_write stalled at {written}/{len(data)}B")
+        written += n
     session.log_event("USB", "usb:bulk_write",
-                      f"ep=0x{args['endpoint']:02x} {n}B")
+                      f"ep=0x{args['endpoint']:02x} {written}B")
 
 
 def _op_bulk_read(session, h, args):

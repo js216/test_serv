@@ -1010,10 +1010,15 @@ def test_supervisor_acquires_poller_lock_before_spawning_worker():
     import inspect
     import poller
     src = inspect.getsource(poller._supervise)
+    makedirs_pos = src.find("os.makedirs(STATE_DIR")
     acquire_pos = src.find("_acquire_poller_lock()")
     popen_pos = src.find("subprocess.Popen")
+    assert makedirs_pos != -1, (
+        "supervisor must create STATE_DIR before locking")
     assert acquire_pos != -1, "supervisor must own poller.lock"
     assert popen_pos != -1, "test assumes supervisor still spawns child"
+    assert makedirs_pos < acquire_pos, (
+        "supervisor must create STATE_DIR before opening poller.lock")
     assert acquire_pos < popen_pos, (
         "poller.lock must be acquired before spawning worker so an "
         "outer while/timeout wrapper cannot start duplicate supervisors")
@@ -1863,6 +1868,20 @@ def test_usbtmc_fast_path_helpers_read_write_and_rate_check():
     else:
         raise AssertionError("zero usbtmc chunk_size should fail")
 
+    class CanceledSession:
+        canceled = True
+
+        def bail_if_canceled(self, where):
+            raise RuntimeError(f"canceled at {where}")
+
+    try:
+        usbtmc._read_with_timeout(
+            0, 1, timeout_ms=1000, session=CanceledSession())
+    except RuntimeError as e:
+        assert "canceled" in str(e)
+    else:
+        raise AssertionError("usbtmc query read should observe cancel")
+
 
 def test_usbtmc_and_raw_usb_plan_shapes_parse():
     text = """
@@ -1957,6 +1976,68 @@ def test_ssh_put_op_shape_and_validation():
         raise AssertionError("slow ssh:put should fail")
 
 
+def test_usb_write_ops_reject_short_writes():
+    from plugins import usb
+
+    class FakeDev:
+        def ctrl_transfer(self, *args, **kwargs):
+            return 1
+
+        def write(self, endpoint, data, timeout=None):
+            return 1 if data else 0
+
+    class FakeHandle:
+        dev = FakeDev()
+
+        def claim(self, interface=None, detach=False):
+            pass
+
+    class FakeSession:
+        def bail_if_canceled(self, where):
+            pass
+
+        def log_event(self, *args):
+            pass
+
+    try:
+        usb._op_control(FakeSession(), FakeHandle(), {
+            "bmRequestType": 0x00,
+            "bRequest": 1,
+            "wValue": 0,
+            "wIndex": 0,
+            "data": b"abc",
+            "length": 0,
+            "timeout_ms": 1000,
+        })
+    except IOError as e:
+        assert "short OUT" in str(e)
+    else:
+        raise AssertionError("short USB control OUT should fail")
+
+    class StallingDev(FakeDev):
+        def __init__(self):
+            self.calls = 0
+
+        def write(self, endpoint, data, timeout=None):
+            self.calls += 1
+            return 1 if self.calls == 1 else 0
+
+    h = FakeHandle()
+    h.dev = StallingDev()
+    try:
+        usb._op_bulk_write(FakeSession(), h, {
+            "endpoint": 0x02,
+            "data": b"abc",
+            "interface": None,
+            "detach": False,
+            "timeout_ms": 1000,
+        })
+    except IOError as e:
+        assert "stalled" in str(e)
+    else:
+        raise AssertionError("short/stalled USB bulk write should fail")
+
+
 def test_ws_plugin_recv_schema_and_helpers():
     from plugins import ws
     assert "recv" in ws.WsPlugin.ops
@@ -1988,6 +2069,25 @@ def test_ws_plugin_recv_schema_and_helpers():
         assert "too slow" in str(e)
     else:
         raise AssertionError("slow ws:recv should fail")
+
+    class SlowWebSocketModule:
+        @staticmethod
+        def create_connection(url, timeout=None):
+            time.sleep(1.0)
+            raise RuntimeError("should have been canceled first")
+
+    class CanceledSession:
+        def bail_if_canceled(self, where):
+            raise RuntimeError(f"canceled at {where}")
+
+    try:
+        ws._connect_with_cancel(
+            SlowWebSocketModule, "ws://example.invalid", 5.0,
+            CanceledSession())
+    except RuntimeError as e:
+        assert "canceled" in str(e)
+    else:
+        raise AssertionError("ws connect should observe cancel")
 
 
 # --- runner --------------------------------------------------------------
@@ -2058,6 +2158,7 @@ def main():
         test_usbtmc_list_available_without_class_nodes,
         test_any_pseudo_device_does_not_make_bare_real_device_ambiguous,
         test_ssh_put_op_shape_and_validation,
+        test_usb_write_ops_reject_short_writes,
         test_ws_plugin_recv_schema_and_helpers,
     ]
     failed = 0

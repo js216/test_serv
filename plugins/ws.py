@@ -3,6 +3,7 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import hashlib
+import threading
 import time
 import zlib
 
@@ -74,6 +75,30 @@ def _recv_frame(ws, deadline, session):
     return bytes(msg)
 
 
+def _connect_with_cancel(websocket, url, timeout_s, session):
+    box = {}
+
+    def _connect():
+        try:
+            box["ws"] = websocket.create_connection(url, timeout=timeout_s)
+        except BaseException as e:
+            box["err"] = e
+
+    t = threading.Thread(target=_connect, daemon=True,
+                         name="ws-connect")
+    t.start()
+    deadline = time.monotonic() + timeout_s
+    while t.is_alive():
+        session.bail_if_canceled("ws:recv connect")
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            raise TimeoutError("ws:recv connect timed out")
+        t.join(timeout=min(0.2, remain))
+    if "err" in box:
+        raise box["err"]
+    return box["ws"]
+
+
 def _op_recv(session, h, args):
     n_expected = args["bytes"]
     if n_expected < 0 or n_expected > MAX_RECV:
@@ -94,7 +119,8 @@ def _op_recv(session, h, args):
     total = 0
     stream = session.stream("ws.recv") if save_stream else None
     t0 = time.monotonic()
-    ws = websocket.create_connection(url, timeout=timeout_ms / 1000.0)
+    ws = _connect_with_cancel(
+        websocket, url, timeout_ms / 1000.0, session)
     try:
         while total < n_expected:
             data = _recv_frame(ws, deadline, session)
