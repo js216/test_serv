@@ -110,7 +110,7 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
 
 
 def _is_job_device_key(key):
-    return bool(key) and not key.startswith("lease.")
+    return bool(key) and not key.startswith("lease.") and not key.endswith(".any")
 
 
 def _append_device_usage(event, key, session):

@@ -1862,6 +1862,21 @@ def test_usbtmc_and_raw_usb_plan_shapes_parse():
     assert parsed.ops[6].verb == "write_blob"
 
 
+def test_usbtmc_list_available_without_class_nodes():
+    from plugins.usbtmc import UsbTmcPlugin
+    plugins = {"usbtmc": UsbTmcPlugin()}
+    reg = DeviceRegistry(plugins)
+    reg.refresh()
+    devices = reg.list_devices()
+    assert any(d["id"] == "usbtmc.any" for d in devices), devices
+
+    parsed = plan.load_tar(plan.pack_tar("usbtmc:list\n", {}))
+    sess = Session(reg, parsed)
+    sess.run_all(plugins)
+    assert not sess.errors, sess.errors
+    assert "usbtmc.list" in sess.streams
+
+
 # --- runner --------------------------------------------------------------
 
 def main():
@@ -1926,6 +1941,7 @@ def main():
         test_usb_and_usbtmc_plugins_expose_bringup_ops,
         test_usbtmc_fast_path_helpers_read_write_and_rate_check,
         test_usbtmc_and_raw_usb_plan_shapes_parse,
+        test_usbtmc_list_available_without_class_nodes,
     ]
     failed = 0
     for t in tests:

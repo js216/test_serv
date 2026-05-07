@@ -342,7 +342,8 @@ class UsbTmcPlugin(DevicePlugin):
     }
 
     def probe(self):
-        out = []
+        out = [{"id": "any", "list_only": True,
+                "description": "USBTMC enumeration pseudo-device"}]
         configured = list(config.instances(self.name))
         if configured:
             for inst in configured:
@@ -356,9 +357,12 @@ class UsbTmcPlugin(DevicePlugin):
             return out
         # No config: expose current class-driver nodes directly so a
         # bring-up bench can try usbtmc.0:identify immediately.
-        return [_node_info(n) for n in _all_nodes()]
+        out.extend(_node_info(n) for n in _all_nodes())
+        return out
 
     def open(self, spec):
+        if spec.get("list_only"):
+            return UsbTmcHandle(spec)
         info = _match_instance(spec) if (
             spec.get("usb_vid") or spec.get("vid") or spec.get("node")
         ) else (spec if os.path.exists(spec.get("node", "")) else None)
