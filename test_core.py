@@ -1877,6 +1877,50 @@ def test_usbtmc_list_available_without_class_nodes():
     assert "usbtmc.list" in sess.streams
 
 
+def test_ssh_put_op_shape_and_validation():
+    from plugins import ssh
+    assert "put" in ssh.SshPlugin.ops
+    op = ssh.SshPlugin.ops["put"]
+    assert op.args == {"data": "blob", "path": "str"}
+    assert op.optional_args == {
+        "mode": "int",
+        "timeout_ms": "int",
+        "min_rate_Bps": "int",
+    }
+    argv = ssh._scp_argv("192.0.2.10", "root", "/k", "/kh",
+                         "/tmp/local", "/tmp/fw.bin")
+    assert argv[:2] == ["scp", "-O"], argv
+    assert "-i" in argv and "/k" in argv, argv
+
+    parsed = plan.load_tar(plan.pack_tar(
+        'ssh.target:put data=@fw.bin path="/tmp/fw.bin" '
+        'mode=0x1a4 timeout_ms=10000 min_rate_Bps=1000\n',
+        {"fw.bin": b"abc"}))
+    assert parsed.ops[0].verb == "put"
+    assert parsed.ops[0].args["mode"].as_int() == 0o644
+
+    try:
+        ssh._validate_remote_path("relative.bin")
+    except ValueError as e:
+        assert "absolute" in str(e)
+    else:
+        raise AssertionError("relative ssh:put path should fail")
+
+    try:
+        ssh._validate_remote_path("/tmp/bad\nname")
+    except ValueError as e:
+        assert "newline" in str(e)
+    else:
+        raise AssertionError("newline in ssh:put path should fail")
+
+    try:
+        ssh._check_min_rate("ssh:put", 100, 10.0, 1000)
+    except TimeoutError as e:
+        assert "too slow" in str(e)
+    else:
+        raise AssertionError("slow ssh:put should fail")
+
+
 # --- runner --------------------------------------------------------------
 
 def main():
@@ -1942,6 +1986,7 @@ def main():
         test_usbtmc_fast_path_helpers_read_write_and_rate_check,
         test_usbtmc_and_raw_usb_plan_shapes_parse,
         test_usbtmc_list_available_without_class_nodes,
+        test_ssh_put_op_shape_and_validation,
     ]
     failed = 0
     for t in tests:

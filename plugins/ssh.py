@@ -3,8 +3,10 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import os
+import shlex
 import shutil
 import subprocess
+import tempfile
 import time
 
 import config
@@ -51,20 +53,46 @@ def _ssh_argv(ip, user, key, known_hosts):
     ]
 
 
-def _op_exec(session, h, args):
-    cmd = args["command"]
-    argv = _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd]
-    session.log_event("SSH", "ssh:exec", cmd)
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
-    _track_subproc(proc, session=session)
-    deadline = time.monotonic() + SSH_TIMEOUT_S
+def _ssh_base_argv(key, known_hosts):
+    return [
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={known_hosts}",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "PubkeyAuthentication=yes",
+        "-o", "PasswordAuthentication=no",
+        "-i", key,
+    ]
+
+
+def _scp_argv(ip, user, key, known_hosts, src, dst):
+    # OpenSSH scp defaults to SFTP mode on newer hosts. Embedded images
+    # often have scp but no sftp-server, so force the legacy scp protocol.
+    return ["scp", "-O"] + _ssh_base_argv(key, known_hosts) + [
+        src, f"{user}@{ip}:{_remote_quote(dst)}"]
+
+
+def _remote_quote(path):
+    if "\x00" in path or "\n" in path or "\r" in path:
+        raise ValueError("remote path must not contain NUL/newline")
+    return shlex.quote(path)
+
+
+def _validate_remote_path(path):
+    if not path.startswith("/"):
+        raise ValueError("ssh:put path must be absolute")
+    _remote_quote(path)
+
+
+def _wait_proc(session, proc, label, timeout_s):
+    deadline = time.monotonic() + timeout_s
     stdout = stderr = b""
     try:
         while True:
             try:
                 stdout, stderr = proc.communicate(timeout=0.2)
-                break
+                return stdout, stderr
             except subprocess.TimeoutExpired:
                 if session.canceled:
                     proc.terminate()
@@ -74,17 +102,39 @@ def _op_exec(session, h, args):
                         proc.kill()
                         proc.wait(timeout=2)
                     raise RuntimeError(
-                        "ssh:exec canceled via DELETE /jobs/<digest>")
+                        f"{label} canceled via DELETE /jobs/<digest>")
                 if time.monotonic() > deadline:
                     proc.terminate()
                     try:
                         proc.wait(timeout=2)
                     except subprocess.TimeoutExpired:
                         proc.kill()
+                        proc.wait(timeout=2)
                     raise TimeoutError(
-                        f"ssh:exec timed out ({SSH_TIMEOUT_S}s)")
+                        f"{label} timed out after {timeout_s:.1f}s")
     finally:
         _untrack_subproc(proc)
+
+
+def _check_min_rate(op_name, total, elapsed_s, min_rate_Bps):
+    if not min_rate_Bps or total == 0:
+        return
+    if elapsed_s <= 0:
+        return
+    rate = total / elapsed_s
+    if rate < min_rate_Bps:
+        raise TimeoutError(
+            f"{op_name} too slow: {rate:.0f} B/s < {min_rate_Bps} B/s")
+
+
+def _op_exec(session, h, args):
+    cmd = args["command"]
+    argv = _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd]
+    session.log_event("SSH", "ssh:exec", cmd)
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    _track_subproc(proc, session=session)
+    stdout, stderr = _wait_proc(session, proc, "ssh:exec", SSH_TIMEOUT_S)
     if stdout:
         session.stream("ssh.exec").append(stdout)
     if stderr:
@@ -95,6 +145,65 @@ def _op_exec(session, h, args):
                       f"stderr={len(stderr)}B")
     if proc.returncode != 0:
         raise RuntimeError(f"ssh:exec exit={proc.returncode}")
+
+
+def _op_put(session, h, args):
+    data = bytes(args["data"])
+    path = args["path"]
+    mode = args.get("mode")
+    timeout_s = (args.get("timeout_ms") or (SSH_TIMEOUT_S * 1000)) / 1000.0
+    min_rate_Bps = args.get("min_rate_Bps")
+    _validate_remote_path(path)
+    if not shutil.which("scp"):
+        raise RuntimeError("ssh:put requires scp in PATH")
+    fd, tmp = tempfile.mkstemp(prefix="test-serv-ssh-put-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        argv = _scp_argv(h.ip, h.user, h.key, h.known_hosts, tmp, path)
+        session.log_event("SSH", "ssh:put",
+                          f"{len(data)}B -> {path}")
+        t0 = time.monotonic()
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        _track_subproc(proc, session=session)
+        stdout, stderr = _wait_proc(session, proc, "ssh:put", timeout_s)
+        elapsed = time.monotonic() - t0
+        if stdout:
+            session.stream("ssh.put").append(stdout)
+        if stderr:
+            session.stream("ssh.put.stderr").append(stderr)
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"ssh:put scp exit={proc.returncode}: "
+                f"{stderr.decode(errors='replace')}")
+        _check_min_rate("ssh:put", len(data), elapsed, min_rate_Bps)
+        rate = (len(data) / elapsed) if elapsed > 0 else 0.0
+        session.log_event(
+            "SSH", "ssh:put",
+            f"ok {len(data)}B in {elapsed:.3f}s @ {rate:.0f} B/s")
+        if mode is not None:
+            if mode < 0 or mode > 0o7777:
+                raise ValueError(f"ssh:put bad mode {mode:o}")
+            cmd = f"chmod {mode:o} -- {_remote_quote(path)}"
+            proc = subprocess.Popen(
+                _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            _track_subproc(proc, session=session)
+            _stdout, stderr = _wait_proc(
+                session, proc, "ssh:put chmod", SSH_TIMEOUT_S)
+            if stderr:
+                session.stream("ssh.put.stderr").append(stderr)
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"ssh:put chmod exit={proc.returncode}: "
+                    f"{stderr.decode(errors='replace')}")
+            session.log_event("SSH", "ssh:put", f"chmod {mode:o} {path}")
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
 
 
 def _op_pubkey(session, h, args):
@@ -248,6 +357,17 @@ class SshPlugin(DevicePlugin):
                  "target's host pubkey to already be trusted -- run "
                  "ssh:trust_host_key first per image build."),
             run=_op_exec),
+        "put": Op(
+            args={"data": "blob", "path": "str"},
+            optional_args={"mode": "int", "timeout_ms": "int",
+                           "min_rate_Bps": "int"},
+            doc=("Copy a plan blob to an absolute path on the target "
+                 "using legacy scp (-O, no SFTP subsystem required) with "
+                 "the same pinned key and known_hosts policy as ssh:exec. "
+                 "Optional mode applies chmod after upload; timeout_ms "
+                 "bounds the scp transfer; min_rate_Bps fails slow "
+                 "transfers."),
+            run=_op_put),
     }
 
     def probe(self):
