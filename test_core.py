@@ -1942,6 +1942,39 @@ def test_ssh_put_op_shape_and_validation():
         raise AssertionError("slow ssh:put should fail")
 
 
+def test_ws_plugin_recv_schema_and_helpers():
+    from plugins import ws
+    assert "recv" in ws.WsPlugin.ops
+    op = ws.WsPlugin.ops["recv"]
+    assert op.args == {"bytes": "int", "timeout_ms": "int"}
+    assert op.optional_args == {
+        "url": "str",
+        "expect_sha256": "str",
+        "expect_crc32": "int",
+        "min_rate_Bps": "int",
+        "stream": "bool",
+    }
+    parsed = plan.load_tar(plan.pack_tar(
+        'ws.any:recv url="ws://172.25.0.115:9000/stream" '
+        'bytes=1048576 timeout_ms=10000 '
+        'expect_sha256="abc" expect_crc32=0x12345678 '
+        'min_rate_Bps=25000000 stream=false\n', {}))
+    assert parsed.ops[0].device == "ws.any"
+    assert parsed.ops[0].verb == "recv"
+    assert parsed.ops[0].args["expect_crc32"].as_int() == 0x12345678
+    assert ws._fmt_crc32(0x12345678) == "0x12345678"
+    class WebSocketTimeoutException(Exception):
+        pass
+    assert ws._is_ws_timeout(WebSocketTimeoutException())
+
+    try:
+        ws._check_min_rate("ws:recv", 100, 10.0, 1000)
+    except TimeoutError as e:
+        assert "too slow" in str(e)
+    else:
+        raise AssertionError("slow ws:recv should fail")
+
+
 # --- runner --------------------------------------------------------------
 
 def main():
@@ -2009,6 +2042,7 @@ def main():
         test_usbtmc_list_available_without_class_nodes,
         test_any_pseudo_device_does_not_make_bare_real_device_ambiguous,
         test_ssh_put_op_shape_and_validation,
+        test_ws_plugin_recv_schema_and_helpers,
     ]
     failed = 0
     for t in tests:
