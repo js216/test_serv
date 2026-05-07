@@ -1380,6 +1380,7 @@ SUPERVISOR_STACK_DUMP_GRACE_S = 1.0
 # knows not to recurse into another supervisor.
 _WORKER_FLAG = "--_worker"
 _HEARTBEAT_FD_ENV = "TEST_SERV_HEARTBEAT_FD"
+_LOCK_HELD_ENV = "TEST_SERV_POLLER_LOCK_HELD"
 
 
 def _heartbeat_stale(last_heartbeat_mono, now=None):
@@ -1411,6 +1412,16 @@ def _supervise():
     """
     import subprocess
     import select
+
+    # Hold the singleton lock in the supervisor, not in each transient
+    # worker. This matters when poller.py itself is wrapped by an outer
+    # shell loop such as `while true; do timeout 3600 python3 poller.py;
+    # done`: timeout may kill/restart the supervisor while an old worker
+    # is still tearing down. If only workers lock, the replacement
+    # supervisor can start and fast-fail child after child on the old
+    # worker's lock. With supervisor-owned locking, a second supervisor
+    # refuses immediately and the outer loop naturally waits/retries.
+    _acquire_poller_lock()
 
     # Pass through any extra args (e.g. --no-supervisor's siblings if
     # we add some later, or --port / config overrides). argv[0] is
@@ -1455,6 +1466,7 @@ def _supervise():
         last_heartbeat_mono = start
         hb_r = hb_w = None
         env = os.environ.copy()
+        env[_LOCK_HELD_ENV] = "1"
         try:
             hb_r, hb_w = os.pipe()
             try:
@@ -1586,7 +1598,8 @@ def _run_poller():
     # state dir can't race on PENDING/ uploads or duplicate-pickup
     # plans (rename gate handles the latter, but the cleaner
     # behaviour is "refuse the second poller and tell the operator").
-    _acquire_poller_lock()
+    if os.environ.get(_LOCK_HELD_ENV) != "1":
+        _acquire_poller_lock()
     _rotate_log_if_large(LOG)
     log_f = open(LOG, "a", buffering=1, encoding="utf-8", errors="replace")
     _log_f[0] = log_f

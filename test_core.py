@@ -1006,6 +1006,21 @@ def test_pending_upload_drain_kick_is_nonblocking():
     assert calls == [1.0], calls
 
 
+def test_supervisor_acquires_poller_lock_before_spawning_worker():
+    import inspect
+    import poller
+    src = inspect.getsource(poller._supervise)
+    acquire_pos = src.find("_acquire_poller_lock()")
+    popen_pos = src.find("subprocess.Popen")
+    assert acquire_pos != -1, "supervisor must own poller.lock"
+    assert popen_pos != -1, "test assumes supervisor still spawns child"
+    assert acquire_pos < popen_pos, (
+        "poller.lock must be acquired before spawning worker so an "
+        "outer while/timeout wrapper cannot start duplicate supervisors")
+    assert "_LOCK_HELD_ENV" in src, (
+        "worker must inherit lock-held marker and skip reacquiring")
+
+
 def test_refused_spool_409_is_backed_off():
     import poller
     import urllib.error
@@ -2014,6 +2029,7 @@ def main():
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
         test_pending_upload_drain_kick_is_nonblocking,
+        test_supervisor_acquires_poller_lock_before_spawning_worker,
         test_refused_spool_409_is_backed_off,
         test_dsp_boot_requires_timeout_and_kills_hung_helper,
         test_dsp_boot_cancel_race_reports_cancel,
