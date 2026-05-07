@@ -1,0 +1,15 @@
+# test_serv USB access.
+#
+# Install with:
+#   sudo cp udev/99-test-serv-usb.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules
+#   sudo udevadm trigger
+#
+# /dev/usbtmcN nodes for USB Test & Measurement Class gadgets.
+KERNEL=="usbtmc[0-9]*", MODE="0660", GROUP="plugdev", TAG+="uaccess"
+
+# Raw libusb access through /dev/bus/usb/BBB/DDD for early firmware
+# bring-up before a class driver binds. This is intentionally broad:
+# the bench's config and test_serv's per-device locks decide which
+# devices agents are allowed to touch.
+SUBSYSTEM=="usb", ENV{DEVTYPE}=="usb_device", MODE="0660", GROUP="plugdev", TAG+="uaccess"

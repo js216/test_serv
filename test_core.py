@@ -1787,6 +1787,81 @@ def test_bench_id_defaults_to_hostname_and_env_overrides():
             os.environ["TEST_SERV_BENCH_ID"] = old
 
 
+def test_usb_and_usbtmc_plugins_expose_bringup_ops():
+    from plugins.usb import UsbPlugin
+    from plugins.usbtmc import UsbTmcPlugin
+
+    usb_ops = UsbPlugin.ops
+    assert {"list", "descriptor", "control", "bulk_write", "bulk_read"} <= \
+        set(usb_ops), usb_ops
+    assert usb_ops["control"].args == {
+        "bmRequestType": "int",
+        "bRequest": "int",
+        "wValue": "int",
+        "wIndex": "int",
+    }
+    assert usb_ops["bulk_read"].optional_args["detach"] == "bool"
+
+    tmc_ops = UsbTmcPlugin.ops
+    assert {"list", "identify", "write", "write_blob", "read",
+            "query", "expect", "clear"} <= set(tmc_ops), tmc_ops
+    assert tmc_ops["write_blob"].args == {"data": "blob"}
+    assert tmc_ops["write_blob"].optional_args["min_rate_Bps"] == "int"
+    assert tmc_ops["read"].optional_args["chunk_size"] == "int"
+    assert tmc_ops["read"].optional_args["exact"] == "bool"
+
+
+def test_usbtmc_fast_path_helpers_read_write_and_rate_check():
+    from plugins import usbtmc
+
+    rfd, wfd = os.pipe()
+    try:
+        os.write(wfd, b"abcdef")
+        got = usbtmc._read_with_timeout(
+            rfd, 6, timeout_ms=1000, chunk_size=3)
+        assert got == b"abcdef", got
+    finally:
+        os.close(rfd)
+        os.close(wfd)
+
+    rfd, wfd = os.pipe()
+    try:
+        written, elapsed = usbtmc._write_all(
+            wfd, b"xyz", timeout_ms=1000, chunk_size=2)
+        assert written == 3, (written, elapsed)
+        assert os.read(rfd, 3) == b"xyz"
+    finally:
+        os.close(rfd)
+        os.close(wfd)
+
+    try:
+        usbtmc._check_min_rate("xfer", 100, 10.0, 1000)
+    except TimeoutError as e:
+        assert "too slow" in str(e)
+    else:
+        raise AssertionError("expected slow transfer to fail")
+
+
+def test_usbtmc_and_raw_usb_plan_shapes_parse():
+    text = """
+    usb.any:list vid=0xfe pid=0x03
+    usb.gadget:control bmRequestType=0x80 bRequest=6 wValue=0x0100 wIndex=0 length=18 timeout_ms=1000
+    usb.gadget:bulk_write endpoint=0x02 data=@out.bin interface=0 timeout_ms=1000
+    usb.gadget:bulk_read endpoint=0x81 length=1024 interface=0 timeout_ms=1000
+    usbtmc.0:identify timeout_ms=5000
+    usbtmc.0:write data="*CLS\\n" timeout_ms=1000
+    usbtmc.0:write_blob data=@out.bin timeout_ms=10000 chunk_size=1048576 min_rate_Bps=25000000
+    usbtmc.0:read length=1048576 timeout_ms=10000 chunk_size=1048576 min_rate_Bps=25000000 exact=true
+    usbtmc.0:query data="*IDN?\\n" timeout_ms=5000
+    usbtmc.0:expect data="PING?\\n" sentinel="PONG" timeout_ms=5000
+    usbtmc.0:clear timeout_ms=100
+    """
+    parsed = plan.load_tar(plan.pack_tar(text, {"out.bin": b"abc"}))
+    assert len(parsed.ops) == 11
+    assert parsed.ops[0].args["vid"].as_int() == 0xfe
+    assert parsed.ops[6].verb == "write_blob"
+
+
 # --- runner --------------------------------------------------------------
 
 def main():
@@ -1848,6 +1923,9 @@ def main():
         test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,
         test_bench_id_defaults_to_hostname_and_env_overrides,
+        test_usb_and_usbtmc_plugins_expose_bringup_ops,
+        test_usbtmc_fast_path_helpers_read_write_and_rate_check,
+        test_usbtmc_and_raw_usb_plan_shapes_parse,
     ]
     failed = 0
     for t in tests:
