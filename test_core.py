@@ -14,7 +14,9 @@ import threading
 import time
 
 import plan
+import report
 import server
+import session as session_module
 from plugin import DevicePlugin, Op
 from registry import DeviceRegistry
 from session import Session, bench_id, pack_artefact
@@ -190,6 +192,125 @@ def test_session_closes_touched_handles_at_job_end():
     assert key not in reg.cache
 
     reg.close_all()
+
+
+def test_session_logs_device_use_and_release_for_jobs_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        old_log = session_module.DEVICES_LOG
+        session_module.DEVICES_LOG = os.path.join(tmp, "devices.log")
+        try:
+            parsed = plan.load_tar(plan.pack_tar('fake:noop k=1\n', {}))
+            plugins = {"fake": FakePlugin()}
+            reg = DeviceRegistry(plugins)
+            reg.refresh()
+
+            sess = Session(reg, parsed)
+            sess.run_all(plugins)
+
+            with open(session_module.DEVICES_LOG, encoding="utf-8") as f:
+                recs = [json.loads(line) for line in f if line.strip()]
+            assert [r["event"] for r in recs] == ["use", "release"], recs
+            assert [r["device"] for r in recs] == ["fake.0", "fake.0"], recs
+            assert recs[1]["t"] >= recs[0]["t"], recs
+            assert recs[0]["session"] == sess.session_id, recs[0]
+
+            reg.close_all()
+        finally:
+            session_module.DEVICES_LOG = old_log
+
+
+def test_lease_only_plan_does_not_count_as_device_usage():
+    from plugins.lease import LeasePlugin
+    with tempfile.TemporaryDirectory() as tmp:
+        old_log = session_module.DEVICES_LOG
+        session_module.DEVICES_LOG = os.path.join(tmp, "devices.log")
+        try:
+            parsed = plan.load_tar(plan.pack_tar(
+                'lease:claim devices="fake.0" duration_s=60\n', {}))
+            plugins = {"fake": FakePlugin(), "lease": LeasePlugin()}
+            reg = DeviceRegistry(plugins)
+            reg.refresh()
+
+            sess = Session(reg, parsed)
+            sess.run_all(plugins)
+
+            assert not os.path.exists(session_module.DEVICES_LOG)
+            reg.close_all()
+        finally:
+            session_module.DEVICES_LOG = old_log
+
+
+def test_report_computes_duty_from_device_log_events():
+    events = [
+        {"t": 10.0, "event": "use", "device": "fake.0",
+         "session": "s1"},
+        {"t": 15.0, "event": "release", "device": "fake.0",
+         "session": "s1"},
+        {"t": 20.0, "event": "use", "device": "fake.0",
+         "session": "s2"},
+        {"t": 30.0, "event": "release", "device": "fake.0",
+         "session": "s2"},
+        {"t": 25.0, "event": "use", "device": "dsp.main",
+         "session": "s3"},
+        {"t": 35.0, "event": "release", "device": "dsp.main",
+         "session": "s3"},
+    ]
+    summary = report.compute_duty(events)
+    assert summary["window_s"] == 25.0, summary
+    assert summary["stats"]["fake.0"]["busy_s"] == 15.0, summary
+    assert summary["stats"]["fake.0"]["intervals"] == 2, summary
+    assert summary["stats"]["dsp.main"]["busy_s"] == 10.0, summary
+
+
+def test_report_pairs_by_session_for_back_to_back_device_jobs():
+    events = [
+        {"t": 10.0, "event": "use", "device": "fake.0",
+         "session": "old"},
+        {"t": 20.0, "event": "release", "device": "fake.0",
+         "session": "old"},
+        {"t": 20.0, "event": "use", "device": "fake.0",
+         "session": "new"},
+        {"t": 30.0, "event": "release", "device": "fake.0",
+         "session": "new"},
+    ]
+    summary = report.compute_duty(events)
+    assert summary["stats"]["fake.0"]["busy_s"] == 20.0, summary
+    assert summary["stats"]["fake.0"]["intervals"] == 2, summary
+
+
+def test_report_closes_stale_session_at_next_device_use():
+    events = [
+        {"t": 10.0, "event": "use", "device": "fake.0",
+         "session": "crashed"},
+        {"t": 20.0, "event": "use", "device": "fake.0",
+         "session": "next"},
+        {"t": 30.0, "event": "release", "device": "fake.0",
+         "session": "next"},
+    ]
+    summary = report.compute_duty(events)
+    st = summary["stats"]["fake.0"]
+    assert st["busy_s"] == 20.0, summary
+    assert st["intervals"] == 2, summary
+    assert st["stale_sessions"] == ["crashed"], summary
+
+
+def test_report_keeps_log_order_for_equal_timestamps():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "devices.log")
+        recs = [
+            {"t": 20.0, "event": "use", "device": "fake.0",
+             "session": "same"},
+            {"t": 20.0, "event": "release", "device": "fake.0",
+             "session": "same"},
+        ]
+        with open(path, "w", encoding="utf-8") as f:
+            for rec in recs:
+                f.write(json.dumps(rec) + "\n")
+        loaded = report.load_events(path)
+        assert [r["event"] for r in loaded] == ["use", "release"], loaded
+        summary = report.compute_duty(loaded, now=1000.0)
+        assert summary["stats"]["fake.0"]["busy_s"] == 0.0, summary
+        assert not summary["stats"]["fake.0"]["active"], summary
 
 
 def test_inventory_returns_devices_and_ops_streams():
@@ -1556,7 +1677,7 @@ def test_multi_instance_plan_holds_all_dev_locks_for_session():
     # The per-device RLocks must be the same identity that's now
     # tracked in _deferred_locks (so the session's finally-release
     # actually drops them on exit). Both instances should appear.
-    deferred = getattr(session, "_deferred_locks", [])
+    deferred = [lk for _, lk in getattr(session, "_deferred_locks", [])]
     expected = {reg.per_dev_lock["twoinst.A"], reg.per_dev_lock["twoinst.B"]}
     assert set(deferred) == expected, (deferred, expected)
     reg.close_all()
@@ -1624,6 +1745,12 @@ def main():
         test_pack_and_load_roundtrip,
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
+        test_session_logs_device_use_and_release_for_jobs_only,
+        test_lease_only_plan_does_not_count_as_device_usage,
+        test_report_computes_duty_from_device_log_events,
+        test_report_pairs_by_session_for_back_to_back_device_jobs,
+        test_report_closes_stale_session_at_next_device_use,
+        test_report_keeps_log_order_for_equal_timestamps,
         test_inventory_returns_devices_and_ops_streams,
         test_server_rest_queue_helpers,
         test_request_path_strips_query_for_static_assets,
