@@ -266,6 +266,14 @@ class DeviceRegistry:
                 f"no device matches {plugin_name}"
                 + (f".{spec_id}" if spec_id else ""))
         if len(candidates) > 1 and spec_id is None:
+            real_candidates = [
+                k for k in candidates
+                if k.rsplit(".", 1)[-1] != "any"]
+            if len(real_candidates) == 1:
+                return real_candidates[0]
+            if real_candidates:
+                candidates = real_candidates
+        if len(candidates) > 1 and spec_id is None:
             ids = ", ".join(sorted(c.split(".", 1)[1] for c in candidates))
             raise LookupError(
                 f"ambiguous: {plugin_name} has {len(candidates)} "

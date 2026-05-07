@@ -75,6 +75,11 @@ def _check_bounds(op_name, length, limit):
         raise ValueError(f"{op_name} length out of range: {length}")
 
 
+def _check_chunk_size(op_name, chunk_size):
+    if chunk_size <= 0 or chunk_size > MAX_QUERY_READ:
+        raise ValueError(f"{op_name} bad chunk_size: {chunk_size}")
+
+
 def _check_min_rate(op_name, total, elapsed_s, min_rate_Bps):
     if not min_rate_Bps or total == 0:
         return
@@ -87,6 +92,7 @@ def _check_min_rate(op_name, total, elapsed_s, min_rate_Bps):
 
 
 def _read_with_timeout(fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK):
+    _check_chunk_size("usbtmc:read", chunk_size)
     deadline = time.monotonic() + timeout_ms / 1000.0
     chunks = []
     total = 0
@@ -97,7 +103,10 @@ def _read_with_timeout(fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK):
         r, _w, _x = select.select([fd], [], [], min(0.2, remain))
         if not r:
             continue
-        data = os.read(fd, min(length - total, chunk_size))
+        try:
+            data = os.read(fd, min(length - total, chunk_size))
+        except (BlockingIOError, InterruptedError):
+            continue
         if not data:
             break
         chunks.append(data)
@@ -109,6 +118,7 @@ def _read_with_timeout(fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK):
 
 def _read_to_stream(session, fd, stream_name, length, timeout_ms,
                     chunk_size=DEFAULT_CHUNK):
+    _check_chunk_size("usbtmc:read", chunk_size)
     deadline = time.monotonic() + timeout_ms / 1000.0
     total = 0
     t0 = time.monotonic()
@@ -121,7 +131,10 @@ def _read_to_stream(session, fd, stream_name, length, timeout_ms,
         r, _w, _x = select.select([fd], [], [], min(0.2, remain))
         if not r:
             continue
-        data = os.read(fd, min(length - total, chunk_size))
+        try:
+            data = os.read(fd, min(length - total, chunk_size))
+        except (BlockingIOError, InterruptedError):
+            continue
         if not data:
             break
         stream.append(data)
@@ -130,6 +143,7 @@ def _read_to_stream(session, fd, stream_name, length, timeout_ms,
 
 
 def _write_all(fd, data, timeout_ms, session=None, chunk_size=DEFAULT_CHUNK):
+    _check_chunk_size("usbtmc:write", chunk_size)
     deadline = time.monotonic() + timeout_ms / 1000.0
     total = 0
     view = memoryview(data)
@@ -144,7 +158,10 @@ def _write_all(fd, data, timeout_ms, session=None, chunk_size=DEFAULT_CHUNK):
         _r, w, _x = select.select([], [fd], [], min(0.2, remain))
         if not w:
             continue
-        n = os.write(fd, view[total:total + chunk_size])
+        try:
+            n = os.write(fd, view[total:total + chunk_size])
+        except (BlockingIOError, InterruptedError):
+            continue
         if n <= 0:
             break
         total += n
@@ -281,7 +298,10 @@ def _op_clear(session, h, args):
         r, _w, _x = select.select([h.fd], [], [], timeout_ms / 1000.0)
         if not r:
             break
-        data = os.read(h.fd, 65536)
+        try:
+            data = os.read(h.fd, 65536)
+        except (BlockingIOError, InterruptedError):
+            continue
         if not data:
             break
         drained += len(data)

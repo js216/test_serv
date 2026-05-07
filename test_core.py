@@ -1841,6 +1841,13 @@ def test_usbtmc_fast_path_helpers_read_write_and_rate_check():
     else:
         raise AssertionError("expected slow transfer to fail")
 
+    try:
+        usbtmc._read_with_timeout(0, 1, timeout_ms=1, chunk_size=0)
+    except ValueError as e:
+        assert "chunk_size" in str(e)
+    else:
+        raise AssertionError("zero usbtmc chunk_size should fail")
+
 
 def test_usbtmc_and_raw_usb_plan_shapes_parse():
     text = """
@@ -1875,6 +1882,20 @@ def test_usbtmc_list_available_without_class_nodes():
     sess.run_all(plugins)
     assert not sess.errors, sess.errors
     assert "usbtmc.list" in sess.streams
+
+
+def test_any_pseudo_device_does_not_make_bare_real_device_ambiguous():
+    class RealPlusAnyPlugin(FakePlugin):
+        name = "realany"
+
+        def probe(self):
+            return [{"id": "any", "list_only": True}, {"id": "real"}]
+
+    plugins = {"realany": RealPlusAnyPlugin()}
+    reg = DeviceRegistry(plugins)
+    reg.refresh()
+    assert reg.resolve("realany") == "realany.real"
+    assert reg.resolve("realany", "any") == "realany.any"
 
 
 def test_ssh_put_op_shape_and_validation():
@@ -1986,6 +2007,7 @@ def main():
         test_usbtmc_fast_path_helpers_read_write_and_rate_check,
         test_usbtmc_and_raw_usb_plan_shapes_parse,
         test_usbtmc_list_available_without_class_nodes,
+        test_any_pseudo_device_does_not_make_bare_real_device_ambiguous,
         test_ssh_put_op_shape_and_validation,
     ]
     failed = 0
