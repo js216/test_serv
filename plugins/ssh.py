@@ -151,11 +151,14 @@ def _op_put(session, h, args):
     data = bytes(args["data"])
     path = args["path"]
     mode = args.get("mode")
-    timeout_s = (args.get("timeout_ms") or (SSH_TIMEOUT_S * 1000)) / 1000.0
+    timeout_ms = args.get("timeout_ms")
     min_rate_Bps = args.get("min_rate_Bps")
     _validate_remote_path(path)
+    if timeout_ms is not None and timeout_ms <= 0:
+        raise ValueError("ssh:put timeout_ms must be > 0")
     if mode is not None and (mode < 0 or mode > 0o7777):
         raise ValueError(f"ssh:put bad mode {mode:o}")
+    timeout_s = (timeout_ms or (SSH_TIMEOUT_S * 1000)) / 1000.0
     if not shutil.which("scp"):
         raise RuntimeError("ssh:put requires scp in PATH")
     fd, tmp = tempfile.mkstemp(prefix="test-serv-ssh-put-")

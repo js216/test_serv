@@ -48,19 +48,28 @@ def _all_nodes():
     return sorted(glob.glob("/dev/usbtmc*"))
 
 
-def _match_instance(inst):
-    if inst.get("node") and os.path.exists(inst["node"]):
-        return _node_info(inst["node"])
+def _info_matches(info, inst):
     want_vid = inst.get("usb_vid") or inst.get("vid")
     want_pid = inst.get("usb_pid") or inst.get("pid")
     want_serial = inst.get("usb_serial") or inst.get("serial")
+    if want_vid and info["vid"].lower() != f"{config.as_int(want_vid):04x}":
+        return False
+    if want_pid and info["pid"].lower() != f"{config.as_int(want_pid):04x}":
+        return False
+    if want_serial and info["serial"] != str(want_serial):
+        return False
+    return True
+
+
+def _match_instance(inst):
+    if inst.get("node") and os.path.exists(inst["node"]):
+        info = _node_info(inst["node"])
+        if _info_matches(info, inst):
+            return info
+        return None
     for node in _all_nodes():
         info = _node_info(node)
-        if want_vid and info["vid"].lower() != f"{config.as_int(want_vid):04x}":
-            continue
-        if want_pid and info["pid"].lower() != f"{config.as_int(want_pid):04x}":
-            continue
-        if want_serial and info["serial"] != str(want_serial):
+        if not _info_matches(info, inst):
             continue
         return info
     return None

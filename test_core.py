@@ -1918,6 +1918,39 @@ def test_usbtmc_list_available_without_class_nodes():
     assert "usbtmc.list" in sess.streams
 
 
+def test_usbtmc_node_instances_still_validate_identity():
+    from plugins import usbtmc
+
+    old_exists = usbtmc.os.path.exists
+    old_node_info = usbtmc._node_info
+    try:
+        usbtmc.os.path.exists = lambda path: (
+            path == "/dev/usbtmc0" or old_exists(path))
+        usbtmc._node_info = lambda node: {
+            "node": node,
+            "id": "0",
+            "vid": "1234",
+            "pid": "5678",
+            "serial": "abc",
+            "manufacturer": "m",
+            "product": "p",
+            "interface": "1-1:1.0",
+        }
+        assert usbtmc._match_instance({
+            "node": "/dev/usbtmc0",
+            "usb_vid": "0x9999",
+        }) is None
+        assert usbtmc._match_instance({
+            "node": "/dev/usbtmc0",
+            "usb_vid": "0x1234",
+            "usb_pid": "0x5678",
+            "usb_serial": "abc",
+        })["node"] == "/dev/usbtmc0"
+    finally:
+        usbtmc.os.path.exists = old_exists
+        usbtmc._node_info = old_node_info
+
+
 def test_explicit_any_ref_locks_only_any_pseudo_device():
     class RealPlusAnyPlugin(FakePlugin):
         name = "pany"
@@ -1998,14 +2031,15 @@ def test_ssh_put_op_shape_and_validation():
     saved_popen = ssh.subprocess.Popen
     ssh.subprocess.Popen = lambda *a, **kw: calls.append((a, kw))
     try:
+        fake_session = type("S", (), {"log_event": lambda *a: None})()
+        fake_handle = type("H", (), {
+            "ip": "192.0.2.1",
+            "user": "root",
+            "key": "/k",
+            "known_hosts": "/kh",
+        })()
         try:
-            ssh._op_put(type("S", (), {"log_event": lambda *a: None})(),
-                        type("H", (), {
-                            "ip": "192.0.2.1",
-                            "user": "root",
-                            "key": "/k",
-                            "known_hosts": "/kh",
-                        })(),
+            ssh._op_put(fake_session, fake_handle,
                         {"data": b"abc", "path": "/tmp/fw",
                          "mode": 0o10000, "timeout_ms": 1000,
                          "min_rate_Bps": None})
@@ -2013,6 +2047,15 @@ def test_ssh_put_op_shape_and_validation():
             assert "bad mode" in str(e)
         else:
             raise AssertionError("bad ssh:put mode should fail")
+        try:
+            ssh._op_put(fake_session, fake_handle,
+                        {"data": b"abc", "path": "/tmp/fw",
+                         "mode": None, "timeout_ms": 0,
+                         "min_rate_Bps": None})
+        except ValueError as e:
+            assert "timeout_ms" in str(e)
+        else:
+            raise AssertionError("zero ssh:put timeout should fail")
     finally:
         ssh.subprocess.Popen = saved_popen
     assert calls == [], calls
@@ -2210,6 +2253,7 @@ def main():
         test_usbtmc_fast_path_helpers_read_write_and_rate_check,
         test_usbtmc_and_raw_usb_plan_shapes_parse,
         test_usbtmc_list_available_without_class_nodes,
+        test_usbtmc_node_instances_still_validate_identity,
         test_explicit_any_ref_locks_only_any_pseudo_device,
         test_any_pseudo_device_does_not_make_bare_real_device_ambiguous,
         test_ssh_put_op_shape_and_validation,
