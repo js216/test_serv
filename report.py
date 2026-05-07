@@ -34,6 +34,8 @@ def load_events(path):
                 if not rec.get("device") or not isinstance(rec.get("t"),
                                                             (int, float)):
                     continue
+                if not rec.get("plan_digest"):
+                    continue
                 events.append(rec)
     except FileNotFoundError:
         return []
@@ -114,9 +116,11 @@ def print_report(summary):
     print(f"window: {_fmt_ts(summary['start'])} .. "
           f"{_fmt_ts(summary['end'])} ({window_s:.1f}s)")
     print("device                 busy_s  duty_%  intervals  active")
-    for device in sorted(summary["stats"]):
-        st = summary["stats"][device]
+    rows = []
+    for device, st in summary["stats"].items():
         duty = (100.0 * st["busy_s"] / window_s) if window_s else 0.0
+        rows.append((duty, device, st))
+    for duty, device, st in sorted(rows, key=lambda r: (-r[0], r[1])):
         active = ""
         if st["active"]:
             oldest = min(r["since"] for r in st["active"])

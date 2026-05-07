@@ -116,6 +116,9 @@ def _is_job_device_key(key):
 def _append_device_usage(event, key, session):
     if not _is_job_device_key(key):
         return
+    plan_digest = getattr(session, "plan_digest", None)
+    if not plan_digest:
+        return
     now = time.time()
     rec = {
         "t": now,
@@ -123,7 +126,7 @@ def _append_device_usage(event, key, session):
         "event": event,
         "device": key,
         "session": session.session_id,
-        "plan_digest": getattr(session, "plan_digest", None),
+        "plan_digest": plan_digest,
     }
     try:
         with _devices_log_lock:

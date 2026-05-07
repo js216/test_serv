@@ -8,6 +8,7 @@ import io
 import json
 import os
 import socket
+import sys
 import tempfile
 import tarfile
 import threading
@@ -205,6 +206,7 @@ def test_session_logs_device_use_and_release_for_jobs_only():
             reg.refresh()
 
             sess = Session(reg, parsed)
+            sess.plan_digest = "0" * 64
             sess.run_all(plugins)
 
             with open(session_module.DEVICES_LOG, encoding="utf-8") as f:
@@ -240,20 +242,39 @@ def test_lease_only_plan_does_not_count_as_device_usage():
             session_module.DEVICES_LOG = old_log
 
 
+def test_direct_session_without_plan_digest_does_not_log_device_usage():
+    with tempfile.TemporaryDirectory() as tmp:
+        old_log = session_module.DEVICES_LOG
+        session_module.DEVICES_LOG = os.path.join(tmp, "devices.log")
+        try:
+            parsed = plan.load_tar(plan.pack_tar('fake:noop k=1\n', {}))
+            plugins = {"fake": FakePlugin()}
+            reg = DeviceRegistry(plugins)
+            reg.refresh()
+
+            sess = Session(reg, parsed)
+            sess.run_all(plugins)
+
+            assert not os.path.exists(session_module.DEVICES_LOG)
+            reg.close_all()
+        finally:
+            session_module.DEVICES_LOG = old_log
+
+
 def test_report_computes_duty_from_device_log_events():
     events = [
         {"t": 10.0, "event": "use", "device": "fake.0",
-         "session": "s1"},
+         "session": "s1", "plan_digest": "p1"},
         {"t": 15.0, "event": "release", "device": "fake.0",
-         "session": "s1"},
+         "session": "s1", "plan_digest": "p1"},
         {"t": 20.0, "event": "use", "device": "fake.0",
-         "session": "s2"},
+         "session": "s2", "plan_digest": "p2"},
         {"t": 30.0, "event": "release", "device": "fake.0",
-         "session": "s2"},
+         "session": "s2", "plan_digest": "p2"},
         {"t": 25.0, "event": "use", "device": "dsp.main",
-         "session": "s3"},
+         "session": "s3", "plan_digest": "p3"},
         {"t": 35.0, "event": "release", "device": "dsp.main",
-         "session": "s3"},
+         "session": "s3", "plan_digest": "p3"},
     ]
     summary = report.compute_duty(events)
     assert summary["window_s"] == 25.0, summary
@@ -265,13 +286,13 @@ def test_report_computes_duty_from_device_log_events():
 def test_report_pairs_by_session_for_back_to_back_device_jobs():
     events = [
         {"t": 10.0, "event": "use", "device": "fake.0",
-         "session": "old"},
+         "session": "old", "plan_digest": "p1"},
         {"t": 20.0, "event": "release", "device": "fake.0",
-         "session": "old"},
+         "session": "old", "plan_digest": "p1"},
         {"t": 20.0, "event": "use", "device": "fake.0",
-         "session": "new"},
+         "session": "new", "plan_digest": "p2"},
         {"t": 30.0, "event": "release", "device": "fake.0",
-         "session": "new"},
+         "session": "new", "plan_digest": "p2"},
     ]
     summary = report.compute_duty(events)
     assert summary["stats"]["fake.0"]["busy_s"] == 20.0, summary
@@ -281,11 +302,11 @@ def test_report_pairs_by_session_for_back_to_back_device_jobs():
 def test_report_closes_stale_session_at_next_device_use():
     events = [
         {"t": 10.0, "event": "use", "device": "fake.0",
-         "session": "crashed"},
+         "session": "crashed", "plan_digest": "p1"},
         {"t": 20.0, "event": "use", "device": "fake.0",
-         "session": "next"},
+         "session": "next", "plan_digest": "p2"},
         {"t": 30.0, "event": "release", "device": "fake.0",
-         "session": "next"},
+         "session": "next", "plan_digest": "p2"},
     ]
     summary = report.compute_duty(events)
     st = summary["stats"]["fake.0"]
@@ -299,9 +320,9 @@ def test_report_keeps_log_order_for_equal_timestamps():
         path = os.path.join(tmp, "devices.log")
         recs = [
             {"t": 20.0, "event": "use", "device": "fake.0",
-             "session": "same"},
+             "session": "same", "plan_digest": "p1"},
             {"t": 20.0, "event": "release", "device": "fake.0",
-             "session": "same"},
+             "session": "same", "plan_digest": "p1"},
         ]
         with open(path, "w", encoding="utf-8") as f:
             for rec in recs:
@@ -311,6 +332,38 @@ def test_report_keeps_log_order_for_equal_timestamps():
         summary = report.compute_duty(loaded, now=1000.0)
         assert summary["stats"]["fake.0"]["busy_s"] == 0.0, summary
         assert not summary["stats"]["fake.0"]["active"], summary
+
+
+def test_report_prints_highest_duty_first():
+    summary = {
+        "start": 10.0,
+        "end": 110.0,
+        "window_s": 100.0,
+        "stats": {
+            "low.0": {
+                "busy_s": 10.0,
+                "intervals": 1,
+                "active": [],
+                "stale_sessions": [],
+            },
+            "high.0": {
+                "busy_s": 90.0,
+                "intervals": 1,
+                "active": [],
+                "stale_sessions": [],
+            },
+        },
+    }
+    old_stdout = sys.stdout
+    out = io.StringIO()
+    try:
+        sys.stdout = out
+        report.print_report(summary)
+    finally:
+        sys.stdout = old_stdout
+    lines = out.getvalue().splitlines()
+    assert lines[2].startswith("high.0"), lines
+    assert lines[3].startswith("low.0"), lines
 
 
 def test_inventory_returns_devices_and_ops_streams():
@@ -1747,10 +1800,12 @@ def main():
         test_session_closes_touched_handles_at_job_end,
         test_session_logs_device_use_and_release_for_jobs_only,
         test_lease_only_plan_does_not_count_as_device_usage,
+        test_direct_session_without_plan_digest_does_not_log_device_usage,
         test_report_computes_duty_from_device_log_events,
         test_report_pairs_by_session_for_back_to_back_device_jobs,
         test_report_closes_stale_session_at_next_device_use,
         test_report_keeps_log_order_for_equal_timestamps,
+        test_report_prints_highest_duty_first,
         test_inventory_returns_devices_and_ops_streams,
         test_server_rest_queue_helpers,
         test_request_path_strips_query_for_static_assets,
