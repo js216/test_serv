@@ -77,21 +77,35 @@ def _recv_frame(ws, deadline, session):
 
 def _connect_with_cancel(websocket, url, timeout_s, session):
     box = {}
+    canceled = threading.Event()
 
     def _connect():
         try:
-            box["ws"] = websocket.create_connection(url, timeout=timeout_s)
+            ws = websocket.create_connection(url, timeout=timeout_s)
+            if canceled.is_set():
+                try:
+                    ws.close()
+                except Exception:
+                    pass
+            else:
+                box["ws"] = ws
         except BaseException as e:
-            box["err"] = e
+            if not canceled.is_set():
+                box["err"] = e
 
     t = threading.Thread(target=_connect, daemon=True,
                          name="ws-connect")
     t.start()
     deadline = time.monotonic() + timeout_s
     while t.is_alive():
-        session.bail_if_canceled("ws:recv connect")
+        try:
+            session.bail_if_canceled("ws:recv connect")
+        except BaseException:
+            canceled.set()
+            raise
         remain = deadline - time.monotonic()
         if remain <= 0:
+            canceled.set()
             raise TimeoutError("ws:recv connect timed out")
         t.join(timeout=min(0.2, remain))
     if "err" in box:

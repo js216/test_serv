@@ -1022,8 +1022,11 @@ def test_supervisor_acquires_poller_lock_before_spawning_worker():
     assert acquire_pos < popen_pos, (
         "poller.lock must be acquired before spawning worker so an "
         "outer while/timeout wrapper cannot start duplicate supervisors")
-    assert "_LOCK_HELD_ENV" in src, (
-        "worker must inherit lock-held marker and skip reacquiring")
+    assert "_LOCK_HELD_ENV" in src and "_LOCK_FD_ENV" in src, (
+        "worker must inherit lock marker and lock fd")
+    assert "pass_fds=tuple(pass_fds)" in src, (
+        "worker must inherit supervisor lock fd so orphan workers keep "
+        "the singleton lock held")
 
 
 def test_refused_spool_409_is_backed_off():
@@ -1747,12 +1750,9 @@ def test_multi_instance_plan_holds_all_dev_locks_for_session():
     locked = getattr(session, "_session_locked_keys", set())
     assert "twoinst.A" in locked, locked
     assert "twoinst.B" in locked, locked
-    # The per-device RLocks must be the same identity that's now
-    # tracked in _deferred_locks (so the session's finally-release
-    # actually drops them on exit). Both instances should appear.
-    deferred = [lk for _, lk in getattr(session, "_deferred_locks", [])]
-    expected = {reg.per_dev_lock["twoinst.A"], reg.per_dev_lock["twoinst.B"]}
-    assert set(deferred) == expected, (deferred, expected)
+    # Concrete device refs are now acquired eagerly, so there should
+    # be no deferred lock path involved for this plan.
+    assert getattr(session, "_deferred_locks", []) == []
     reg.close_all()
 
 
@@ -1918,6 +1918,25 @@ def test_usbtmc_list_available_without_class_nodes():
     assert "usbtmc.list" in sess.streams
 
 
+def test_explicit_any_ref_locks_only_any_pseudo_device():
+    class RealPlusAnyPlugin(FakePlugin):
+        name = "pany"
+        ops = {"list": Op(args={}, doc="list", run=_noop)}
+
+        def probe(self):
+            return [{"id": "any", "list_only": True}, {"id": "real"}]
+
+    plugins = {"pany": RealPlusAnyPlugin()}
+    reg = DeviceRegistry(plugins)
+    reg.refresh()
+    parsed = plan.load_tar(plan.pack_tar("pany.any:list\n", {}))
+    sess = Session(reg, parsed)
+    sess.run_all(plugins)
+    assert "pany.any" in sess._session_locked_keys, sess._session_locked_keys
+    assert "pany.real" not in sess._session_locked_keys, \
+        sess._session_locked_keys
+
+
 def test_any_pseudo_device_does_not_make_bare_real_device_ambiguous():
     class RealPlusAnyPlugin(FakePlugin):
         name = "realany"
@@ -1974,6 +1993,29 @@ def test_ssh_put_op_shape_and_validation():
         assert "too slow" in str(e)
     else:
         raise AssertionError("slow ssh:put should fail")
+
+    calls = []
+    saved_popen = ssh.subprocess.Popen
+    ssh.subprocess.Popen = lambda *a, **kw: calls.append((a, kw))
+    try:
+        try:
+            ssh._op_put(type("S", (), {"log_event": lambda *a: None})(),
+                        type("H", (), {
+                            "ip": "192.0.2.1",
+                            "user": "root",
+                            "key": "/k",
+                            "known_hosts": "/kh",
+                        })(),
+                        {"data": b"abc", "path": "/tmp/fw",
+                         "mode": 0o10000, "timeout_ms": 1000,
+                         "min_rate_Bps": None})
+        except ValueError as e:
+            assert "bad mode" in str(e)
+        else:
+            raise AssertionError("bad ssh:put mode should fail")
+    finally:
+        ssh.subprocess.Popen = saved_popen
+    assert calls == [], calls
 
 
 def test_usb_write_ops_reject_short_writes():
@@ -2071,10 +2113,17 @@ def test_ws_plugin_recv_schema_and_helpers():
         raise AssertionError("slow ws:recv should fail")
 
     class SlowWebSocketModule:
+        made = []
+
         @staticmethod
         def create_connection(url, timeout=None):
-            time.sleep(1.0)
-            raise RuntimeError("should have been canceled first")
+            time.sleep(0.2)
+            obj = type("Conn", (), {
+                "closed": False,
+                "close": lambda self: setattr(self, "closed", True),
+            })()
+            SlowWebSocketModule.made.append(obj)
+            return obj
 
     class CanceledSession:
         def bail_if_canceled(self, where):
@@ -2088,6 +2137,11 @@ def test_ws_plugin_recv_schema_and_helpers():
         assert "canceled" in str(e)
     else:
         raise AssertionError("ws connect should observe cancel")
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and not SlowWebSocketModule.made:
+        time.sleep(0.01)
+    assert SlowWebSocketModule.made
+    assert SlowWebSocketModule.made[0].closed
 
 
 # --- runner --------------------------------------------------------------
@@ -2156,6 +2210,7 @@ def main():
         test_usbtmc_fast_path_helpers_read_write_and_rate_check,
         test_usbtmc_and_raw_usb_plan_shapes_parse,
         test_usbtmc_list_available_without_class_nodes,
+        test_explicit_any_ref_locks_only_any_pseudo_device,
         test_any_pseudo_device_does_not_make_bare_real_device_ambiguous,
         test_ssh_put_op_shape_and_validation,
         test_usb_write_ops_reject_short_writes,

@@ -1381,6 +1381,7 @@ SUPERVISOR_STACK_DUMP_GRACE_S = 1.0
 _WORKER_FLAG = "--_worker"
 _HEARTBEAT_FD_ENV = "TEST_SERV_HEARTBEAT_FD"
 _LOCK_HELD_ENV = "TEST_SERV_POLLER_LOCK_HELD"
+_LOCK_FD_ENV = "TEST_SERV_POLLER_LOCK_FD"
 
 
 def _heartbeat_stale(last_heartbeat_mono, now=None):
@@ -1468,6 +1469,14 @@ def _supervise():
         hb_r = hb_w = None
         env = os.environ.copy()
         env[_LOCK_HELD_ENV] = "1"
+        pass_fds = []
+        if _poller_lock_fd is not None:
+            try:
+                os.set_inheritable(_poller_lock_fd, True)
+            except OSError:
+                pass
+            env[_LOCK_FD_ENV] = str(_poller_lock_fd)
+            pass_fds.append(_poller_lock_fd)
         try:
             hb_r, hb_w = os.pipe()
             try:
@@ -1476,7 +1485,8 @@ def _supervise():
                 pass
             os.set_inheritable(hb_w, True)
             env[_HEARTBEAT_FD_ENV] = str(hb_w)
-            p = subprocess.Popen(argv, pass_fds=(hb_w,), env=env)
+            pass_fds.append(hb_w)
+            p = subprocess.Popen(argv, pass_fds=tuple(pass_fds), env=env)
         except OSError as e:
             for fd in (hb_r, hb_w):
                 if fd is not None:

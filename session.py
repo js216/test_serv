@@ -512,16 +512,18 @@ class Session:
         # are held for the rest of the session, same as eager ones --
         # so the overall semantics is still job-atomic once the
         # device shows up.
-        from plan import required_devices
-        needed = sorted(required_devices(self.plan))
-        for name in needed:
+        from plan import required_device_refs, split_device_ref
+        needed = sorted(required_device_refs(self.plan))
+        for ref in needed:
+            name, _spec_id = split_device_ref(ref)
             self.registry.refresh_plugin(name)
 
         eager_keys = []
         self._deferred_names = set()
-        for name in needed:
+        for ref in needed:
+            name, spec_id = split_device_ref(ref)
             try:
-                eager_keys.append(self.registry.resolve(name))
+                eager_keys.append(self.registry.resolve(name, spec_id))
             except LookupError:
                 self._deferred_names.add(name)
         with self.registry.lock:

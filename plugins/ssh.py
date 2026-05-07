@@ -154,6 +154,8 @@ def _op_put(session, h, args):
     timeout_s = (args.get("timeout_ms") or (SSH_TIMEOUT_S * 1000)) / 1000.0
     min_rate_Bps = args.get("min_rate_Bps")
     _validate_remote_path(path)
+    if mode is not None and (mode < 0 or mode > 0o7777):
+        raise ValueError(f"ssh:put bad mode {mode:o}")
     if not shutil.which("scp"):
         raise RuntimeError("ssh:put requires scp in PATH")
     fd, tmp = tempfile.mkstemp(prefix="test-serv-ssh-put-")
@@ -183,8 +185,6 @@ def _op_put(session, h, args):
             "SSH", "ssh:put",
             f"ok {len(data)}B in {elapsed:.3f}s @ {rate:.0f} B/s")
         if mode is not None:
-            if mode < 0 or mode > 0o7777:
-                raise ValueError(f"ssh:put bad mode {mode:o}")
             cmd = f"chmod {mode:o} -- {_remote_quote(path)}"
             proc = subprocess.Popen(
                 _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd],
