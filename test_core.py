@@ -13,6 +13,7 @@ import tarfile
 import threading
 import time
 
+from plugins.tcp import TcpPlugin
 import plan
 import server
 from plugin import DevicePlugin, Op
@@ -213,6 +214,79 @@ def test_inventory_returns_devices_and_ops_streams():
     assert "emit" in ops["fake"]["ops"]
 
     reg.close_all()
+
+
+def test_tcp_recv_captures_stream_and_expectation():
+    ready = threading.Event()
+
+    def _serve(listener):
+        ready.set()
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"stream_ws_tcp_hello\n")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        thread = threading.Thread(target=_serve, args=(listener,),
+                                  daemon=True)
+        thread.start()
+        assert ready.wait(timeout=1.0)
+        host, port = listener.getsockname()
+
+        parsed = plan.load_tar(plan.pack_tar(
+            f'tcp:recv host="{host}" port={port} '
+            'expect="stream_ws_tcp_hello\\n" timeout_ms=1000\n', {}))
+        plugins = {"tcp": TcpPlugin()}
+        reg = DeviceRegistry(plugins)
+        reg.refresh()
+        session = Session(reg, parsed)
+        session.run_all(plugins)
+
+        assert not session.errors, session.errors
+        assert session.stream("tcp.recv").snapshot_bytes() == (
+            b"stream_ws_tcp_hello\n")
+        assert session.checks[0]["kind"] == "tcp_recv"
+        assert session.checks[0]["status"] == "hit"
+
+        reg.close_all()
+        thread.join(timeout=1.0)
+
+
+def test_tcp_recv_expect_mismatch_fails_after_capture():
+    ready = threading.Event()
+
+    def _serve(listener):
+        ready.set()
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"wrong\n")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        thread = threading.Thread(target=_serve, args=(listener,),
+                                  daemon=True)
+        thread.start()
+        assert ready.wait(timeout=1.0)
+        host, port = listener.getsockname()
+
+        parsed = plan.load_tar(plan.pack_tar(
+            f'tcp:recv host="{host}" port={port} '
+            'expect="stream_ws_tcp_hello\\n" timeout_ms=1000\n', {}))
+        plugins = {"tcp": TcpPlugin()}
+        reg = DeviceRegistry(plugins)
+        reg.refresh()
+        session = Session(reg, parsed)
+        session.run_all(plugins)
+
+        assert session.errors, "expected tcp:recv mismatch to fail"
+        assert session.stream("tcp.recv").snapshot_bytes() == b"wrong\n"
+        assert session.checks[0]["kind"] == "tcp_recv"
+        assert session.checks[0]["status"] == "timeout"
+
+        reg.close_all()
+        thread.join(timeout=1.0)
 
 
 def test_server_rest_queue_helpers():
@@ -1699,6 +1773,8 @@ def main():
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
+        test_tcp_recv_captures_stream_and_expectation,
+        test_tcp_recv_expect_mismatch_fails_after_capture,
         test_server_rest_queue_helpers,
         test_request_path_strips_query_for_static_assets,
         test_static_assets_accept_query_and_disable_cache,
