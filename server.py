@@ -1091,8 +1091,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._send_json(
                 json.dumps({"status": "canceled_queued",
                             "digest": digest}).encode())
-        # 2) in-flight? leave a marker, poller will see it.
-        if os.path.exists(os.path.join(DONE, f"{digest}.plan")):
+        # 2) in-flight? leave a marker, poller will see it. If the
+        # DONE record is old and no inflight snapshot owns it, resolve
+        # it here; waiting for a poller to ack a cancel marker can
+        # leave stale "running" rows visible forever.
+        done_path = os.path.join(DONE, f"{digest}.plan")
+        if os.path.exists(done_path):
+            fresh = True
+            try:
+                fresh = (
+                    time.time() - os.path.getmtime(done_path)
+                    < PRUNE_MIN_AGE_S)
+            except FileNotFoundError:
+                pass
+            if digest not in _inflight_digests() and not fresh:
+                removed = []
+                for label, path in (("done", done_path),
+                                    ("meta", f"{done_path}.meta"),
+                                    ("cancel",
+                                     os.path.join(CANCEL, digest))):
+                    try:
+                        os.unlink(path)
+                        removed.append(label)
+                    except FileNotFoundError:
+                        pass
+                return self._send_json(
+                    json.dumps({"status": "stale_canceled",
+                                "digest": digest,
+                                "removed": removed}).encode())
             os.makedirs(CANCEL, mode=0o700, exist_ok=True)
             with open(os.path.join(CANCEL, digest), "wb"):
                 pass

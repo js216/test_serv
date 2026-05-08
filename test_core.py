@@ -12,9 +12,11 @@ import tempfile
 import tarfile
 import threading
 import time
+import urllib.error
 
 import plan
 import server
+import submit
 from plugin import DevicePlugin, Op
 from registry import DeviceRegistry
 from session import Session, bench_id, pack_artefact
@@ -529,6 +531,222 @@ def test_session_watchdog_hard_exits_when_wedged():
         _session.WATCHDOG_SOFT_GRACE_S = saved_soft
         _session.WATCHDOG_HARD_GRACE_S = saved_hard
         reg.close_all()
+
+
+def test_lock_wait_does_not_consume_session_runtime():
+    """A session's X-Test-Runtime budget starts after device locks.
+
+    Shared-bench contention can leave a picked-up job blocked on a
+    per-device lock. That wait must not make the first op get skipped
+    as already past deadline once the previous session releases the
+    device.
+    """
+    parsed = plan.load_tar(plan.pack_tar("fake:noop k=1\n", {}))
+    plugins = {"fake": FakePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    key = reg.resolve("fake")
+    dev_lock = reg.per_dev_lock[key]
+    dev_lock.acquire()
+    session = Session(reg, parsed, runtime_s=0.05)
+    t = threading.Thread(target=lambda: session.run_all(plugins))
+    try:
+        t.start()
+        time.sleep(0.10)
+        dev_lock.release()
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "session did not finish after lock release"
+        assert len(session.ops_log) == 1, session.events
+        assert session.ops_log[0]["status"] == "ok", session.ops_log
+        assert not any(
+            e["kind"] == "ERROR" and "session exceeded" in e["msg"]
+            for e in session.events), session.events
+    finally:
+        if dev_lock._is_owned():
+            dev_lock.release()
+        reg.close_all()
+
+
+def test_cancel_aborts_device_lock_wait():
+    """DELETE /jobs cancel must wake sessions waiting on a device lock.
+
+    A reset-only job can be picked up while another session holds
+    bench_mcu. If cancel lands during that lock wait, the session must
+    stop promptly instead of camping until the holder eventually exits.
+    """
+    parsed = plan.load_tar(plan.pack_tar("fake:noop k=1\n", {}))
+    plugins = {"fake": FakePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    key = reg.resolve("fake")
+    dev_lock = reg.per_dev_lock[key]
+    dev_lock.acquire()
+    session = Session(reg, parsed, runtime_s=60.0)
+    t = threading.Thread(target=lambda: session.run_all(plugins))
+    try:
+        t.start()
+        time.sleep(0.05)
+        t0 = time.monotonic()
+        session.signal_cancel()
+        t.join(timeout=1.0)
+        elapsed = time.monotonic() - t0
+        assert not t.is_alive(), "session ignored cancel during lock wait"
+        assert elapsed < 0.5, f"lock-wait cancel took {elapsed:.2f}s"
+        assert session.canceled
+        assert session.ops_log == [], session.ops_log
+        assert any("canceled while waiting for device lock" in e["msg"]
+                   for e in session.events), session.events
+        _, mtxt = pack_artefact(session)
+        assert json.loads(mtxt)["status"] == "canceled", mtxt
+    finally:
+        if dev_lock._is_owned():
+            dev_lock.release()
+        reg.close_all()
+
+
+def test_submit_wait_retries_transient_server_restart():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise RuntimeError(
+                "cannot reach test_serv at http://127.0.0.1:1: "
+                "Connection refused")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "a" * 64, 1.0) == b"tar"
+        assert len(calls) == 2
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_retries_transient_connection_reset():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "b" * 64, 1.0) == b"tar"
+        assert len(calls) == 2
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_retries_raw_url_error():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise urllib.error.URLError("ssh tunnel closed")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "c" * 64, 1.0) == b"tar"
+        assert len(calls) == 2
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_retries_transient_timeouts():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise socket.timeout("socket timed out")
+        if len(calls) == 2:
+            raise TimeoutError("poll timed out")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "d" * 64, 1.0) == b"tar"
+        assert len(calls) == 3
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_returns_when_job_disappears_without_tar():
+    old_head = submit._head_tar
+    old_job_known = submit._job_known
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+    calls = []
+
+    try:
+        submit._head_tar = lambda _server, _digest: False
+
+        def fake_job_known(server_url, digest):
+            calls.append((server_url, digest))
+            return False
+
+        submit._job_known = fake_job_known
+        submit._get_tar = lambda _server, _digest: b"unexpected"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "f" * 64, 10.0) is None
+        assert calls == [("http://127.0.0.1:1", "f" * 64)]
+    finally:
+        submit._head_tar = old_head
+        submit._job_known = old_job_known
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_reraises_http_error():
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    err = urllib.error.HTTPError(
+        "http://127.0.0.1:1/outputs/%s.tar" % ("e" * 64),
+        503, "Service Unavailable", {}, io.BytesIO(b"busy"))
+
+    try:
+        submit._head_tar = lambda _server, _digest: (_ for _ in ()).throw(err)
+        submit._get_tar = lambda _server, _digest: b"unexpected"
+        try:
+            submit._wait("http://127.0.0.1:1", "e" * 64, 1.0)
+        except urllib.error.HTTPError as e:
+            assert e is err
+        else:
+            raise AssertionError("expected HTTPError to propagate")
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
 
 
 def test_acquire_open_timeout_quarantines_and_doesnt_wedge():
@@ -1476,6 +1694,83 @@ def test_stale_cancel_resolution_removes_orphan_running_record():
              server.CANCEL) = old_dirs
 
 
+def test_delete_job_resolves_old_non_inflight_running_record():
+    """DELETE /jobs should not rely on a poller to clean stale rows.
+
+    If DONE has an old running record and STATUS/inflight.json does not
+    list that digest, the server can prove no current session owns it.
+    Resolve it immediately instead of leaving cancel_pending forever.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dirs = (server.INPUTS, server.OUTPUTS, server.DONE,
+                    server.STATUS, server.RELEASE, server.SWEEP,
+                    server.CANCEL)
+        server.INPUTS = os.path.join(tmp, "inputs")
+        server.OUTPUTS = os.path.join(tmp, "outputs")
+        server.DONE = os.path.join(tmp, "done")
+        server.STATUS = os.path.join(tmp, "status")
+        server.RELEASE = os.path.join(tmp, "release")
+        server.SWEEP = os.path.join(tmp, "sweep")
+        server.CANCEL = os.path.join(tmp, "cancel")
+        for d in (server.INPUTS, server.OUTPUTS, server.DONE,
+                  server.STATUS, server.RELEASE, server.SWEEP,
+                  server.CANCEL):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            stale = "f" * 64
+            fresh = "1" * 64
+            live = "2" * 64
+            for digest in (stale, fresh, live):
+                with open(os.path.join(server.DONE, f"{digest}.plan"),
+                          "wb") as f:
+                    f.write(b"plan")
+            old_t = time.time() - server.PRUNE_MIN_AGE_S - 1.0
+            os.utime(os.path.join(server.DONE, f"{stale}.plan"),
+                     (old_t, old_t))
+            os.utime(os.path.join(server.DONE, f"{live}.plan"),
+                     (old_t, old_t))
+            with open(os.path.join(server.STATUS, "inflight.json"),
+                      "wb") as f:
+                f.write(json.dumps([{"digest": live}]).encode())
+
+            host, port = httpd.server_address
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                conn.request("DELETE", f"/jobs/{stale}")
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+            finally:
+                conn.close()
+            assert resp.status == 200, resp.status
+            assert body["status"] == "stale_canceled", body
+            assert not os.path.exists(
+                os.path.join(server.DONE, f"{stale}.plan"))
+
+            for digest in (fresh, live):
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                try:
+                    conn.request("DELETE", f"/jobs/{digest}")
+                    resp = conn.getresponse()
+                    body = json.loads(resp.read())
+                finally:
+                    conn.close()
+                assert resp.status == 200, (resp.status, body)
+                assert body["status"] == "cancel_signaled", body
+                assert os.path.exists(os.path.join(server.CANCEL, digest))
+                assert os.path.exists(
+                    os.path.join(server.DONE, f"{digest}.plan"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            (server.INPUTS, server.OUTPUTS, server.DONE,
+             server.STATUS, server.RELEASE, server.SWEEP,
+             server.CANCEL) = old_dirs
+
+
 def test_delete_outputs_no_op_when_nothing_to_delete():
     """An agent's DELETE /outputs/<digest> can race a fresh re-pickup
     of the same digest: agent thinks it's cleaning up after a fetch,
@@ -1635,6 +1930,14 @@ def main():
         test_cancel_propagates_to_session,
         test_signal_cancel_sigkills_session_subprocs,
         test_session_watchdog_hard_exits_when_wedged,
+        test_lock_wait_does_not_consume_session_runtime,
+        test_cancel_aborts_device_lock_wait,
+        test_submit_wait_retries_transient_server_restart,
+        test_submit_wait_retries_transient_connection_reset,
+        test_submit_wait_retries_raw_url_error,
+        test_submit_wait_retries_transient_timeouts,
+        test_submit_wait_returns_when_job_disappears_without_tar,
+        test_submit_wait_reraises_http_error,
         test_acquire_open_timeout_quarantines_and_doesnt_wedge,
         test_refresh_survives_a_hung_probe,
         test_hung_probe_keeps_last_good_specs,
@@ -1662,6 +1965,7 @@ def main():
         test_failure_artefact_carries_identity_fields,
         test_prune_skips_inflight_digests,
         test_stale_cancel_resolution_removes_orphan_running_record,
+        test_delete_job_resolves_old_non_inflight_running_record,
         test_delete_outputs_no_op_when_nothing_to_delete,
         test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,
