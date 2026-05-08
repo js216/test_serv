@@ -407,10 +407,11 @@ class DfuPlugin(DevicePlugin):
            "`@name` both work).  Binary path is bench-owned; attacker-"
            "controllable inputs are limited to typed plan args and plan "
            "blobs. "
-           "DFU entry is automated: with BOOT pins strapped for system "
-           "memory, pulse the reset line via bench_mcu.reset_dut (EVB) "
-           "or bench_mcu.reset_dut2 (custom PCB) -- no human button "
-           "press required.")
+           "DFU entry is automated: both bench MP135 boards have BOOT "
+           "pins hardwired to 000, so pulsing reset via bench_mcu."
+           "reset_dut (EVB) or bench_mcu.reset_dut2 (custom PCB) drops "
+           "them straight into the system-memory DFU bootloader -- no "
+           "human button press or strap change required.")
 
     ops = {
         "list": Op(args={},
@@ -511,8 +512,9 @@ class DfuPlugin(DevicePlugin):
             raise RuntimeError(
                 f"dfu: device {expected_serial!r} not enumerated "
                 f"(saw {serials!r}); is the board in DFU mode? "
-                f"Pulse bench_mcu.reset_dut (EVB) or reset_dut2 "
-                f"(custom PCB) with BOOT pins strapped for system memory.")
+                f"Both bench MP135s have BOOT=000 hardwired, so a pulse "
+                f"of bench_mcu.reset_dut (EVB) or reset_dut2 (custom "
+                f"PCB) is enough -- no strap change needed.")
         usb_index = match.get("usb_index") or spec.get("usb_index", "usb1")
         h = DfuHandle(
             instance_id=spec["id"],

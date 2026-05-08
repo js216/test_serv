@@ -152,7 +152,9 @@ class Mp135Plugin(DevicePlugin):
            "interface MI_01).  Background-drained into mp135.uart stream. "
            "Reset is automated via bench_mcu: reset_dut for the EVB "
            "STM32MP135, reset_dut2 for the custom STM32MP135 PCB -- no "
-           "human button press required.")
+           "human button press required.  On both bench boards the BOOT "
+           "pins are hardwired to 000, so a bench_mcu reset drops the "
+           "MPU straight into the system-memory DFU bootloader.")
 
     ops = {
         "uart_open": Op(args={},
