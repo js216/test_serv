@@ -149,7 +149,10 @@ class Mp135Plugin(DevicePlugin):
     name = "mp135"
     doc = ("STM32MP135 eval board serial console via STLink VCP "
            "(configured in config.json, usually ST VID 0483 PID 3753 "
-           "interface MI_01).  Background-drained into mp135.uart stream.")
+           "interface MI_01).  Background-drained into mp135.uart stream. "
+           "Reset is automated via bench_mcu: reset_dut for the EVB "
+           "STM32MP135, reset_dut2 for the custom STM32MP135 PCB -- no "
+           "human button press required.")
 
     ops = {
         "uart_open": Op(args={},
