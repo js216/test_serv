@@ -1613,6 +1613,80 @@ def test_bench_id_defaults_to_hostname_and_env_overrides():
             os.environ["TEST_SERV_BENCH_ID"] = old
 
 
+def test_ssh_put_uses_key_only_scp_and_streams_output():
+    from plugins import ssh
+
+    class Stream:
+        def __init__(self):
+            self.data = b""
+
+        def append(self, data):
+            self.data += data
+
+    class FakeSession:
+        canceled = False
+
+        def __init__(self):
+            self.streams = {}
+            self.events = []
+
+        def stream(self, name):
+            return self.streams.setdefault(name, Stream())
+
+        def log_event(self, *args):
+            self.events.append(args)
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, argv, stdout=None, stderr=None):
+            self.argv = argv
+            self.terminated = False
+            calls.append(argv)
+
+        def communicate(self, timeout=None):
+            with open(self.argv[-2], "rb") as f:
+                assert f.read() == b"payload"
+            return b"copied\n", b"scp note\n"
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    calls = []
+    saved_popen = ssh.subprocess.Popen
+    ssh.subprocess.Popen = FakeProc
+    try:
+        sess = FakeSession()
+        h = ssh.SshHandle("172.25.0.115", "root", "/bench/key",
+                          "/bench/known_hosts")
+        ssh._op_put(sess, h, {
+            "data": b"payload",
+            "path": "/tmp/blob.txt",
+            "timeout_ms": None,
+        })
+    finally:
+        ssh.subprocess.Popen = saved_popen
+
+    argv = calls[0]
+    assert argv[:2] == ["scp", "-O"], argv
+    assert "StrictHostKeyChecking=yes" in argv, argv
+    assert "UserKnownHostsFile=/bench/known_hosts" in argv, argv
+    assert "BatchMode=yes" in argv, argv
+    assert "IdentitiesOnly=yes" in argv, argv
+    assert "PubkeyAuthentication=yes" in argv, argv
+    assert "PasswordAuthentication=no" in argv, argv
+    assert argv[-1] == "root@172.25.0.115:/tmp/blob.txt", argv
+    assert sess.streams["ssh.put"].data == b"copied\n"
+    assert sess.streams["ssh.put.stderr"].data == b"scp note\n"
+    assert any(e[:2] == ("SSH", "ssh:put") for e in sess.events)
+
+
 # --- runner --------------------------------------------------------------
 
 def main():
@@ -1666,6 +1740,7 @@ def main():
         test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,
         test_bench_id_defaults_to_hostname_and_env_overrides,
+        test_ssh_put_uses_key_only_scp_and_streams_output,
     ]
     failed = 0
     for t in tests:

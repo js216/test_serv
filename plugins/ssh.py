@@ -3,8 +3,10 @@
 # Copyright (c) 2026 Jakob Kastelic
 
 import os
+import re
 import shutil
 import subprocess
+import tempfile
 import time
 
 import config
@@ -34,6 +36,7 @@ SSH_TIMEOUT_S = 60
 # this window. uname is sub-second on a reachable target; ssh's own
 # ConnectTimeout=5 in _ssh_argv handles unreachable.
 IDENTITY_TIMEOUT_S = 8
+_REMOTE_PATH_RE = re.compile(r"^/[A-Za-z0-9._/+-]+$")
 
 
 def _ssh_argv(ip, user, key, known_hosts):
@@ -51,14 +54,18 @@ def _ssh_argv(ip, user, key, known_hosts):
     ]
 
 
-def _op_exec(session, h, args):
-    cmd = args["command"]
-    argv = _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd]
-    session.log_event("SSH", "ssh:exec", cmd)
-    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE)
+def _ssh_timeout_s(args):
+    timeout_ms = args.get("timeout_ms")
+    if timeout_ms is None:
+        return SSH_TIMEOUT_S
+    if timeout_ms <= 0:
+        raise ValueError("ssh timeout_ms must be > 0")
+    return timeout_ms / 1000.0
+
+
+def _run_child(session, proc, op_name, timeout_s):
     _track_subproc(proc, session=session)
-    deadline = time.monotonic() + SSH_TIMEOUT_S
+    deadline = time.monotonic() + timeout_s
     stdout = stderr = b""
     try:
         while True:
@@ -74,7 +81,7 @@ def _op_exec(session, h, args):
                         proc.kill()
                         proc.wait(timeout=2)
                     raise RuntimeError(
-                        "ssh:exec canceled via DELETE /jobs/<digest>")
+                        f"{op_name} canceled via DELETE /jobs/<digest>")
                 if time.monotonic() > deadline:
                     proc.terminate()
                     try:
@@ -82,9 +89,20 @@ def _op_exec(session, h, args):
                     except subprocess.TimeoutExpired:
                         proc.kill()
                     raise TimeoutError(
-                        f"ssh:exec timed out ({SSH_TIMEOUT_S}s)")
+                        f"{op_name} timed out ({timeout_s:g}s)")
     finally:
         _untrack_subproc(proc)
+    return stdout, stderr
+
+
+def _op_exec(session, h, args):
+    cmd = args["command"]
+    argv = _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd]
+    session.log_event("SSH", "ssh:exec", cmd)
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
+    timeout_s = _ssh_timeout_s(args)
+    stdout, stderr = _run_child(session, proc, "ssh:exec", timeout_s)
     if stdout:
         session.stream("ssh.exec").append(stdout)
     if stderr:
@@ -95,6 +113,57 @@ def _op_exec(session, h, args):
                       f"stderr={len(stderr)}B")
     if proc.returncode != 0:
         raise RuntimeError(f"ssh:exec exit={proc.returncode}")
+
+
+def _scp_argv(ip, user, key, known_hosts, src_path, dest_path):
+    return [
+        "scp",
+        "-O",
+        "-o", "StrictHostKeyChecking=yes",
+        "-o", f"UserKnownHostsFile={known_hosts}",
+        "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=5",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "PubkeyAuthentication=yes",
+        "-o", "PasswordAuthentication=no",
+        "-i", key,
+        src_path,
+        f"{user}@{ip}:{dest_path}",
+    ]
+
+
+def _op_put(session, h, args):
+    data = args["data"]
+    dest_path = args["path"]
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError("ssh:put data must be a plan blob")
+    if not _REMOTE_PATH_RE.fullmatch(dest_path):
+        raise ValueError(
+            "ssh:put path must be absolute and contain only "
+            "A-Z a-z 0-9 . _ / + -")
+
+    timeout_s = _ssh_timeout_s(args)
+    with tempfile.NamedTemporaryFile(prefix="test-serv-ssh-put-") as f:
+        f.write(bytes(data))
+        f.flush()
+        argv = _scp_argv(h.ip, h.user, h.key, h.known_hosts,
+                         f.name, dest_path)
+        session.log_event("SSH", "ssh:put",
+                          f"{len(data)}B -> {dest_path}")
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE)
+        stdout, stderr = _run_child(session, proc, "ssh:put", timeout_s)
+
+    if stdout:
+        session.stream("ssh.put").append(stdout)
+    if stderr:
+        session.stream("ssh.put.stderr").append(stderr)
+    session.log_event("SSH", "ssh:put",
+                      f"exit={proc.returncode} "
+                      f"stdout={len(stdout)}B "
+                      f"stderr={len(stderr)}B")
+    if proc.returncode != 0:
+        raise RuntimeError(f"ssh:put exit={proc.returncode}")
 
 
 def _op_pubkey(session, h, args):
@@ -239,6 +308,7 @@ class SshPlugin(DevicePlugin):
             run=_op_trust_host_key),
         "exec": Op(
             args={"command": "str"},
+            optional_args={"timeout_ms": "int"},
             doc=("Run an arbitrary shell command on the target as the "
                  "configured user (typically root). Stdout/stderr "
                  "land in streams ssh.exec / ssh.exec.stderr; the "
@@ -248,6 +318,17 @@ class SshPlugin(DevicePlugin):
                  "target's host pubkey to already be trusted -- run "
                  "ssh:trust_host_key first per image build."),
             run=_op_exec),
+        "put": Op(
+            args={"data": "blob", "path": "str"},
+            optional_args={"timeout_ms": "int"},
+            doc=("Copy a plan blob to an absolute path on the target "
+                 "using key-only scp with the same strict known_hosts "
+                 "and pinned identity-key behavior as ssh:exec. "
+                 "Stdout/stderr land in streams ssh.put / "
+                 "ssh.put.stderr; non-zero exit raises. "
+                 f"Per-call timeout: {SSH_TIMEOUT_S}s by default. "
+                 "Requires ssh:trust_host_key first per image build."),
+            run=_op_put),
     }
 
     def probe(self):
