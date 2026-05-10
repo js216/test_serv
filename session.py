@@ -32,6 +32,10 @@ MAX_SESSION_S = 3600.0
 WATCHDOG_SOFT_GRACE_S = 30.0
 WATCHDOG_HARD_GRACE_S = 90.0
 
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+DEVICES_LOG = os.path.join(REPO_DIR, "devices.log")
+_devices_log_lock = threading.Lock()
+
 
 def bench_id():
     """Return the bench identity stamped into manifests/status.
@@ -103,6 +107,33 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
     if message is not None:
         out["message"] = message
     return out
+
+
+def _is_job_device_key(key):
+    return bool(key) and not key.startswith("lease.") and not key.endswith(".any")
+
+
+def _append_device_usage(event, key, session):
+    if not _is_job_device_key(key):
+        return
+    plan_digest = getattr(session, "plan_digest", None)
+    if not plan_digest:
+        return
+    now = time.time()
+    rec = {
+        "t": now,
+        "iso": datetime.fromtimestamp(now).isoformat(timespec="milliseconds"),
+        "event": event,
+        "device": key,
+        "session": session.session_id,
+        "plan_digest": plan_digest,
+    }
+    try:
+        with _devices_log_lock:
+            with open(DEVICES_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except Exception:
+        traceback.print_exc()
 
 
 class StopSession(Exception):
@@ -276,6 +307,7 @@ class Session:
         self.ops_log = []      # list of dicts for ops.jsonl
         self.pinned = {}       # device_key -> context manager (for open/close)
         self.touched_keys = set()
+        self._usage_logged_keys = set()
         self.errors = []
         # Plan-level claims recorded by the `expect "<text>"` control
         # verb. Surface as manifest.expectations[] so a future operator
@@ -480,16 +512,18 @@ class Session:
         # are held for the rest of the session, same as eager ones --
         # so the overall semantics is still job-atomic once the
         # device shows up.
-        from plan import required_devices
-        needed = sorted(required_devices(self.plan))
-        for name in needed:
+        from plan import required_device_refs, split_device_ref
+        needed = sorted(required_device_refs(self.plan))
+        for ref in needed:
+            name, _spec_id = split_device_ref(ref)
             self.registry.refresh_plugin(name)
 
         eager_keys = []
         self._deferred_names = set()
-        for name in needed:
+        for ref in needed:
+            name, spec_id = split_device_ref(ref)
             try:
-                eager_keys.append(self.registry.resolve(name))
+                eager_keys.append(self.registry.resolve(name, spec_id))
             except LookupError:
                 self._deferred_names.add(name)
         with self.registry.lock:
@@ -503,7 +537,7 @@ class Session:
             self._pinned_specs = set(eager_keys)
             for k in self._pinned_specs:
                 self.registry.pinned_specs[k] += 1
-        self._deferred_locks = []     # filled by _run_device_op
+        self._deferred_locks = []     # (device_key, lock), filled by ops
 
         self.log_event(
             "LOCK", "session",
@@ -582,6 +616,8 @@ class Session:
         # session could win the lock between ops, breaking the
         # job-atomic invariant the README promises.
         self._session_locked_keys = set(eager_keys)
+        for key in eager_keys:
+            self._mark_device_use(key)
         self.log_event("LOCK", "session", "acquired; running ops")
         # Lock wait is bench scheduling/resource contention, not plan
         # execution. Start the runtime budget after eager locks are held
@@ -700,9 +736,11 @@ class Session:
                                "auto-released on session end")
             # Release deferred locks (acquired mid-session) first, then
             # eager locks. Reverse of acquisition order in both lists.
-            for lk in reversed(self._deferred_locks):
+            for key, lk in reversed(self._deferred_locks):
+                self._mark_device_release(key)
                 lk.release()
-            for lk in reversed(eager_locks):
+            for key, lk in reversed(list(zip(eager_keys, eager_locks))):
+                self._mark_device_release(key)
                 lk.release()
             self.log_event("LOCK", "session", "released")
             # Tell the watchdog we're done so it doesn't fire after a
@@ -775,6 +813,18 @@ class Session:
 
     # --- device ops ---
 
+    def _mark_device_use(self, key):
+        if not _is_job_device_key(key) or key in self._usage_logged_keys:
+            return
+        self._usage_logged_keys.add(key)
+        _append_device_usage("use", key, self)
+
+    def _mark_device_release(self, key):
+        if key not in self._usage_logged_keys:
+            return
+        self._usage_logged_keys.remove(key)
+        _append_device_usage("release", key, self)
+
     def _resolve_device(self, device_ref):
         """Resolve with one targeted re-probe on miss.
 
@@ -818,8 +868,9 @@ class Session:
                 self._pinned_specs.add(key)
                 self.registry.pinned_specs[key] += 1
             lk.acquire()
-            self._deferred_locks.append(lk)
+            self._deferred_locks.append((key, lk))
             self._session_locked_keys.add(key)
+            self._mark_device_use(key)
             self._deferred_names.discard(plugin_name)
             self.log_event("LOCK", "session",
                            f"deferred acquire {key}")

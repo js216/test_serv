@@ -5,3 +5,4 @@ __pycache__/
 heartbeat.log
 watchdog.log
 stackdump.log
+devices.log

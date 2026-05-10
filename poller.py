@@ -1380,6 +1380,8 @@ SUPERVISOR_STACK_DUMP_GRACE_S = 1.0
 # knows not to recurse into another supervisor.
 _WORKER_FLAG = "--_worker"
 _HEARTBEAT_FD_ENV = "TEST_SERV_HEARTBEAT_FD"
+_LOCK_HELD_ENV = "TEST_SERV_POLLER_LOCK_HELD"
+_LOCK_FD_ENV = "TEST_SERV_POLLER_LOCK_FD"
 
 
 def _heartbeat_stale(last_heartbeat_mono, now=None):
@@ -1411,6 +1413,17 @@ def _supervise():
     """
     import subprocess
     import select
+
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    # Hold the singleton lock in the supervisor, not in each transient
+    # worker. This matters when poller.py itself is wrapped by an outer
+    # shell loop such as `while true; do timeout 3600 python3 poller.py;
+    # done`: timeout may kill/restart the supervisor while an old worker
+    # is still tearing down. If only workers lock, the replacement
+    # supervisor can start and fast-fail child after child on the old
+    # worker's lock. With supervisor-owned locking, a second supervisor
+    # refuses immediately and the outer loop naturally waits/retries.
+    _acquire_poller_lock()
 
     # Pass through any extra args (e.g. --no-supervisor's siblings if
     # we add some later, or --port / config overrides). argv[0] is
@@ -1455,6 +1468,15 @@ def _supervise():
         last_heartbeat_mono = start
         hb_r = hb_w = None
         env = os.environ.copy()
+        env[_LOCK_HELD_ENV] = "1"
+        pass_fds = []
+        if _poller_lock_fd is not None:
+            try:
+                os.set_inheritable(_poller_lock_fd, True)
+            except OSError:
+                pass
+            env[_LOCK_FD_ENV] = str(_poller_lock_fd)
+            pass_fds.append(_poller_lock_fd)
         try:
             hb_r, hb_w = os.pipe()
             try:
@@ -1463,7 +1485,8 @@ def _supervise():
                 pass
             os.set_inheritable(hb_w, True)
             env[_HEARTBEAT_FD_ENV] = str(hb_w)
-            p = subprocess.Popen(argv, pass_fds=(hb_w,), env=env)
+            pass_fds.append(hb_w)
+            p = subprocess.Popen(argv, pass_fds=tuple(pass_fds), env=env)
         except OSError as e:
             for fd in (hb_r, hb_w):
                 if fd is not None:
@@ -1586,7 +1609,8 @@ def _run_poller():
     # state dir can't race on PENDING/ uploads or duplicate-pickup
     # plans (rename gate handles the latter, but the cleaner
     # behaviour is "refuse the second poller and tell the operator").
-    _acquire_poller_lock()
+    if os.environ.get(_LOCK_HELD_ENV) != "1":
+        _acquire_poller_lock()
     _rotate_log_if_large(LOG)
     log_f = open(LOG, "a", buffering=1, encoding="utf-8", errors="replace")
     _log_f[0] = log_f

@@ -1,8 +1,12 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
-# do.sh --- TODO: description
+# do.sh --- Install bench udev permissions
 # Copyright (c) 2026 Jakob Kastelic
 set -e
+
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
 
 cat > /etc/udev/rules.d/99-bench-usb.rules <<'EOF'
 # --- FTDI ---
@@ -22,9 +26,15 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="f4ec", ATTR{idProduct}=="1011", MODE="0666"
 
 # --- STM32MP135 baremetal USB MSC bootloader: /dev/sdX writable by user ---
 SUBSYSTEM=="block", ATTRS{idVendor}=="0483", ATTRS{idProduct}=="571d", MODE="0666"
+
+# --- Any USB Mass Storage Class block device used as a DUT gadget ---
+SUBSYSTEM=="block", SUBSYSTEMS=="usb", ATTRS{bInterfaceClass}=="08", MODE="0666"
+
+# --- USB Test & Measurement Class (/dev/usbtmcN) ---
+KERNEL=="usbtmc[0-9]*", MODE="0666", TAG+="uaccess"
 EOF
 
 udevadm control --reload-rules
 udevadm trigger --action=change || true
 
-echo "Bench USB rules updated. Replug new devices when ready."
+echo "Bench USB rules updated. Replug devices if existing nodes did not change."

@@ -26,5 +26,8 @@ pyusb>=1.2
 pyvisa>=1.13
 pyvisa-py>=0.7
 
+# Plain WebSocket client -- ws plugin network stream tests.
+websocket-client>=1.7
+
 # Trace processing -- scope (downsampling + signal analysis).
 numpy>=1.23
