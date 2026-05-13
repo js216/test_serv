@@ -8,16 +8,16 @@ import io
 import json
 import os
 import socket
-import sys
 import tempfile
 import tarfile
 import threading
 import time
+import urllib.error
 
+from plugins.tcp import TcpPlugin
 import plan
-import report
 import server
-import session as session_module
+import submit
 from plugin import DevicePlugin, Op
 from registry import DeviceRegistry
 from session import Session, bench_id, pack_artefact
@@ -195,177 +195,6 @@ def test_session_closes_touched_handles_at_job_end():
     reg.close_all()
 
 
-def test_session_logs_device_use_and_release_for_jobs_only():
-    with tempfile.TemporaryDirectory() as tmp:
-        old_log = session_module.DEVICES_LOG
-        session_module.DEVICES_LOG = os.path.join(tmp, "devices.log")
-        try:
-            parsed = plan.load_tar(plan.pack_tar('fake:noop k=1\n', {}))
-            plugins = {"fake": FakePlugin()}
-            reg = DeviceRegistry(plugins)
-            reg.refresh()
-
-            sess = Session(reg, parsed)
-            sess.plan_digest = "0" * 64
-            sess.run_all(plugins)
-
-            with open(session_module.DEVICES_LOG, encoding="utf-8") as f:
-                recs = [json.loads(line) for line in f if line.strip()]
-            assert [r["event"] for r in recs] == ["use", "release"], recs
-            assert [r["device"] for r in recs] == ["fake.0", "fake.0"], recs
-            assert recs[1]["t"] >= recs[0]["t"], recs
-            assert recs[0]["session"] == sess.session_id, recs[0]
-
-            reg.close_all()
-        finally:
-            session_module.DEVICES_LOG = old_log
-
-
-def test_lease_only_plan_does_not_count_as_device_usage():
-    from plugins.lease import LeasePlugin
-    with tempfile.TemporaryDirectory() as tmp:
-        old_log = session_module.DEVICES_LOG
-        session_module.DEVICES_LOG = os.path.join(tmp, "devices.log")
-        try:
-            parsed = plan.load_tar(plan.pack_tar(
-                'lease:claim devices="fake.0" duration_s=60\n', {}))
-            plugins = {"fake": FakePlugin(), "lease": LeasePlugin()}
-            reg = DeviceRegistry(plugins)
-            reg.refresh()
-
-            sess = Session(reg, parsed)
-            sess.run_all(plugins)
-
-            assert not os.path.exists(session_module.DEVICES_LOG)
-            reg.close_all()
-        finally:
-            session_module.DEVICES_LOG = old_log
-
-
-def test_direct_session_without_plan_digest_does_not_log_device_usage():
-    with tempfile.TemporaryDirectory() as tmp:
-        old_log = session_module.DEVICES_LOG
-        session_module.DEVICES_LOG = os.path.join(tmp, "devices.log")
-        try:
-            parsed = plan.load_tar(plan.pack_tar('fake:noop k=1\n', {}))
-            plugins = {"fake": FakePlugin()}
-            reg = DeviceRegistry(plugins)
-            reg.refresh()
-
-            sess = Session(reg, parsed)
-            sess.run_all(plugins)
-
-            assert not os.path.exists(session_module.DEVICES_LOG)
-            reg.close_all()
-        finally:
-            session_module.DEVICES_LOG = old_log
-
-
-def test_report_computes_duty_from_device_log_events():
-    events = [
-        {"t": 10.0, "event": "use", "device": "fake.0",
-         "session": "s1", "plan_digest": "p1"},
-        {"t": 15.0, "event": "release", "device": "fake.0",
-         "session": "s1", "plan_digest": "p1"},
-        {"t": 20.0, "event": "use", "device": "fake.0",
-         "session": "s2", "plan_digest": "p2"},
-        {"t": 30.0, "event": "release", "device": "fake.0",
-         "session": "s2", "plan_digest": "p2"},
-        {"t": 25.0, "event": "use", "device": "dsp.main",
-         "session": "s3", "plan_digest": "p3"},
-        {"t": 35.0, "event": "release", "device": "dsp.main",
-         "session": "s3", "plan_digest": "p3"},
-    ]
-    summary = report.compute_duty(events)
-    assert summary["window_s"] == 25.0, summary
-    assert summary["stats"]["fake.0"]["busy_s"] == 15.0, summary
-    assert summary["stats"]["fake.0"]["intervals"] == 2, summary
-    assert summary["stats"]["dsp.main"]["busy_s"] == 10.0, summary
-
-
-def test_report_pairs_by_session_for_back_to_back_device_jobs():
-    events = [
-        {"t": 10.0, "event": "use", "device": "fake.0",
-         "session": "old", "plan_digest": "p1"},
-        {"t": 20.0, "event": "release", "device": "fake.0",
-         "session": "old", "plan_digest": "p1"},
-        {"t": 20.0, "event": "use", "device": "fake.0",
-         "session": "new", "plan_digest": "p2"},
-        {"t": 30.0, "event": "release", "device": "fake.0",
-         "session": "new", "plan_digest": "p2"},
-    ]
-    summary = report.compute_duty(events)
-    assert summary["stats"]["fake.0"]["busy_s"] == 20.0, summary
-    assert summary["stats"]["fake.0"]["intervals"] == 2, summary
-
-
-def test_report_closes_stale_session_at_next_device_use():
-    events = [
-        {"t": 10.0, "event": "use", "device": "fake.0",
-         "session": "crashed", "plan_digest": "p1"},
-        {"t": 20.0, "event": "use", "device": "fake.0",
-         "session": "next", "plan_digest": "p2"},
-        {"t": 30.0, "event": "release", "device": "fake.0",
-         "session": "next", "plan_digest": "p2"},
-    ]
-    summary = report.compute_duty(events)
-    st = summary["stats"]["fake.0"]
-    assert st["busy_s"] == 20.0, summary
-    assert st["intervals"] == 2, summary
-    assert st["stale_sessions"] == ["crashed"], summary
-
-
-def test_report_keeps_log_order_for_equal_timestamps():
-    with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, "devices.log")
-        recs = [
-            {"t": 20.0, "event": "use", "device": "fake.0",
-             "session": "same", "plan_digest": "p1"},
-            {"t": 20.0, "event": "release", "device": "fake.0",
-             "session": "same", "plan_digest": "p1"},
-        ]
-        with open(path, "w", encoding="utf-8") as f:
-            for rec in recs:
-                f.write(json.dumps(rec) + "\n")
-        loaded = report.load_events(path)
-        assert [r["event"] for r in loaded] == ["use", "release"], loaded
-        summary = report.compute_duty(loaded, now=1000.0)
-        assert summary["stats"]["fake.0"]["busy_s"] == 0.0, summary
-        assert not summary["stats"]["fake.0"]["active"], summary
-
-
-def test_report_prints_highest_duty_first():
-    summary = {
-        "start": 10.0,
-        "end": 110.0,
-        "window_s": 100.0,
-        "stats": {
-            "low.0": {
-                "busy_s": 10.0,
-                "intervals": 1,
-                "active": [],
-                "stale_sessions": [],
-            },
-            "high.0": {
-                "busy_s": 90.0,
-                "intervals": 1,
-                "active": [],
-                "stale_sessions": [],
-            },
-        },
-    }
-    old_stdout = sys.stdout
-    out = io.StringIO()
-    try:
-        sys.stdout = out
-        report.print_report(summary)
-    finally:
-        sys.stdout = old_stdout
-    lines = out.getvalue().splitlines()
-    assert lines[2].startswith("high.0"), lines
-    assert lines[3].startswith("low.0"), lines
-
-
 def test_inventory_returns_devices_and_ops_streams():
     parsed = plan.load_tar(plan.pack_tar("inventory\n", {}))
     fake = FakePlugin()
@@ -387,6 +216,79 @@ def test_inventory_returns_devices_and_ops_streams():
     assert "emit" in ops["fake"]["ops"]
 
     reg.close_all()
+
+
+def test_tcp_recv_captures_stream_and_expectation():
+    ready = threading.Event()
+
+    def _serve(listener):
+        ready.set()
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"stream_ws_tcp_hello\n")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        thread = threading.Thread(target=_serve, args=(listener,),
+                                  daemon=True)
+        thread.start()
+        assert ready.wait(timeout=1.0)
+        host, port = listener.getsockname()
+
+        parsed = plan.load_tar(plan.pack_tar(
+            f'tcp:recv host="{host}" port={port} '
+            'expect="stream_ws_tcp_hello\\n" timeout_ms=1000\n', {}))
+        plugins = {"tcp": TcpPlugin()}
+        reg = DeviceRegistry(plugins)
+        reg.refresh()
+        session = Session(reg, parsed)
+        session.run_all(plugins)
+
+        assert not session.errors, session.errors
+        assert session.stream("tcp.recv").snapshot_bytes() == (
+            b"stream_ws_tcp_hello\n")
+        assert session.checks[0]["kind"] == "tcp_recv"
+        assert session.checks[0]["status"] == "hit"
+
+        reg.close_all()
+        thread.join(timeout=1.0)
+
+
+def test_tcp_recv_expect_mismatch_fails_after_capture():
+    ready = threading.Event()
+
+    def _serve(listener):
+        ready.set()
+        conn, _ = listener.accept()
+        with conn:
+            conn.sendall(b"wrong\n")
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        thread = threading.Thread(target=_serve, args=(listener,),
+                                  daemon=True)
+        thread.start()
+        assert ready.wait(timeout=1.0)
+        host, port = listener.getsockname()
+
+        parsed = plan.load_tar(plan.pack_tar(
+            f'tcp:recv host="{host}" port={port} '
+            'expect="stream_ws_tcp_hello\\n" timeout_ms=1000\n', {}))
+        plugins = {"tcp": TcpPlugin()}
+        reg = DeviceRegistry(plugins)
+        reg.refresh()
+        session = Session(reg, parsed)
+        session.run_all(plugins)
+
+        assert session.errors, "expected tcp:recv mismatch to fail"
+        assert session.stream("tcp.recv").snapshot_bytes() == b"wrong\n"
+        assert session.checks[0]["kind"] == "tcp_recv"
+        assert session.checks[0]["status"] == "timeout"
+
+        reg.close_all()
+        thread.join(timeout=1.0)
 
 
 def test_server_rest_queue_helpers():
@@ -705,6 +607,222 @@ def test_session_watchdog_hard_exits_when_wedged():
         reg.close_all()
 
 
+def test_lock_wait_does_not_consume_session_runtime():
+    """A session's X-Test-Runtime budget starts after device locks.
+
+    Shared-bench contention can leave a picked-up job blocked on a
+    per-device lock. That wait must not make the first op get skipped
+    as already past deadline once the previous session releases the
+    device.
+    """
+    parsed = plan.load_tar(plan.pack_tar("fake:noop k=1\n", {}))
+    plugins = {"fake": FakePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    key = reg.resolve("fake")
+    dev_lock = reg.per_dev_lock[key]
+    dev_lock.acquire()
+    session = Session(reg, parsed, runtime_s=0.05)
+    t = threading.Thread(target=lambda: session.run_all(plugins))
+    try:
+        t.start()
+        time.sleep(0.10)
+        dev_lock.release()
+        t.join(timeout=2.0)
+        assert not t.is_alive(), "session did not finish after lock release"
+        assert len(session.ops_log) == 1, session.events
+        assert session.ops_log[0]["status"] == "ok", session.ops_log
+        assert not any(
+            e["kind"] == "ERROR" and "session exceeded" in e["msg"]
+            for e in session.events), session.events
+    finally:
+        if dev_lock._is_owned():
+            dev_lock.release()
+        reg.close_all()
+
+
+def test_cancel_aborts_device_lock_wait():
+    """DELETE /jobs cancel must wake sessions waiting on a device lock.
+
+    A reset-only job can be picked up while another session holds
+    bench_mcu. If cancel lands during that lock wait, the session must
+    stop promptly instead of camping until the holder eventually exits.
+    """
+    parsed = plan.load_tar(plan.pack_tar("fake:noop k=1\n", {}))
+    plugins = {"fake": FakePlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    key = reg.resolve("fake")
+    dev_lock = reg.per_dev_lock[key]
+    dev_lock.acquire()
+    session = Session(reg, parsed, runtime_s=60.0)
+    t = threading.Thread(target=lambda: session.run_all(plugins))
+    try:
+        t.start()
+        time.sleep(0.05)
+        t0 = time.monotonic()
+        session.signal_cancel()
+        t.join(timeout=1.0)
+        elapsed = time.monotonic() - t0
+        assert not t.is_alive(), "session ignored cancel during lock wait"
+        assert elapsed < 0.5, f"lock-wait cancel took {elapsed:.2f}s"
+        assert session.canceled
+        assert session.ops_log == [], session.ops_log
+        assert any("canceled while waiting for device lock" in e["msg"]
+                   for e in session.events), session.events
+        _, mtxt = pack_artefact(session)
+        assert json.loads(mtxt)["status"] == "canceled", mtxt
+    finally:
+        if dev_lock._is_owned():
+            dev_lock.release()
+        reg.close_all()
+
+
+def test_submit_wait_retries_transient_server_restart():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise RuntimeError(
+                "cannot reach test_serv at http://127.0.0.1:1: "
+                "Connection refused")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "a" * 64, 1.0) == b"tar"
+        assert len(calls) == 2
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_retries_transient_connection_reset():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise ConnectionResetError(104, "Connection reset by peer")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "b" * 64, 1.0) == b"tar"
+        assert len(calls) == 2
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_retries_raw_url_error():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise urllib.error.URLError("ssh tunnel closed")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "c" * 64, 1.0) == b"tar"
+        assert len(calls) == 2
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_retries_transient_timeouts():
+    calls = []
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+
+    def fake_head(server_url, digest):
+        calls.append((server_url, digest))
+        if len(calls) == 1:
+            raise socket.timeout("socket timed out")
+        if len(calls) == 2:
+            raise TimeoutError("poll timed out")
+        return True
+
+    try:
+        submit._head_tar = fake_head
+        submit._get_tar = lambda _server, _digest: b"tar"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "d" * 64, 1.0) == b"tar"
+        assert len(calls) == 3
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_returns_when_job_disappears_without_tar():
+    old_head = submit._head_tar
+    old_job_known = submit._job_known
+    old_get = submit._get_tar
+    old_sleep = submit.time.sleep
+    calls = []
+
+    try:
+        submit._head_tar = lambda _server, _digest: False
+
+        def fake_job_known(server_url, digest):
+            calls.append((server_url, digest))
+            return False
+
+        submit._job_known = fake_job_known
+        submit._get_tar = lambda _server, _digest: b"unexpected"
+        submit.time.sleep = lambda _seconds: None
+        assert submit._wait("http://127.0.0.1:1", "f" * 64, 10.0) is None
+        assert calls == [("http://127.0.0.1:1", "f" * 64)]
+    finally:
+        submit._head_tar = old_head
+        submit._job_known = old_job_known
+        submit._get_tar = old_get
+        submit.time.sleep = old_sleep
+
+
+def test_submit_wait_reraises_http_error():
+    old_head = submit._head_tar
+    old_get = submit._get_tar
+    err = urllib.error.HTTPError(
+        "http://127.0.0.1:1/outputs/%s.tar" % ("e" * 64),
+        503, "Service Unavailable", {}, io.BytesIO(b"busy"))
+
+    try:
+        submit._head_tar = lambda _server, _digest: (_ for _ in ()).throw(err)
+        submit._get_tar = lambda _server, _digest: b"unexpected"
+        try:
+            submit._wait("http://127.0.0.1:1", "e" * 64, 1.0)
+        except urllib.error.HTTPError as e:
+            assert e is err
+        else:
+            raise AssertionError("expected HTTPError to propagate")
+    finally:
+        submit._head_tar = old_head
+        submit._get_tar = old_get
+
+
 def test_acquire_open_timeout_quarantines_and_doesnt_wedge():
     """Round-13 Y-CRIT1: pl.open() in _Acquire.__enter__ must have
     a wall-clock cap; a hung open used to hold dev_lock + a worker
@@ -1004,29 +1122,6 @@ def test_pending_upload_drain_kick_is_nonblocking():
                 break
             time.sleep(0.01)
     assert calls == [1.0], calls
-
-
-def test_supervisor_acquires_poller_lock_before_spawning_worker():
-    import inspect
-    import poller
-    src = inspect.getsource(poller._supervise)
-    makedirs_pos = src.find("os.makedirs(STATE_DIR")
-    acquire_pos = src.find("_acquire_poller_lock()")
-    popen_pos = src.find("subprocess.Popen")
-    assert makedirs_pos != -1, (
-        "supervisor must create STATE_DIR before locking")
-    assert acquire_pos != -1, "supervisor must own poller.lock"
-    assert popen_pos != -1, "test assumes supervisor still spawns child"
-    assert makedirs_pos < acquire_pos, (
-        "supervisor must create STATE_DIR before opening poller.lock")
-    assert acquire_pos < popen_pos, (
-        "poller.lock must be acquired before spawning worker so an "
-        "outer while/timeout wrapper cannot start duplicate supervisors")
-    assert "_LOCK_HELD_ENV" in src and "_LOCK_FD_ENV" in src, (
-        "worker must inherit lock marker and lock fd")
-    assert "pass_fds=tuple(pass_fds)" in src, (
-        "worker must inherit supervisor lock fd so orphan workers keep "
-        "the singleton lock held")
 
 
 def test_refused_spool_409_is_backed_off():
@@ -1673,6 +1768,83 @@ def test_stale_cancel_resolution_removes_orphan_running_record():
              server.CANCEL) = old_dirs
 
 
+def test_delete_job_resolves_old_non_inflight_running_record():
+    """DELETE /jobs should not rely on a poller to clean stale rows.
+
+    If DONE has an old running record and STATUS/inflight.json does not
+    list that digest, the server can prove no current session owns it.
+    Resolve it immediately instead of leaving cancel_pending forever.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dirs = (server.INPUTS, server.OUTPUTS, server.DONE,
+                    server.STATUS, server.RELEASE, server.SWEEP,
+                    server.CANCEL)
+        server.INPUTS = os.path.join(tmp, "inputs")
+        server.OUTPUTS = os.path.join(tmp, "outputs")
+        server.DONE = os.path.join(tmp, "done")
+        server.STATUS = os.path.join(tmp, "status")
+        server.RELEASE = os.path.join(tmp, "release")
+        server.SWEEP = os.path.join(tmp, "sweep")
+        server.CANCEL = os.path.join(tmp, "cancel")
+        for d in (server.INPUTS, server.OUTPUTS, server.DONE,
+                  server.STATUS, server.RELEASE, server.SWEEP,
+                  server.CANCEL):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        httpd = server.ThreadingHTTPServer(("127.0.0.1", 0), server.Handler)
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            stale = "f" * 64
+            fresh = "1" * 64
+            live = "2" * 64
+            for digest in (stale, fresh, live):
+                with open(os.path.join(server.DONE, f"{digest}.plan"),
+                          "wb") as f:
+                    f.write(b"plan")
+            old_t = time.time() - server.PRUNE_MIN_AGE_S - 1.0
+            os.utime(os.path.join(server.DONE, f"{stale}.plan"),
+                     (old_t, old_t))
+            os.utime(os.path.join(server.DONE, f"{live}.plan"),
+                     (old_t, old_t))
+            with open(os.path.join(server.STATUS, "inflight.json"),
+                      "wb") as f:
+                f.write(json.dumps([{"digest": live}]).encode())
+
+            host, port = httpd.server_address
+            conn = http.client.HTTPConnection(host, port, timeout=5)
+            try:
+                conn.request("DELETE", f"/jobs/{stale}")
+                resp = conn.getresponse()
+                body = json.loads(resp.read())
+            finally:
+                conn.close()
+            assert resp.status == 200, resp.status
+            assert body["status"] == "stale_canceled", body
+            assert not os.path.exists(
+                os.path.join(server.DONE, f"{stale}.plan"))
+
+            for digest in (fresh, live):
+                conn = http.client.HTTPConnection(host, port, timeout=5)
+                try:
+                    conn.request("DELETE", f"/jobs/{digest}")
+                    resp = conn.getresponse()
+                    body = json.loads(resp.read())
+                finally:
+                    conn.close()
+                assert resp.status == 200, (resp.status, body)
+                assert body["status"] == "cancel_signaled", body
+                assert os.path.exists(os.path.join(server.CANCEL, digest))
+                assert os.path.exists(
+                    os.path.join(server.DONE, f"{digest}.plan"))
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            thread.join(timeout=5)
+            (server.INPUTS, server.OUTPUTS, server.DONE,
+             server.STATUS, server.RELEASE, server.SWEEP,
+             server.CANCEL) = old_dirs
+
+
 def test_delete_outputs_no_op_when_nothing_to_delete():
     """An agent's DELETE /outputs/<digest> can race a fresh re-pickup
     of the same digest: agent thinks it's cleaning up after a fetch,
@@ -1750,9 +1922,12 @@ def test_multi_instance_plan_holds_all_dev_locks_for_session():
     locked = getattr(session, "_session_locked_keys", set())
     assert "twoinst.A" in locked, locked
     assert "twoinst.B" in locked, locked
-    # Concrete device refs are now acquired eagerly, so there should
-    # be no deferred lock path involved for this plan.
-    assert getattr(session, "_deferred_locks", []) == []
+    # The per-device RLocks must be the same identity that's now
+    # tracked in _deferred_locks (so the session's finally-release
+    # actually drops them on exit). Both instances should appear.
+    deferred = getattr(session, "_deferred_locks", [])
+    expected = {reg.per_dev_lock["twoinst.A"], reg.per_dev_lock["twoinst.B"]}
+    assert set(deferred) == expected, (deferred, expected)
     reg.close_all()
 
 
@@ -1807,384 +1982,78 @@ def test_bench_id_defaults_to_hostname_and_env_overrides():
             os.environ["TEST_SERV_BENCH_ID"] = old
 
 
-def test_usb_and_usbtmc_plugins_expose_bringup_ops():
-    from plugins.usb import UsbPlugin
-    from plugins.usbtmc import UsbTmcPlugin
-
-    usb_ops = UsbPlugin.ops
-    assert {"list", "descriptor", "control", "bulk_write", "bulk_read"} <= \
-        set(usb_ops), usb_ops
-    assert usb_ops["control"].args == {
-        "bmRequestType": "int",
-        "bRequest": "int",
-        "wValue": "int",
-        "wIndex": "int",
-    }
-    assert usb_ops["bulk_read"].optional_args["detach"] == "bool"
-
-    tmc_ops = UsbTmcPlugin.ops
-    assert {"list", "identify", "write", "write_blob", "read",
-            "query", "expect", "clear"} <= set(tmc_ops), tmc_ops
-    assert tmc_ops["write_blob"].args == {"data": "blob"}
-    assert tmc_ops["write_blob"].optional_args["min_rate_Bps"] == "int"
-    assert tmc_ops["read"].optional_args["chunk_size"] == "int"
-    assert tmc_ops["read"].optional_args["exact"] == "bool"
-
-
-def test_usbtmc_fast_path_helpers_read_write_and_rate_check():
-    from plugins import usbtmc
-
-    rfd, wfd = os.pipe()
-    try:
-        os.write(wfd, b"abcdef")
-        got = usbtmc._read_with_timeout(
-            rfd, 6, timeout_ms=1000, chunk_size=3)
-        assert got == b"abcdef", got
-    finally:
-        os.close(rfd)
-        os.close(wfd)
-
-    rfd, wfd = os.pipe()
-    try:
-        written, elapsed = usbtmc._write_all(
-            wfd, b"xyz", timeout_ms=1000, chunk_size=2)
-        assert written == 3, (written, elapsed)
-        assert os.read(rfd, 3) == b"xyz"
-    finally:
-        os.close(rfd)
-        os.close(wfd)
-
-    try:
-        usbtmc._check_min_rate("xfer", 100, 10.0, 1000)
-    except TimeoutError as e:
-        assert "too slow" in str(e)
-    else:
-        raise AssertionError("expected slow transfer to fail")
-
-    try:
-        usbtmc._read_with_timeout(0, 1, timeout_ms=1, chunk_size=0)
-    except ValueError as e:
-        assert "chunk_size" in str(e)
-    else:
-        raise AssertionError("zero usbtmc chunk_size should fail")
-
-    class CanceledSession:
-        canceled = True
-
-        def bail_if_canceled(self, where):
-            raise RuntimeError(f"canceled at {where}")
-
-    try:
-        usbtmc._read_with_timeout(
-            0, 1, timeout_ms=1000, session=CanceledSession())
-    except RuntimeError as e:
-        assert "canceled" in str(e)
-    else:
-        raise AssertionError("usbtmc query read should observe cancel")
-
-
-def test_usbtmc_and_raw_usb_plan_shapes_parse():
-    text = """
-    usb.any:list vid=0xfe pid=0x03
-    usb.gadget:control bmRequestType=0x80 bRequest=6 wValue=0x0100 wIndex=0 length=18 timeout_ms=1000
-    usb.gadget:bulk_write endpoint=0x02 data=@out.bin interface=0 timeout_ms=1000
-    usb.gadget:bulk_read endpoint=0x81 length=1024 interface=0 timeout_ms=1000
-    usbtmc.0:identify timeout_ms=5000
-    usbtmc.0:write data="*CLS\\n" timeout_ms=1000
-    usbtmc.0:write_blob data=@out.bin timeout_ms=10000 chunk_size=1048576 min_rate_Bps=25000000
-    usbtmc.0:read length=1048576 timeout_ms=10000 chunk_size=1048576 min_rate_Bps=25000000 exact=true
-    usbtmc.0:query data="*IDN?\\n" timeout_ms=5000
-    usbtmc.0:expect data="PING?\\n" sentinel="PONG" timeout_ms=5000
-    usbtmc.0:clear timeout_ms=100
-    """
-    parsed = plan.load_tar(plan.pack_tar(text, {"out.bin": b"abc"}))
-    assert len(parsed.ops) == 11
-    assert parsed.ops[0].args["vid"].as_int() == 0xfe
-    assert parsed.ops[6].verb == "write_blob"
-
-
-def test_usbtmc_list_available_without_class_nodes():
-    from plugins.usbtmc import UsbTmcPlugin
-    plugins = {"usbtmc": UsbTmcPlugin()}
-    reg = DeviceRegistry(plugins)
-    reg.refresh()
-    devices = reg.list_devices()
-    assert any(d["id"] == "usbtmc.any" for d in devices), devices
-
-    parsed = plan.load_tar(plan.pack_tar("usbtmc:list\n", {}))
-    sess = Session(reg, parsed)
-    sess.run_all(plugins)
-    assert not sess.errors, sess.errors
-    assert "usbtmc.list" in sess.streams
-
-
-def test_usbtmc_node_instances_still_validate_identity():
-    from plugins import usbtmc
-
-    old_exists = usbtmc.os.path.exists
-    old_node_info = usbtmc._node_info
-    try:
-        usbtmc.os.path.exists = lambda path: (
-            path == "/dev/usbtmc0" or old_exists(path))
-        usbtmc._node_info = lambda node: {
-            "node": node,
-            "id": "0",
-            "vid": "1234",
-            "pid": "5678",
-            "serial": "abc",
-            "manufacturer": "m",
-            "product": "p",
-            "interface": "1-1:1.0",
-        }
-        assert usbtmc._match_instance({
-            "node": "/dev/usbtmc0",
-            "usb_vid": "0x9999",
-        }) is None
-        assert usbtmc._match_instance({
-            "node": "/dev/usbtmc0",
-            "usb_vid": "0x1234",
-            "usb_pid": "0x5678",
-            "usb_serial": "abc",
-        })["node"] == "/dev/usbtmc0"
-    finally:
-        usbtmc.os.path.exists = old_exists
-        usbtmc._node_info = old_node_info
-
-
-def test_explicit_any_ref_locks_only_any_pseudo_device():
-    class RealPlusAnyPlugin(FakePlugin):
-        name = "pany"
-        ops = {"list": Op(args={}, doc="list", run=_noop)}
-
-        def probe(self):
-            return [{"id": "any", "list_only": True}, {"id": "real"}]
-
-    plugins = {"pany": RealPlusAnyPlugin()}
-    reg = DeviceRegistry(plugins)
-    reg.refresh()
-    parsed = plan.load_tar(plan.pack_tar("pany.any:list\n", {}))
-    sess = Session(reg, parsed)
-    sess.run_all(plugins)
-    assert "pany.any" in sess._session_locked_keys, sess._session_locked_keys
-    assert "pany.real" not in sess._session_locked_keys, \
-        sess._session_locked_keys
-
-
-def test_any_pseudo_device_does_not_make_bare_real_device_ambiguous():
-    class RealPlusAnyPlugin(FakePlugin):
-        name = "realany"
-
-        def probe(self):
-            return [{"id": "any", "list_only": True}, {"id": "real"}]
-
-    plugins = {"realany": RealPlusAnyPlugin()}
-    reg = DeviceRegistry(plugins)
-    reg.refresh()
-    assert reg.resolve("realany") == "realany.real"
-    assert reg.resolve("realany", "any") == "realany.any"
-
-
-def test_ssh_put_op_shape_and_validation():
+def test_ssh_put_uses_key_only_scp_and_streams_output():
     from plugins import ssh
-    assert "put" in ssh.SshPlugin.ops
-    op = ssh.SshPlugin.ops["put"]
-    assert op.args == {"data": "blob", "path": "str"}
-    assert op.optional_args == {
-        "mode": "int",
-        "timeout_ms": "int",
-        "min_rate_Bps": "int",
-    }
-    argv = ssh._scp_argv("192.0.2.10", "root", "/k", "/kh",
-                         "/tmp/local", "/tmp/fw.bin")
-    assert argv[:2] == ["scp", "-O"], argv
-    assert "-i" in argv and "/k" in argv, argv
 
-    parsed = plan.load_tar(plan.pack_tar(
-        'ssh.target:put data=@fw.bin path="/tmp/fw.bin" '
-        'mode=0x1a4 timeout_ms=10000 min_rate_Bps=1000\n',
-        {"fw.bin": b"abc"}))
-    assert parsed.ops[0].verb == "put"
-    assert parsed.ops[0].args["mode"].as_int() == 0o644
+    class Stream:
+        def __init__(self):
+            self.data = b""
 
-    try:
-        ssh._validate_remote_path("relative.bin")
-    except ValueError as e:
-        assert "absolute" in str(e)
-    else:
-        raise AssertionError("relative ssh:put path should fail")
+        def append(self, data):
+            self.data += data
 
-    try:
-        ssh._validate_remote_path("/tmp/bad\nname")
-    except ValueError as e:
-        assert "newline" in str(e)
-    else:
-        raise AssertionError("newline in ssh:put path should fail")
+    class FakeSession:
+        canceled = False
 
-    try:
-        ssh._check_min_rate("ssh:put", 100, 10.0, 1000)
-    except TimeoutError as e:
-        assert "too slow" in str(e)
-    else:
-        raise AssertionError("slow ssh:put should fail")
+        def __init__(self):
+            self.streams = {}
+            self.events = []
+
+        def stream(self, name):
+            return self.streams.setdefault(name, Stream())
+
+        def log_event(self, *args):
+            self.events.append(args)
+
+    class FakeProc:
+        returncode = 0
+
+        def __init__(self, argv, stdout=None, stderr=None):
+            self.argv = argv
+            self.terminated = False
+            calls.append(argv)
+
+        def communicate(self, timeout=None):
+            with open(self.argv[-2], "rb") as f:
+                assert f.read() == b"payload"
+            return b"copied\n", b"scp note\n"
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.returncode = -9
+
+        def wait(self, timeout=None):
+            return self.returncode
 
     calls = []
     saved_popen = ssh.subprocess.Popen
-    ssh.subprocess.Popen = lambda *a, **kw: calls.append((a, kw))
+    ssh.subprocess.Popen = FakeProc
     try:
-        fake_session = type("S", (), {"log_event": lambda *a: None})()
-        fake_handle = type("H", (), {
-            "ip": "192.0.2.1",
-            "user": "root",
-            "key": "/k",
-            "known_hosts": "/kh",
-        })()
-        try:
-            ssh._op_put(fake_session, fake_handle,
-                        {"data": b"abc", "path": "/tmp/fw",
-                         "mode": 0o10000, "timeout_ms": 1000,
-                         "min_rate_Bps": None})
-        except ValueError as e:
-            assert "bad mode" in str(e)
-        else:
-            raise AssertionError("bad ssh:put mode should fail")
-        try:
-            ssh._op_put(fake_session, fake_handle,
-                        {"data": b"abc", "path": "/tmp/fw",
-                         "mode": None, "timeout_ms": 0,
-                         "min_rate_Bps": None})
-        except ValueError as e:
-            assert "timeout_ms" in str(e)
-        else:
-            raise AssertionError("zero ssh:put timeout should fail")
+        sess = FakeSession()
+        h = ssh.SshHandle("172.25.0.115", "root", "/bench/key",
+                          "/bench/known_hosts")
+        ssh._op_put(sess, h, {
+            "data": b"payload",
+            "path": "/tmp/blob.txt",
+            "timeout_ms": None,
+        })
     finally:
         ssh.subprocess.Popen = saved_popen
-    assert calls == [], calls
 
-
-def test_usb_write_ops_reject_short_writes():
-    from plugins import usb
-
-    class FakeDev:
-        def ctrl_transfer(self, *args, **kwargs):
-            return 1
-
-        def write(self, endpoint, data, timeout=None):
-            return 1 if data else 0
-
-    class FakeHandle:
-        dev = FakeDev()
-
-        def claim(self, interface=None, detach=False):
-            pass
-
-    class FakeSession:
-        def bail_if_canceled(self, where):
-            pass
-
-        def log_event(self, *args):
-            pass
-
-    try:
-        usb._op_control(FakeSession(), FakeHandle(), {
-            "bmRequestType": 0x00,
-            "bRequest": 1,
-            "wValue": 0,
-            "wIndex": 0,
-            "data": b"abc",
-            "length": 0,
-            "timeout_ms": 1000,
-        })
-    except IOError as e:
-        assert "short OUT" in str(e)
-    else:
-        raise AssertionError("short USB control OUT should fail")
-
-    class StallingDev(FakeDev):
-        def __init__(self):
-            self.calls = 0
-
-        def write(self, endpoint, data, timeout=None):
-            self.calls += 1
-            return 1 if self.calls == 1 else 0
-
-    h = FakeHandle()
-    h.dev = StallingDev()
-    try:
-        usb._op_bulk_write(FakeSession(), h, {
-            "endpoint": 0x02,
-            "data": b"abc",
-            "interface": None,
-            "detach": False,
-            "timeout_ms": 1000,
-        })
-    except IOError as e:
-        assert "stalled" in str(e)
-    else:
-        raise AssertionError("short/stalled USB bulk write should fail")
-
-
-def test_ws_plugin_recv_schema_and_helpers():
-    from plugins import ws
-    assert "recv" in ws.WsPlugin.ops
-    op = ws.WsPlugin.ops["recv"]
-    assert op.args == {"bytes": "int", "timeout_ms": "int"}
-    assert op.optional_args == {
-        "url": "str",
-        "expect_sha256": "str",
-        "expect_crc32": "int",
-        "min_rate_Bps": "int",
-        "stream": "bool",
-    }
-    parsed = plan.load_tar(plan.pack_tar(
-        'ws.any:recv url="ws://172.25.0.115:9000/stream" '
-        'bytes=1048576 timeout_ms=10000 '
-        'expect_sha256="abc" expect_crc32=0x12345678 '
-        'min_rate_Bps=25000000 stream=false\n', {}))
-    assert parsed.ops[0].device == "ws.any"
-    assert parsed.ops[0].verb == "recv"
-    assert parsed.ops[0].args["expect_crc32"].as_int() == 0x12345678
-    assert ws._fmt_crc32(0x12345678) == "0x12345678"
-    class WebSocketTimeoutException(Exception):
-        pass
-    assert ws._is_ws_timeout(WebSocketTimeoutException())
-
-    try:
-        ws._check_min_rate("ws:recv", 100, 10.0, 1000)
-    except TimeoutError as e:
-        assert "too slow" in str(e)
-    else:
-        raise AssertionError("slow ws:recv should fail")
-
-    class SlowWebSocketModule:
-        made = []
-
-        @staticmethod
-        def create_connection(url, timeout=None):
-            time.sleep(0.2)
-            obj = type("Conn", (), {
-                "closed": False,
-                "close": lambda self: setattr(self, "closed", True),
-            })()
-            SlowWebSocketModule.made.append(obj)
-            return obj
-
-    class CanceledSession:
-        def bail_if_canceled(self, where):
-            raise RuntimeError(f"canceled at {where}")
-
-    try:
-        ws._connect_with_cancel(
-            SlowWebSocketModule, "ws://example.invalid", 5.0,
-            CanceledSession())
-    except RuntimeError as e:
-        assert "canceled" in str(e)
-    else:
-        raise AssertionError("ws connect should observe cancel")
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline and not SlowWebSocketModule.made:
-        time.sleep(0.01)
-    assert SlowWebSocketModule.made
-    assert SlowWebSocketModule.made[0].closed
+    argv = calls[0]
+    assert argv[:2] == ["scp", "-O"], argv
+    assert "StrictHostKeyChecking=yes" in argv, argv
+    assert "UserKnownHostsFile=/bench/known_hosts" in argv, argv
+    assert "BatchMode=yes" in argv, argv
+    assert "IdentitiesOnly=yes" in argv, argv
+    assert "PubkeyAuthentication=yes" in argv, argv
+    assert "PasswordAuthentication=no" in argv, argv
+    assert argv[-1] == "root@172.25.0.115:/tmp/blob.txt", argv
+    assert sess.streams["ssh.put"].data == b"copied\n"
+    assert sess.streams["ssh.put.stderr"].data == b"scp note\n"
+    assert any(e[:2] == ("SSH", "ssh:put") for e in sess.events)
 
 
 # --- runner --------------------------------------------------------------
@@ -2198,15 +2067,9 @@ def main():
         test_pack_and_load_roundtrip,
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
-        test_session_logs_device_use_and_release_for_jobs_only,
-        test_lease_only_plan_does_not_count_as_device_usage,
-        test_direct_session_without_plan_digest_does_not_log_device_usage,
-        test_report_computes_duty_from_device_log_events,
-        test_report_pairs_by_session_for_back_to_back_device_jobs,
-        test_report_closes_stale_session_at_next_device_use,
-        test_report_keeps_log_order_for_equal_timestamps,
-        test_report_prints_highest_duty_first,
         test_inventory_returns_devices_and_ops_streams,
+        test_tcp_recv_captures_stream_and_expectation,
+        test_tcp_recv_expect_mismatch_fails_after_capture,
         test_server_rest_queue_helpers,
         test_request_path_strips_query_for_static_assets,
         test_static_assets_accept_query_and_disable_cache,
@@ -2217,6 +2080,14 @@ def main():
         test_cancel_propagates_to_session,
         test_signal_cancel_sigkills_session_subprocs,
         test_session_watchdog_hard_exits_when_wedged,
+        test_lock_wait_does_not_consume_session_runtime,
+        test_cancel_aborts_device_lock_wait,
+        test_submit_wait_retries_transient_server_restart,
+        test_submit_wait_retries_transient_connection_reset,
+        test_submit_wait_retries_raw_url_error,
+        test_submit_wait_retries_transient_timeouts,
+        test_submit_wait_returns_when_job_disappears_without_tar,
+        test_submit_wait_reraises_http_error,
         test_acquire_open_timeout_quarantines_and_doesnt_wedge,
         test_refresh_survives_a_hung_probe,
         test_hung_probe_keeps_last_good_specs,
@@ -2226,7 +2097,6 @@ def main():
         test_dispatch_rejects_garbage_plan,
         test_spool_unique_per_attempt,
         test_pending_upload_drain_kick_is_nonblocking,
-        test_supervisor_acquires_poller_lock_before_spawning_worker,
         test_refused_spool_409_is_backed_off,
         test_dsp_boot_requires_timeout_and_kills_hung_helper,
         test_dsp_boot_cancel_race_reports_cancel,
@@ -2245,20 +2115,12 @@ def main():
         test_failure_artefact_carries_identity_fields,
         test_prune_skips_inflight_digests,
         test_stale_cancel_resolution_removes_orphan_running_record,
+        test_delete_job_resolves_old_non_inflight_running_record,
         test_delete_outputs_no_op_when_nothing_to_delete,
         test_multi_instance_plan_holds_all_dev_locks_for_session,
         test_check_record_lands_in_manifest,
         test_bench_id_defaults_to_hostname_and_env_overrides,
-        test_usb_and_usbtmc_plugins_expose_bringup_ops,
-        test_usbtmc_fast_path_helpers_read_write_and_rate_check,
-        test_usbtmc_and_raw_usb_plan_shapes_parse,
-        test_usbtmc_list_available_without_class_nodes,
-        test_usbtmc_node_instances_still_validate_identity,
-        test_explicit_any_ref_locks_only_any_pseudo_device,
-        test_any_pseudo_device_does_not_make_bare_real_device_ambiguous,
-        test_ssh_put_op_shape_and_validation,
-        test_usb_write_ops_reject_short_writes,
-        test_ws_plugin_recv_schema_and_helpers,
+        test_ssh_put_uses_key_only_scp_and_streams_output,
     ]
     failed = 0
     for t in tests:

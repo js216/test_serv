@@ -480,7 +480,7 @@ class Session:
         # Agent picks down via X-Test-Runtime, bench enforces up via
         # MAX_SESSION_S so a rogue agent can't camp on a device.
         budget_s = min(self.runtime_s or DEFAULT_SESSION_S, MAX_SESSION_S)
-        deadline = self.t0 + budget_s
+        self._runtime_budget_s = budget_s
         # If the plan starts with `lease:resume token=...`, validate
         # the token now so the eager-acquire path treats the lease's
         # devices as ours. A bad/expired token fails the session
@@ -566,10 +566,21 @@ class Session:
                     s.close()
                 return
         eager_acquired = []
+        lock_wait_canceled = False
         try:
             for lk in eager_locks:
-                lk.acquire()
-                eager_acquired.append(lk)
+                while True:
+                    if self.canceled:
+                        self.log_event(
+                            "ERROR", "session",
+                            "canceled while waiting for device lock")
+                        lock_wait_canceled = True
+                        break
+                    if lk.acquire(timeout=0.1):
+                        eager_acquired.append(lk)
+                        break
+                if lock_wait_canceled:
+                    break
         except Exception:
             for held in reversed(eager_acquired):
                 held.release()
@@ -577,6 +588,19 @@ class Session:
             self.log_event(
                 "ERROR", "session",
                 f"lock acquire: {self.errors[-1].splitlines()[-1]}")
+            for s in self.streams.values():
+                s.close()
+            return
+        if lock_wait_canceled:
+            for held in reversed(eager_acquired):
+                held.release()
+            with self.registry.lock:
+                for kk in self._pinned_specs:
+                    n = self.registry.pinned_specs.get(kk, 0) - 1
+                    if n > 0:
+                        self.registry.pinned_specs[kk] = n
+                    else:
+                        self.registry.pinned_specs.pop(kk, None)
             for s in self.streams.values():
                 s.close()
             return
@@ -595,6 +619,11 @@ class Session:
         for key in eager_keys:
             self._mark_device_use(key)
         self.log_event("LOCK", "session", "acquired; running ops")
+        # Lock wait is bench scheduling/resource contention, not plan
+        # execution. Start the runtime budget after eager locks are held
+        # so a valid op is not skipped just because another session
+        # released the device late.
+        deadline = time.monotonic() + budget_s
         # Watchdog: the in-loop deadline check at _run_block only
         # fires at op boundaries. A session stuck inside ONE op's C
         # call (mp135 serial.read, fpga MPSSE write/read, dsp
@@ -721,9 +750,10 @@ class Session:
     def _run_block(self, ops, plugins, deadline):
         for op in ops:
             if time.monotonic() > deadline:
+                budget = getattr(
+                    self, "_runtime_budget_s", deadline - self.t0)
                 self.log_event("ERROR", "session",
-                               f"session exceeded {deadline - self.t0:.0f}s "
-                               f"deadline")
+                               f"session exceeded {budget:.0f}s deadline")
                 return
             if self.canceled:
                 # Record where the cancel landed, with elapsed time.

@@ -121,6 +121,19 @@ def _head_tar(server, digest):
         raise
 
 
+def _job_known(server, digest):
+    """Return True while the server still advertises an accepted job.
+
+    A canceled or stale-resolved job can disappear without publishing an
+    output tar. In that case --wait should return promptly instead of
+    polling HEAD /outputs/<digest>.tar until the outer timeout expires.
+    """
+    _status, body, _hdrs = _http_json("GET", _url(server, "jobs"))
+    jobs = body if isinstance(body, list) else body.get("jobs", [])
+    return any(isinstance(job, dict) and job.get("digest") == digest
+               for job in jobs)
+
+
 def _delete_outputs(server, digest):
     try:
         _request("DELETE", _url(server, f"outputs/{digest}"))
@@ -131,8 +144,21 @@ def _delete_outputs(server, digest):
 def _wait(server, digest, timeout):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if _head_tar(server, digest):
-            return _get_tar(server, digest)
+        try:
+            if _head_tar(server, digest):
+                return _get_tar(server, digest)
+            if not _job_known(server, digest):
+                return None
+        except (RuntimeError, urllib.error.URLError, ConnectionError,
+                TimeoutError) as e:
+            if isinstance(e, urllib.error.HTTPError):
+                raise
+            # The job has already been accepted by the server. If the
+            # operator restarts test_serv or the TCP connection resets
+            # while a bench run is still in progress, keep polling until
+            # the normal wait deadline instead of converting a brief
+            # transport blip into a false mission failure.
+            pass
         time.sleep(0.05)
     return None
 
