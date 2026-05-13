@@ -1,6 +1,39 @@
 # SPDX-License-Identifier: MIT
 # msc.py --- USB Mass Storage Class block-device writer
 # Copyright (c) 2026 Jakob Kastelic
+#
+# Why the bare write/read/verify ops shell out to dd(1) (and cmp(1)):
+#
+# A previous all-Python implementation used os.read / os.write loops
+# with bytearray accumulation. On a USB-MSC link that does ~7 MB/s with
+# plain `dd`, the plugin crawled at ~0.3 MB/s. Two compounding causes:
+#
+#   1. The plugin materialized the entire image in Python memory more
+#      than once -- bytearray growth during read, `bytes(got)` copy,
+#      plus an msc.read stream record copy. For multi-GB SD card
+#      images on a bench host with limited RAM this swap-thrashed and
+#      cratered USB writeback.
+#   2. Page-cache-only writes without fsync measured page-cache-fill
+#      rate, not wire rate. Once an fsync was added to the timed
+#      window, the reported rate dropped to actual wire rate -- which
+#      *would* have matched `dd ... conv=fsync` if not for (1).
+#
+# The fix: stage to / from a local-disk temp file and let dd do the
+# block-device I/O with a fixed C-level buffer. Memory footprint stays
+# bounded regardless of image size, throughput tracks the link, and we
+# get dd's own rate stats for free (parsed out of stderr into the
+# msc.dd artefact stream and fed to min_rate_Bps).
+#
+# For verify we hand the byte compare to cmp(1) instead of zipping
+# bytes in Python -- same reasoning, plus cmp short-circuits on the
+# first differing byte and gives us the offset directly.
+#
+# The *_zeroes and *_prbs variants stay in-Python because they generate
+# their pattern on the fly (no source blob to stage) and their
+# bottleneck was the pattern generator / comparator, not memory
+# pressure. Do NOT collapse the bare write/read/verify back into pure
+# Python loops "for consistency" with those variants -- the swap-thrash
+# regression returns immediately on any image larger than ~free RAM.
 
 import glob
 import os
