@@ -584,8 +584,10 @@ class MscPlugin(DevicePlugin):
                  "MSC).  Refuses if any partition under the device is "
                  "mounted.  min_rate_Bps fails the op if dd's reported "
                  "wire rate falls below the requested byte/s floor.  "
-                 "dd's stderr (progress + final stats) is captured in "
-                 "the msc.dd stream."),
+                 "dd's raw stderr (progress + final stats line) is "
+                 "captured in the msc.dd stream alongside the artefact "
+                 "-- inspect it to see the actual wire rate dd "
+                 "measured."),
             run=_op_write),
         "read": Op(
             args={"n": "int"},
@@ -598,7 +600,10 @@ class MscPlugin(DevicePlugin):
                  "is capped at STREAM_MAX_BYTES; reads larger than "
                  "that get truncated to the most recent records.  "
                  "min_rate_Bps fails the op if dd's reported wire rate "
-                 "falls below the requested byte/s floor."),
+                 "falls below the requested byte/s floor.  dd's raw "
+                 "stderr (progress + final stats line) is captured in "
+                 "the msc.dd stream alongside the artefact -- inspect "
+                 "it to see the actual wire rate dd measured."),
             run=_op_read),
         "write_zeroes": Op(
             args={"n": "int"},
@@ -648,7 +653,10 @@ class MscPlugin(DevicePlugin):
                  "for-byte using cmp(1).  Streams a 256-byte window "
                  "around the first mismatch into msc.verify_mismatch "
                  "on failure.  min_rate_Bps applies to the dd read "
-                 "portion only (cmp is local-disk and cheap)."),
+                 "portion only (cmp is local-disk and cheap).  dd's "
+                 "raw stderr (progress + final stats line) is captured "
+                 "in the msc.dd stream alongside the artefact -- "
+                 "inspect it to see the actual wire rate dd measured."),
             run=_op_verify),
     }
 
