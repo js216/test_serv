@@ -4,6 +4,10 @@
 
 import glob
 import os
+import re
+import shutil
+import subprocess
+import tempfile
 import time
 
 import config
@@ -12,6 +16,7 @@ from ._prbs import XorShift32Bytes
 
 
 CHUNK_BYTES = 1 << 20
+DD_TIMEOUT_S = 6 * 60 * 60   # 6h cap so a wedged dd can't camp on the lock
 
 
 def _check_min_rate(op_name, total, elapsed_s, min_rate_Bps):
@@ -23,6 +28,139 @@ def _check_min_rate(op_name, total, elapsed_s, min_rate_Bps):
     if rate < min_rate_Bps:
         raise TimeoutError(
             f"{op_name} too slow: {rate:.0f} B/s < {min_rate_Bps} B/s")
+
+
+def _track_subproc(proc, session=None):
+    """Mirror plugins/dfu.py: register a Popen so the poller's SIGINT
+    AND session.signal_cancel can kill dd promptly.  Imported at first
+    call so this module stays importable without poller.py.
+    """
+    try:
+        from poller import register_subprocess
+        register_subprocess(proc, session=session)
+    except Exception:
+        pass
+
+
+def _untrack_subproc(proc):
+    try:
+        from poller import unregister_subprocess
+        unregister_subprocess(proc)
+    except Exception:
+        pass
+
+
+_DD_STATS_RE = re.compile(
+    rb"(\d+)\s+bytes\b.*?copied,\s+([\d.eE+\-]+)\s*s,\s+"
+    rb"([\d.eE+\-]+)\s*([kMGT]?)B/s")
+_DD_UNIT_MULT = {b"": 1, b"k": 10**3, b"M": 10**6, b"G": 10**9, b"T": 10**12}
+
+
+def _parse_dd_stats(stderr_bytes):
+    """Extract ``(bytes_copied, rate_Bps)`` from dd's final stderr line.
+
+    dd's last status line is unambiguous, e.g.::
+        1048576000 bytes (1.0 GB, 1000 MiB) copied, 145.7 s, 7.2 MB/s
+    We scan for the LAST occurrence so any intermediate progress-bar
+    lines from ``status=progress`` don't shadow the final summary.
+    Returns ``(None, None)`` if the line isn't present (e.g. dd was
+    killed before printing).
+    """
+    last = None
+    for m in _DD_STATS_RE.finditer(stderr_bytes or b""):
+        last = m
+    if last is None:
+        return None, None
+    n = int(last.group(1))
+    rate_val = float(last.group(3))
+    mult = _DD_UNIT_MULT.get(last.group(4), 1)
+    return n, rate_val * mult
+
+
+def _tmpdir():
+    return os.environ.get(
+        "TEST_SERV_MSC_TMPDIR", tempfile.gettempdir())
+
+
+def _stage_blob(data, instance_id):
+    """Write blob bytes to a uniquely named temp file; return the path.
+    Caller is responsible for unlinking.  Splitting this out of the op
+    keeps the dd-spawn helper free of bytes-bound code.
+    """
+    fd, path = tempfile.mkstemp(
+        prefix=f"msc-{instance_id}-", suffix=".bin", dir=_tmpdir())
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except Exception:
+        try: os.remove(path)
+        except OSError: pass
+        raise
+    return path
+
+
+def _new_tmp(instance_id, suffix=".bin"):
+    fd, path = tempfile.mkstemp(
+        prefix=f"msc-{instance_id}-", suffix=suffix, dir=_tmpdir())
+    os.close(fd)
+    return path
+
+
+def _run_dd(session, argv, op_name, stream_name="msc.dd"):
+    """Run dd, stream stderr to ``stream_name``, honour session cancel,
+    and return ``(bytes_done, rate_Bps, elapsed_s)``.
+
+    ``bytes_done`` / ``rate_Bps`` come from dd's own final stats line so
+    we report whatever dd actually achieved -- including the partial
+    count on a mid-flight cancel.  Returns ``(None, None, elapsed)`` if
+    dd died before printing the summary, in which case ``op_name`` is
+    raised as IOError so the caller can surface it.
+    """
+    dd = shutil.which("dd")
+    if dd is None:
+        raise RuntimeError(
+            f"{op_name}: dd(1) not found on PATH; install coreutils")
+    full_argv = [dd] + list(argv)
+    t0 = time.monotonic()
+    proc = subprocess.Popen(
+        full_argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    _track_subproc(proc, session=session)
+    canceled = False
+    try:
+        deadline = t0 + DD_TIMEOUT_S
+        while True:
+            try:
+                _, stderr = proc.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                if session.canceled:
+                    canceled = True
+                    proc.terminate()
+                    try: proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill(); proc.wait(timeout=2)
+                    _, stderr = proc.communicate(timeout=2)
+                    break
+                if time.monotonic() > deadline:
+                    proc.terminate()
+                    try: proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        proc.kill(); proc.wait(timeout=2)
+                    _, stderr = proc.communicate(timeout=2)
+                    raise TimeoutError(
+                        f"{op_name}: dd exceeded {DD_TIMEOUT_S}s wall clock")
+    finally:
+        _untrack_subproc(proc)
+    elapsed = time.monotonic() - t0
+    session.stream(stream_name).append(stderr or b"")
+    if canceled:
+        raise RuntimeError(
+            f"{op_name}: dd canceled via DELETE /jobs/<digest>")
+    if proc.returncode != 0:
+        raise IOError(
+            f"{op_name}: dd exit={proc.returncode}; see {stream_name} stream")
+    bytes_done, rate_Bps = _parse_dd_stats(stderr or b"")
+    return bytes_done, rate_Bps, elapsed
 
 
 def _norm_hex(v):
@@ -96,44 +234,43 @@ def _refuse_if_mounted(device):
 
 
 class MscHandle:
-    def __init__(self, device, block_size):
+    def __init__(self, device, block_size, instance_id="0"):
         self.device = device
         self.block_size = block_size
+        self.instance_id = instance_id
 
 
 def _op_write(session, h, args):
-    data = bytes(args["data"])
+    data = args["data"]
     offset_lba = args.get("offset_lba") or 0
     min_rate_Bps = args.get("min_rate_Bps")
-    offset = offset_lba * h.block_size
+    offset_bytes = offset_lba * h.block_size
     _refuse_if_mounted(h.device)
     total = len(data)
-    t0 = time.monotonic()
-    fd = os.open(h.device, os.O_WRONLY)
+
+    # Stage the blob to local disk so dd can stream it with a fixed
+    # C-level buffer instead of us materializing every chunk in Python.
+    # Without this the page cache plus 2x in-process copies of a multi-
+    # GB SD image swap-thrash the bench machine and crater USB
+    # writeback -- we measured ~0.3 MB/s on a link that does 7+ MB/s.
+    src = _stage_blob(data, h.instance_id)
     try:
-        os.lseek(fd, offset, os.SEEK_SET)
-        written = 0
-        while written < total:
-            session.bail_if_canceled(f"msc:write @ {written}/{total}B")
-            n = os.write(fd, data[written:written + CHUNK_BYTES])
-            if n <= 0:
-                raise IOError(f"write stalled at {written}/{total}")
-            written += n
-        # Skip fsync on cancel: cancel observed AT the bottom of the
-        # loop means the write completed but the agent already wants
-        # out -- making them wait several seconds for the kernel to
-        # flush a 100 MB buffer to USB just to abandon the result is
-        # the wrong tradeoff. The kernel will flush in the background;
-        # the next msc op opens the device fresh and sees current state.
-        if not session.canceled:
-            os.fsync(fd)
+        argv = [f"if={src}", f"of={h.device}",
+                "bs=1M", "conv=fsync,notrunc",
+                "oflag=seek_bytes", f"seek={offset_bytes}",
+                "status=progress"]
+        bytes_w, rate_Bps, elapsed = _run_dd(session, argv, "msc:write")
     finally:
-        os.close(fd)
+        try: os.remove(src)
+        except OSError: pass
+
+    actual = bytes_w if bytes_w is not None else total
+    rate_note = (f" ({rate_Bps/1e6:.2f} MB/s via dd)"
+                 if rate_Bps is not None else " via dd")
     session.log_event(
         "MSC", "msc:write",
-        f"wrote {total}B to {h.device} @ LBA {offset_lba}")
-    _check_min_rate("msc:write", total, time.monotonic() - t0,
-                    min_rate_Bps)
+        f"wrote {actual}B to {h.device} @ LBA {offset_lba}{rate_note}")
+    _check_min_rate("msc:write", actual, elapsed, min_rate_Bps)
 
 
 def _write_generated(session, h, *, n, offset_lba, min_rate_Bps,
@@ -277,72 +414,116 @@ def _op_verify_prbs(session, h, args):
 
 
 def _op_read(session, h, args):
-    n = args["n"]
+    n = int(args["n"])
     offset_lba = args.get("offset_lba") or 0
     min_rate_Bps = args.get("min_rate_Bps")
-    offset = offset_lba * h.block_size
-    t0 = time.monotonic()
-    fd = os.open(h.device, os.O_RDONLY)
+    offset_bytes = offset_lba * h.block_size
+
+    dst = _new_tmp(h.instance_id)
     try:
-        os.lseek(fd, offset, os.SEEK_SET)
-        got = bytearray()
-        while len(got) < n:
-            session.bail_if_canceled(f"msc:read @ {len(got)}/{n}B")
-            chunk = os.read(fd, min(CHUNK_BYTES, n - len(got)))
-            if not chunk:
-                raise IOError(f"short read at {len(got)}/{n}")
-            got += chunk
+        argv = [f"if={h.device}", f"of={dst}",
+                "bs=1M",
+                "iflag=skip_bytes,count_bytes",
+                f"skip={offset_bytes}", f"count={n}",
+                "status=progress"]
+        bytes_r, rate_Bps, elapsed = _run_dd(session, argv, "msc:read")
+
+        # Stream the captured bytes into the msc.read artefact stream
+        # chunk-by-chunk so a multi-GB read doesn't materialize the full
+        # payload in Python memory.  The stream cap (STREAM_MAX_BYTES,
+        # 64 MiB) still evicts oldest records for oversized reads, but
+        # the bench RAM footprint stays bounded.
+        stream = session.stream("msc.read")
+        with open(dst, "rb") as f:
+            while True:
+                session.bail_if_canceled(
+                    f"msc:read drain @ {f.tell()}/{n}B")
+                chunk = f.read(CHUNK_BYTES)
+                if not chunk:
+                    break
+                stream.append(chunk)
     finally:
-        os.close(fd)
-    session.stream("msc.read").append(bytes(got))
+        try: os.remove(dst)
+        except OSError: pass
+
+    actual = bytes_r if bytes_r is not None else n
+    rate_note = (f" ({rate_Bps/1e6:.2f} MB/s via dd)"
+                 if rate_Bps is not None else " via dd")
     session.log_event(
         "MSC", "msc:read",
-        f"read {n}B from {h.device} @ LBA {offset_lba}")
-    _check_min_rate("msc:read", n, time.monotonic() - t0, min_rate_Bps)
+        f"read {actual}B from {h.device} @ LBA {offset_lba}{rate_note}")
+    _check_min_rate("msc:read", actual, elapsed, min_rate_Bps)
 
 
 def _op_verify(session, h, args):
-    expected = bytes(args["data"])
+    expected = args["data"]
     offset_lba = args.get("offset_lba") or 0
-    offset = offset_lba * h.block_size
+    offset_bytes = offset_lba * h.block_size
     total = len(expected)
-    fd = os.open(h.device, os.O_RDONLY)
+    min_rate_Bps = args.get("min_rate_Bps")
+
+    exp_path = _stage_blob(expected, h.instance_id)
+    got_path = _new_tmp(h.instance_id)
     try:
-        os.lseek(fd, offset, os.SEEK_SET)
-        got = bytearray()
-        while len(got) < total:
-            session.bail_if_canceled(f"msc:verify @ {len(got)}/{total}B")
-            chunk = os.read(fd, min(CHUNK_BYTES, total - len(got)))
-            if not chunk:
-                raise IOError(f"short read at {len(got)}/{total}")
-            got += chunk
-    finally:
-        os.close(fd)
-    got = bytes(got[:total])
-    if got == expected:
-        session.log_event("MSC", "msc:verify",
-                          f"OK {total}B @ LBA {offset_lba}")
-        # Record machine-checkable pass so manifest.status doesn't
-        # land as "inert" for a verify-only plan.
+        argv = [f"if={h.device}", f"of={got_path}",
+                "bs=1M",
+                "iflag=skip_bytes,count_bytes",
+                f"skip={offset_bytes}", f"count={total}",
+                "status=progress"]
+        bytes_r, rate_Bps, elapsed = _run_dd(session, argv, "msc:verify")
+        _check_min_rate(
+            "msc:verify", bytes_r if bytes_r is not None else total,
+            elapsed, min_rate_Bps)
+
+        # Hand the byte-for-byte compare to cmp(1): C-level memcmp,
+        # streaming, never materializes either file in our process.
+        # cmp exits 0 on identical, 1 on diff, 2 on error.
+        cmp_bin = shutil.which("cmp")
+        if cmp_bin is None:
+            raise RuntimeError(
+                "msc:verify: cmp(1) not found on PATH; install diffutils")
+        cmp_proc = subprocess.run(
+            [cmp_bin, "--", exp_path, got_path],
+            capture_output=True, timeout=DD_TIMEOUT_S)
+        if cmp_proc.returncode == 0:
+            session.log_event(
+                "MSC", "msc:verify",
+                f"OK {total}B @ LBA {offset_lba} via dd+cmp"
+                + (f" ({rate_Bps/1e6:.2f} MB/s)"
+                   if rate_Bps is not None else ""))
+            session.record_check(
+                "msc_verify", h.device,
+                f"{total}B match at LBA {offset_lba}",
+                "hit",
+                {"bytes": total, "offset_lba": offset_lba})
+            return
+        if cmp_proc.returncode != 1:
+            raise IOError(
+                f"msc:verify: cmp exit={cmp_proc.returncode}: "
+                f"{(cmp_proc.stderr or b'').decode(errors='replace')!r}")
+
+        # cmp's stdout on mismatch: "exp got differ: byte 12345, line 678"
+        # 1-indexed byte position; convert to 0-indexed.
+        m = re.search(rb"byte\s+(\d+)", cmp_proc.stdout or b"")
+        first = int(m.group(1)) - 1 if m else -1
+        with open(got_path, "rb") as f:
+            if first >= 0:
+                f.seek(max(0, first - 64))
+            window = f.read(256)
+        session.stream("msc.verify_mismatch").append(
+            b"--MISMATCH--" + window)
         session.record_check(
             "msc_verify", h.device,
             f"{total}B match at LBA {offset_lba}",
-            "hit",
-            {"bytes": total, "offset_lba": offset_lba})
-        return
-    mism = sum(1 for a, b in zip(expected, got) if a != b)
-    first = next((i for i, (a, b) in enumerate(zip(expected, got)) if a != b),
-                 -1)
-    session.stream("msc.verify_mismatch").append(
-        b"--MISMATCH--" + got[max(0, first - 64):first + 192])
-    session.record_check(
-        "msc_verify", h.device,
-        f"{total}B match at LBA {offset_lba}",
-        "miss",
-        {"bytes": total, "offset_lba": offset_lba,
-         "mismatched": mism, "first_diff": first})
-    raise ValueError(
-        f"msc verify mismatch: {mism}B differ, first at {first}")
+            "miss",
+            {"bytes": total, "offset_lba": offset_lba,
+             "first_diff": first})
+        raise ValueError(
+            f"msc verify mismatch: first differing byte at {first}")
+    finally:
+        for p in (exp_path, got_path):
+            try: os.remove(p)
+            except OSError: pass
 
 
 class MscPlugin(DevicePlugin):
@@ -352,27 +533,39 @@ class MscPlugin(DevicePlugin):
            "and exposes write / read / verify ops at arbitrary LBA "
            "offsets. Refuses any write if a partition under the device "
            "is currently mounted, so a stray host-side automount can't "
-           "let the bench corrupt the agent's data.")
+           "let the bench corrupt the agent's data.  write / read / "
+           "verify shell out to dd(1) (and cmp(1) for verify) so a "
+           "multi-GB SD image streams through a fixed C-level buffer "
+           "instead of materializing in Python memory; dd's stats are "
+           "captured in the msc.dd stream and feed min_rate_Bps.  The "
+           "*_zeroes and *_prbs variants stay in-process since they "
+           "generate their pattern on the fly.")
 
     ops = {
         "write": Op(
             args={"data": "blob"},
             optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
-            doc=("Write a blob to the resolved block device. "
-                 "offset_lba defaults to 0; units are block_size "
-                 "(512 B for STM32MP1 baremetal MSC). Refuses if "
-                 "any partition under the device is mounted. "
-                 "min_rate_Bps fails the op if effective write rate "
-                 "falls below the requested byte/s floor."),
+            doc=("Write a blob to the resolved block device via dd(1) "
+                 "(bs=1M conv=fsync,notrunc).  offset_lba defaults to 0; "
+                 "units are block_size (512 B for STM32MP1 baremetal "
+                 "MSC).  Refuses if any partition under the device is "
+                 "mounted.  min_rate_Bps fails the op if dd's reported "
+                 "wire rate falls below the requested byte/s floor.  "
+                 "dd's stderr (progress + final stats) is captured in "
+                 "the msc.dd stream."),
             run=_op_write),
         "read": Op(
             args={"n": "int"},
             optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
-            doc=("Read n bytes from the resolved block device starting at "
-                 "offset_lba (default 0); bytes go into stream msc.read "
-                 "in the artefact tarball. min_rate_Bps fails the op if "
-                 "effective read rate falls below the requested byte/s "
-                 "floor."),
+            doc=("Read n bytes from the resolved block device via dd(1) "
+                 "starting at offset_lba (default 0); bytes go into "
+                 "stream msc.read in the artefact tarball, streamed "
+                 "chunk-by-chunk so a multi-GB read does not "
+                 "materialize in plugin memory.  The msc.read stream "
+                 "is capped at STREAM_MAX_BYTES; reads larger than "
+                 "that get truncated to the most recent records.  "
+                 "min_rate_Bps fails the op if dd's reported wire rate "
+                 "falls below the requested byte/s floor."),
             run=_op_read),
         "write_zeroes": Op(
             args={"n": "int"},
@@ -416,11 +609,13 @@ class MscPlugin(DevicePlugin):
             run=_op_verify_prbs),
         "verify": Op(
             args={"data": "blob"},
-            optional_args={"offset_lba": "int"},
+            optional_args={"offset_lba": "int", "min_rate_Bps": "int"},
             doc=("Read len(data) bytes from the resolved block device "
-                 "starting at offset_lba and compare byte-for-byte. "
-                 "Streams a window around the first mismatch into "
-                 "msc.verify_mismatch on failure."),
+                 "via dd(1) starting at offset_lba and compare byte-"
+                 "for-byte using cmp(1).  Streams a 256-byte window "
+                 "around the first mismatch into msc.verify_mismatch "
+                 "on failure.  min_rate_Bps applies to the dd read "
+                 "portion only (cmp is local-disk and cheap)."),
             run=_op_verify),
     }
 
@@ -460,7 +655,8 @@ class MscPlugin(DevicePlugin):
                 f"msc: device path drifted ({device!r} -> {actual!r}); "
                 f"replug or re-probe")
         _refuse_if_mounted(device)
-        h = MscHandle(device=device, block_size=spec["block_size"])
+        h = MscHandle(device=device, block_size=spec["block_size"],
+                      instance_id=spec.get("id", "0"))
         h._identity_verified = True
         return h
 
