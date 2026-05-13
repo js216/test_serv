@@ -135,7 +135,7 @@
       },
       {
         "id": "custom",
-        "ip": "172.25.0.140",
+        "ip": "172.25.0.46",
         "user": "root",
         "key":         "~/.ssh/test_serv_embedded",
         "known_hosts": "~/.ssh/test_serv_known_hosts"
