@@ -31,9 +31,12 @@ def _norm_hex(v):
 
 def _resolve_block_device(vid, pid, serial=None):
     """Walk /sys/bus/usb to find the /dev/sdX backing a USB device with
-    the given VID/PID (and optional iSerial). Returns ``None`` if no
-    matching device is currently enumerated. Hot-plug aware -- callers
-    re-probe to pick up a freshly attached drive.
+    the given VID/PID (and optional iSerial). Returns ``(device, speed)``
+    where ``device`` is the /dev path and ``speed`` is the host-negotiated
+    rate in Mbps (12=FS, 480=HS, 5000=SS) or ``None`` if unreadable.
+    Returns ``(None, None)`` if no matching device is currently
+    enumerated. Hot-plug aware -- callers re-probe to pick up a freshly
+    attached drive.
     """
     target_vid = _norm_hex(vid)
     target_pid = _norm_hex(pid)
@@ -63,8 +66,14 @@ def _resolve_block_device(vid, pid, serial=None):
         matches = sorted(glob.glob(
             f"{usb_path}/*:*/host*/target*/*/block/sd?"))
         if matches:
-            return "/dev/" + matches[0].rsplit("/", 1)[-1]
-    return None
+            speed = None
+            try:
+                with open(f"{usb_path}/speed") as f:
+                    speed = int(f.read().strip())
+            except (OSError, ValueError):
+                pass
+            return ("/dev/" + matches[0].rsplit("/", 1)[-1], speed)
+    return (None, None)
 
 
 def _refuse_if_mounted(device):
@@ -423,7 +432,8 @@ class MscPlugin(DevicePlugin):
             usb_serial = inst.get("usb_serial")
             if not (usb_vid and usb_pid):
                 continue
-            device = _resolve_block_device(usb_vid, usb_pid, usb_serial)
+            device, speed_mbps = _resolve_block_device(
+                usb_vid, usb_pid, usb_serial)
             if device is None:
                 continue
             out.append({
@@ -433,6 +443,7 @@ class MscPlugin(DevicePlugin):
                 "usb_vid": usb_vid,
                 "usb_pid": usb_pid,
                 "usb_serial": usb_serial,
+                "usb_speed_mbps": speed_mbps,
                 "description": inst.get("description"),
             })
         return out
@@ -442,7 +453,7 @@ class MscPlugin(DevicePlugin):
         # Re-resolve from sysfs: catches the case where the bootloader
         # was reset between probe and open and the kernel reassigned
         # /dev/sdX to a different physical device.
-        actual = _resolve_block_device(
+        actual, _ = _resolve_block_device(
             spec["usb_vid"], spec["usb_pid"], spec.get("usb_serial"))
         if actual != device:
             raise RuntimeError(
