@@ -816,6 +816,39 @@ $("#prune-jobs").addEventListener("click", async () => {
   }
 });
 
+$("#cancel-running").addEventListener("click", async () => {
+  // Includes both `queued` and `running` -- "in flight" from the
+  // operator's perspective covers anything that hasn't completed,
+  // and per-job cancel already handles both transparently.
+  const targets = (state.jobs || []).filter(
+    j => j.status === "queued" || j.status === "running");
+  if (!targets.length) {
+    alert("no queued or running jobs to cancel");
+    return;
+  }
+  if (!confirm(
+    `Cancel ${targets.length} in-flight job(s)?\n\n` +
+    `Each session aborts at its next op boundary (~2.5s) and posts ` +
+    `an artefact with manifest.status=canceled.`)) {
+    return;
+  }
+  const results = await Promise.allSettled(
+    targets.map(j =>
+      fetch(`/jobs/${j.digest}`, { method: "DELETE" })
+        .then(r => r.ok ? r.json() : Promise.reject(
+                new Error(`HTTP ${r.status}`)))
+        .then(data => ({ digest: j.digest, status: data.status }))));
+  const failed = results.filter(r => r.status === "rejected");
+  if (failed.length) {
+    alert(`cancel: ${results.length - failed.length} succeeded, ` +
+          `${failed.length} failed. See console for details.`);
+    console.log("cancel-running:", results);
+  } else {
+    console.log("cancel-running:", results);
+  }
+  refresh();
+});
+
 $("#wipe-jobs").addEventListener("click", async () => {
   const total = state.jobs.length;
   if (!confirm(

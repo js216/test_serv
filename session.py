@@ -1031,10 +1031,53 @@ class Session:
                 "ops": control_ops,
             },
         }
-        # Job-lifecycle / REST docs used to be jammed in here as a
-        # fake "_jobs" plugin. They aren't plan ops, so they don't
-        # belong in the inventory. Agents fetch them via GET /help
-        # on the server instead -- see server.py:_help.
+        # Job-lifecycle / REST surface lives alongside the plan-op
+        # catalogue so an agent reading bench.ops.json can find out how
+        # to cancel an in-flight run without having to also hit GET
+        # /help. Strictly speaking these aren't plan ops -- they're
+        # operations on the run itself -- so they live under a fake
+        # "_jobs" plugin entry with no actual `ops` map.
+        ops_map["_jobs"] = {
+            "doc": (
+                "Job lifecycle (REST surface on the test_serv HTTP "
+                "endpoint; NOT plan ops -- these are issued by the\n"
+                "agent against the server, not written into a plan).\n"
+                "\n"
+                "Cancel an in-flight or queued run:\n"
+                "  DELETE /jobs/<digest>\n"
+                "    Drops the job's queued plan if it has not been\n"
+                "    picked up yet, otherwise leaves a cancel marker\n"
+                "    that the poller pulls on its next /cancels tick\n"
+                "    (~2.5s). The session's bail_if_canceled hook\n"
+                "    fires at the next op boundary, the artefact is\n"
+                "    still written, and manifest.status becomes\n"
+                "    `canceled`. Idempotent: a second DELETE on the\n"
+                "    same digest is a no-op.\n"
+                "    Response: {\"status\": \"canceled_queued\"} if\n"
+                "    the plan was still queued, or\n"
+                "    {\"status\": \"cancel_signaled\"} if a running\n"
+                "    session was asked to abort, or\n"
+                "    {\"status\": \"stale_canceled\"} if the server\n"
+                "    resolved a long-stale `running` entry locally.\n"
+                "\n"
+                "List jobs:\n"
+                "  GET /jobs\n"
+                "    Returns one entry per known digest with status\n"
+                "    in {queued, running, done}; running entries\n"
+                "    grow a `cancel_pending: true` flag once their\n"
+                "    DELETE marker is in flight.\n"
+                "\n"
+                "Other endpoints:\n"
+                "  POST /jobs                submit a plan tar\n"
+                "  GET  /outputs/<dg>.tar    fetch artefact\n"
+                "  DELETE /outputs/<dg>      drop artefact + record\n"
+                "  GET  /inflight           live snapshot of running\n"
+                "                            sessions (events + tail\n"
+                "                            of each stream)\n"
+                "  POST /sweep              ask poller to re-probe\n"
+                "                            identity on next tick"),
+            "ops": {},
+        }
         for name, pl in sorted(plugins.items()):
             ops_map[name] = {
                 "doc": pl.doc,
