@@ -108,6 +108,18 @@
     ]
   },
 
+  "usb": {
+    "instances": [
+      {
+        "id": "usbtmc",
+        "description": "STM32MP135F-DK Linux USBTMC gadget. Present only when the EVB Linux image exposes the USBTMC function.",
+        "usb_vid": "0x0483",
+        "usb_pid": "0x571e",
+        "usb_serial": "evb-linux-usbtmc-0001"
+      }
+    ]
+  },
+
   "scope": {
     "instances": [
       {

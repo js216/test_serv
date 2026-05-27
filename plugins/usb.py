@@ -328,9 +328,27 @@ class UsbPlugin(DevicePlugin):
     }
 
     def probe(self):
-        out = [{"id": "any", "list_only": True,
-                "description": "raw USB enumeration pseudo-device"}]
-        for inst in config.instances(self.name):
+        configured = list(config.instances(self.name))
+        out = [{
+            "id": "any",
+            "list_only": True,
+            "description": "raw USB enumeration pseudo-device",
+            "configured_instances_note": (
+                "Planned USB instances from config.json. These are not "
+                "connected/resolvable unless they also appear as separate "
+                "device rows such as usb.<id>."),
+            "configured_instances": [
+                {
+                    "id": inst.get("id"),
+                    "usb_vid": inst.get("usb_vid") or inst.get("vid"),
+                    "usb_pid": inst.get("usb_pid") or inst.get("pid"),
+                    "usb_serial": inst.get("usb_serial") or inst.get("serial"),
+                    "description": inst.get("description"),
+                }
+                for inst in configured
+            ],
+        }]
+        for inst in configured:
             try:
                 dev = _match_configured(inst)
             except Exception:

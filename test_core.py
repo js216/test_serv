@@ -268,6 +268,36 @@ def test_usb_any_descriptor_uses_unique_selector():
         usb_mod._device_record = old_record
 
 
+def test_usb_inventory_lists_configured_absent_instances():
+    import config as config_mod
+
+    old_cached = config_mod._cached
+    try:
+        config_mod._cached = {
+            "usb": {
+                "instances": [{
+                    "id": "usbtmc",
+                    "description": "future gadget",
+                    "usb_vid": "0x0483",
+                    "usb_pid": "0x571e",
+                    "usb_serial": "evb-linux-usbtmc-0001",
+                }]
+            }
+        }
+        specs = UsbPlugin().probe()
+        any_spec = next(s for s in specs if s["id"] == "any")
+        assert any_spec["configured_instances"] == [{
+            "id": "usbtmc",
+            "usb_vid": "0x0483",
+            "usb_pid": "0x571e",
+            "usb_serial": "evb-linux-usbtmc-0001",
+            "description": "future gadget",
+        }]
+        assert not any(s["id"] == "usbtmc" for s in specs), specs
+    finally:
+        config_mod._cached = old_cached
+
+
 def test_tcp_recv_captures_stream_and_expectation():
     ready = threading.Event()
 
@@ -2019,6 +2049,7 @@ def main():
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
         test_usb_any_descriptor_uses_unique_selector,
+        test_usb_inventory_lists_configured_absent_instances,
         test_tcp_recv_captures_stream_and_expectation,
         test_tcp_recv_expect_mismatch_fails_after_capture,
         test_server_rest_queue_helpers,
