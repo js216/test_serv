@@ -321,27 +321,6 @@ def _count_dir_files(path, suffix=""):
         return -1
 
 
-def _redacted_leases(registry):
-    """Token-redacted lease snapshot for the operator-facing
-    leases.json. The lease token is the credential -- redact to
-    a 4-char prefix so the operator can correlate with their own
-    claim's manifest without leaking it to anyone else watching
-    the tunnel.
-    """
-    out = []
-    try:
-        for entry in registry.lease_list():
-            tok = entry.get("token") or ""
-            out.append({
-                "token_prefix": (tok[:4] + "...") if tok else "",
-                "devices": entry.get("devices") or [],
-                "expires_in_s": entry.get("expires_in_s") or 0.0,
-            })
-    except Exception:
-        traceback.print_exc()
-    return out
-
-
 def _self_rss_bytes():
     """RSS in bytes from /proc/self/status (VmRSS line). Returns -1
     on failure. Coupled to Linux; the rest of the bench is too, so
@@ -731,11 +710,6 @@ def _snapshot_inflight():
                 stream_names = list(sess.streams.keys())
             stream_tails = {}
             for name in stream_names[:INFLIGHT_MAX_STREAMS]:
-                if name == "lease.list":
-                    # The lease listing already redacts tokens
-                    # plugin-side, but skip from inflight too as
-                    # belt-and-suspenders.
-                    continue
                 s = sess.streams.get(name)
                 if s is None:
                     continue
@@ -820,16 +794,6 @@ def _publish_status(registry, plugins_by_name):
     }).encode()
     _write_atomic(os.path.join(STATUS, "bench.json"), bench)
     _push_status("bench.json", bench)
-
-    # leases.json: token-redacted snapshot of live cross-session
-    # leases so a returning operator can see "what's holding dsp.A"
-    # without composing a lease:list plan and reading the artefact.
-    # Tokens are NEVER published here -- only the device list +
-    # remaining seconds. Operator who needs the actual token to
-    # release it has to look at the original claim's manifest.
-    leases = json.dumps(_redacted_leases(registry), indent=2).encode()
-    _write_atomic(os.path.join(STATUS, "leases.json"), leases)
-    _push_status("leases.json", leases)
 
     _publish_inflight()
 

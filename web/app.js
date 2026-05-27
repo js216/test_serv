@@ -498,45 +498,7 @@ async function waitForArtefact(digest) {
   return { status: "timeout" };
 }
 
-// Last lease token observed in any artefact this dashboard has
-// rendered. Persisted in localStorage so a page reload doesn't lose
-// the operator's in-flight lease. Used to auto-fill the
-// REPLACE_WITH_YOUR_TOKEN placeholder in lease_resume.plan /
-// lease_release.plan when the operator picks them from the
-// example dropdown -- otherwise the dashboard lease workflow
-// requires the operator to manually copy a 16-char hex string from
-// manifest.json into the textarea.
-const LEASE_TOKEN_KEY = "test_serv_last_lease_token";
-
-function getStoredLeaseToken() {
-  try { return localStorage.getItem(LEASE_TOKEN_KEY) || ""; }
-  catch (e) { return ""; }
-}
-function setStoredLeaseToken(tok) {
-  try {
-    if (tok) localStorage.setItem(LEASE_TOKEN_KEY, tok);
-    else localStorage.removeItem(LEASE_TOKEN_KEY);
-  } catch (e) {}
-}
-
-async function _maybeStashLeaseToken(digest) {
-  // After a successful claim, manifest.lease_token is set. Capture
-  // it for future resume/release pre-fills.
-  try {
-    const r = await fetch(
-      `/outputs/${digest}/file/manifest.json`, { cache: "no-store" });
-    if (!r.ok) return;
-    const m = await r.json();
-    if (m && m.lease_token) {
-      setStoredLeaseToken(m.lease_token);
-    }
-  } catch (e) {}
-}
-
 async function renderArtefact(digest, result) {
-  // Side-effect: stash any lease token from this run BEFORE rendering
-  // so the next example-picker change can pre-fill it.
-  _maybeStashLeaseToken(digest);
   const out = $("#submit-result");
   if (!out) return;
   out.innerHTML = "";
@@ -679,58 +641,12 @@ $("#example-picker")?.addEventListener("change", async (ev) => {
     const r = await fetch(`/examples/${encodeURIComponent(name)}`,
                           { cache: "no-store" });
     if (!r.ok) throw new Error(`/examples/${name}: ${r.status}`);
-    let text = await r.text();
-    // Pre-fill REPLACE_WITH_YOUR_TOKEN with the most recently
-    // observed lease token, so the dashboard lease workflow doesn't
-    // require copy-pasting a 16-char hex string from manifest.json.
-    // The operator can still hand-edit afterwards (which clears the
-    // exampleState so submit goes through plain text, not auto-pack).
-    const stored = getStoredLeaseToken();
-    let substituted = false;
-    if (stored && text.includes("REPLACE_WITH_YOUR_TOKEN")) {
-      text = text.split("REPLACE_WITH_YOUR_TOKEN").join(stored);
-      substituted = true;
-    }
+    const text = await r.text();
     $("#plan-text").value = text;
-    // Tell the operator the substitution happened so they know
-    // (a) something changed silently in the textarea, (b) the token
-    // is from a previous run -- if their last claim was on a poller
-    // that has since restarted, the lease is gone and the resume
-    // will fail with "lease unknown or expired."
     const out = $("#submit-result");
-    if (out) {
-      if (substituted) {
-        out.innerHTML =
-          `<div class='hint'>auto-filled lease_token (` +
-          `${stored.slice(0, 8)}…) from your last claim. ` +
-          `Edit the textarea to override; clear with the ` +
-          `"forget lease token" button.</div>` +
-          `<button id='forget-lease-token' type='button'>` +
-          `forget lease token</button>`;
-        const btn = document.getElementById("forget-lease-token");
-        if (btn) {
-          btn.addEventListener("click", () => {
-            setStoredLeaseToken("");
-            out.innerHTML = "<div class='hint'>lease token forgotten.</div>";
-          });
-        }
-      } else {
-        out.innerHTML = "";
-      }
-    }
-    if (substituted) {
-      // The dashboard text now differs from examples/<name>.plan; if
-      // we left exampleState set, submit would route through
-      // /examples/<name>.plan.tar (which would re-fetch the
-      // unsubstituted example with the placeholder, defeating the
-      // auto-fill). Lease plans don't carry @blob refs so plain-text
-      // submit works fine.
-      _exampleState.name = null;
-      _exampleState.original = "";
-    } else {
-      _exampleState.name = name;
-      _exampleState.original = text;
-    }
+    if (out) out.innerHTML = "";
+    _exampleState.name = name;
+    _exampleState.original = text;
   } catch (e) {
     alert(`failed to load example: ${e}`);
   }

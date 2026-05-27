@@ -1410,109 +1410,6 @@ def test_watchdog_log_records_before_and_after_process_snapshots():
             watchdog.WATCHDOG_LOG = old_log
 
 
-def test_lease_lifecycle():
-    """Full lease flow: claim -> resume from another session ->
-    blocks_acquire rejects an unrelated session -> release.
-
-    This is the regression that brings back the old `lease` subsystem
-    we cut in round 2 (D1) -- the test plus the example plan plus
-    the README section are the three guards against it being cut
-    again on the same "no users" reasoning.
-    """
-    from plugins.lease import LeasePlugin
-    fake = FakePlugin()
-    plugins = {"fake": fake, "lease": LeasePlugin()}
-    reg = DeviceRegistry(plugins); reg.refresh()
-
-    # 1. First plan claims fake.0 for 60 s.
-    p1 = plan.load_tar(plan.pack_tar(
-        'lease:claim devices="fake.0" duration_s=60\n'
-        'fake:noop k=1\n', {}))
-    s1 = Session(reg, p1)
-    s1.run_all(plugins)
-    token = s1.lease_token
-    assert token is not None and len(token) == 16, token
-    assert not s1.errors, s1.errors
-    # Token lands in manifest.lease_token (not in any stream/event)
-    # so a tunnel-side observer can't read it from /inflight while
-    # the session is live -- only whoever fetches the artefact tar
-    # sees it.
-    _, m1 = pack_artefact(s1)
-    m1 = json.loads(m1)
-    assert m1.get("lease_token") == token, m1
-    # And not in lease.token stream (which no longer exists) or in
-    # any timeline-event message.
-    assert "lease.token" not in s1.streams
-    for ev in s1.events:
-        assert token not in ev["msg"], ev
-
-    # 2. Other agent (no token) is fast-rejected.
-    p2 = plan.load_tar(plan.pack_tar('fake:noop k=2\n', {}))
-    s2 = Session(reg, p2)
-    s2.run_all(plugins)
-    assert s2.errors, "lease should have blocked the unleased session"
-    assert "leased to" in s2.errors[0], s2.errors[0]
-    # fake.opens count didn't increment for s2.
-    opens_before_resume = fake.opens
-
-    # 3. Resume from a follow-up plan with the right token: works.
-    p3 = plan.load_tar(plan.pack_tar(
-        f'lease:resume token="{token}"\n'
-        'fake:noop k=3\n', {}))
-    s3 = Session(reg, p3)
-    s3.run_all(plugins)
-    assert not s3.errors, s3.errors
-    assert fake.opens > opens_before_resume
-
-    # 4. Wrong token: rejected.
-    p4 = plan.load_tar(plan.pack_tar(
-        'lease:resume token="not-a-real-token"\n'
-        'fake:noop k=4\n', {}))
-    s4 = Session(reg, p4)
-    s4.run_all(plugins)
-    assert s4.errors and "lease" in s4.errors[0].lower(), s4.errors
-
-    # 5. Release lets unleased sessions through again.
-    p5 = plan.load_tar(plan.pack_tar(
-        f'lease:resume token="{token}"\n'
-        f'lease:release token="{token}"\n', {}))
-    s5 = Session(reg, p5)
-    s5.run_all(plugins)
-    assert not s5.errors, s5.errors
-
-    p6 = plan.load_tar(plan.pack_tar('fake:noop k=6\n', {}))
-    s6 = Session(reg, p6)
-    s6.run_all(plugins)
-    assert not s6.errors, ("after release, unleased session should run; "
-                           f"got {s6.errors}")
-
-    reg.close_all()
-
-
-def test_lease_release_honors_explicit_token_without_resume():
-    """Round-12 W1: a one-line plan `lease:release token="..."` (no
-    preceding lease:resume) must actually drop the lease. The op
-    receives args["token"] decoded to a plain str by decode_args;
-    the previous helper looked for a Value.raw attribute and silently
-    fell back to session.lease_token (None for a fresh session) --
-    so the operator saw "no-op" while the lease lived on until expiry.
-    """
-    from plugins.lease import LeasePlugin
-    plugins = {"fake": FakePlugin(), "lease": LeasePlugin()}
-    reg = DeviceRegistry(plugins); reg.refresh()
-    token = reg.lease_claim(["fake.0"], 60)
-    assert token in reg.leases
-    parsed = plan.load_tar(plan.pack_tar(
-        f'lease:release token="{token}"\n', {}))
-    s = Session(reg, parsed)
-    s.run_all(plugins)
-    assert not s.errors, s.errors
-    assert token not in reg.leases, (
-        "explicit-token release must drop the lease even with no "
-        "preceding lease:resume")
-    reg.close_all()
-
-
 def test_expect_lands_in_manifest():
     """`expect "<claim>"` must surface in manifest.expectations[].
     A plan that records `expect` but never runs a *machine-checkable*
@@ -1600,24 +1497,6 @@ def test_stream_contains_bytes_resets_after_truncation():
         _session.STREAM_MAX_BYTES = old_max
 
 
-def test_lease_claim_rejects_lease_pseudo_device():
-    """L3 regression: an agent could claim `lease._default` (the
-    lease plugin's own probe pseudo-device) and lock the lease
-    subsystem bench-wide, since every other session's lease op
-    would acquire lease._default and hit the lease check."""
-    from plugins.lease import LeasePlugin
-    plugins = {"lease": LeasePlugin()}
-    reg = DeviceRegistry(plugins); reg.refresh()
-    try:
-        reg.lease_claim(["lease._default"], 60)
-    except Exception as e:
-        assert "lease plugin" in str(e) or "pseudo" in str(e), str(e)
-    else:
-        raise AssertionError(
-            "lease_claim must reject lease._default (L3 regression)")
-    reg.close_all()
-
-
 def test_failure_artefact_carries_identity_fields():
     """L8 regression: _failure_artefact's manifest must carry
     run_id, plan_digest, code_digest so an aggregator scripting on
@@ -1639,7 +1518,7 @@ def test_prune_skips_inflight_digests():
       a) digests the poller's published inflight.json says are live, OR
       b) digests whose DONE/.plan was created less than PRUNE_MIN_AGE_S
          seconds ago (covers the publish-lag window before the first
-         inflight push reaches the server -- a 105ms lease op finishes
+         inflight push reaches the server -- a quick failure finishes
          long before STATUS/inflight.json catches up).
     Old, non-inflight DONE/.plan files do get pruned.
     """
@@ -2126,13 +2005,10 @@ def main():
         test_msc_write_prbs_inventory_documents_reproduction,
         test_supervisor_heartbeat_stale_uses_monotonic_age,
         test_watchdog_log_records_before_and_after_process_snapshots,
-        test_lease_lifecycle,
-        test_lease_release_honors_explicit_token_without_resume,
         test_expect_lands_in_manifest,
         test_stream_truncation_marker_survives_multiple_cap_hits,
         test_stream_contains_bytes_incremental_and_cross_record,
         test_stream_contains_bytes_resets_after_truncation,
-        test_lease_claim_rejects_lease_pseudo_device,
         test_failure_artefact_carries_identity_fields,
         test_prune_skips_inflight_digests,
         test_stale_cancel_resolution_removes_orphan_running_record,

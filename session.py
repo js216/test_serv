@@ -17,7 +17,7 @@ from datetime import datetime
 
 from plan import PlanError
 from plugin import Op as OpSchema
-from plugin import BusyError, decode_args
+from plugin import decode_args
 
 
 DEFAULT_SESSION_S = 600.0
@@ -59,7 +59,7 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
                   expectations=None, message=None,
                   files=None, run_id=None, plan_digest=None,
                   code_digest=None, blob_digests=None,
-                  lease_token=None, checks=None, inert_reason=None):
+                  checks=None, inert_reason=None):
     """Single source of truth for the artefact ``manifest.json``
     shape. Both the session's success path and the poller's failure-
     artefact path emit through here so the two never drift on field
@@ -73,7 +73,7 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
                     nothing
         "errors"    n_errors > 0
         "failed"    poller refused before run_all even started
-                    (parse error, validation, lease conflict)
+                    (parse error, validation)
         "canceled"  signal_cancel landed mid-run
     ``checks[]`` carries machine-readable assertion records (hit /
     miss / timeout per *_expect or similar), distinct from
@@ -100,8 +100,6 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
         "code_digest": code_digest,
         "blob_digests": dict(blob_digests or {}),
     }
-    if lease_token is not None:
-        out["lease_token"] = lease_token
     if inert_reason is not None:
         out["inert_reason"] = inert_reason
     if message is not None:
@@ -110,7 +108,7 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
 
 
 def _is_job_device_key(key):
-    return bool(key) and not key.startswith("lease.") and not key.endswith(".any")
+    return bool(key) and not key.endswith(".any")
 
 
 def _append_device_usage(event, key, session):
@@ -321,19 +319,6 @@ class Session:
         # for one caller; that's gone now.
         self.bench_devices = None
         self.bench_ops = None
-        # If the plan starts with `lease:resume token=...`, the
-        # session's lock-acquire phase treats the token's held
-        # devices as owned (so lease_blocks_acquire returns None
-        # for our own token), and lease:claim sets this on success
-        # so a same-plan release defaults to it.
-        self.lease_token = None
-        # True iff lease_token was issued by THIS session (lease:claim);
-        # False if we just resumed someone else's claim. Only the
-        # claiming run's manifest publishes the token.
-        self.lease_just_claimed = False
-        # True iff lease:claim auto_release_on_session_end=true was
-        # set; the finally block drops the lease on session end.
-        self.lease_release_on_end = False
         # Plan/run identity, set by the dispatcher before run_all.
         # Surfaces in manifest.json so an aggregator can group runs
         # of the same plan without parsing plan.txt.
@@ -440,40 +425,6 @@ class Session:
             except Exception:
                 pass
 
-    def _prescan_lease_resume(self):
-        """If the plan contains ``lease:resume token=...`` anywhere,
-        validate the token against the registry's live lease table and
-        bind ``self.lease_token`` BEFORE the eager-acquire path runs.
-        The binding makes ``lease_blocks_acquire`` return None for our
-        own held devices, so we can re-acquire the locks the previous
-        session released. A bad / expired token raises ``BusyError``.
-
-        We scan the whole plan, not just op[0], so a natural
-        ``description "..."`` line above ``lease:resume`` doesn't
-        silently skip the binding -- which would then fail eager
-        acquire with a confusing "device is leased to '...'" error.
-        Only the first ``lease:resume`` is honored; subsequent ones
-        are no-ops at op time anyway.
-        """
-        op = next((o for o in self.plan.ops
-                   if o.device == "lease" and o.verb == "resume"),
-                  None)
-        if op is None:
-            return
-        v = op.args.get("token")
-        if v is None:
-            raise BusyError("lease:resume requires token=...")
-        token = v.raw if hasattr(v, "raw") else str(v)
-        held = self.registry.lease_resume(token)  # raises on bad token
-        self.lease_token = token
-        # Don't include the token in the event message -- the live
-        # /inflight feed exposes events to any tunnel client every
-        # 2.5s, and the token is the lease credential. Same redaction
-        # rule as plugins/lease.py:_op_resume.
-        self.log_event(
-            "LEASE", "session",
-            f"resumed devices={sorted(held)} (token redacted)")
-
     # --- execution ---
 
     def run_all(self, plugins):
@@ -481,19 +432,6 @@ class Session:
         # MAX_SESSION_S so a rogue agent can't camp on a device.
         budget_s = min(self.runtime_s or DEFAULT_SESSION_S, MAX_SESSION_S)
         self._runtime_budget_s = budget_s
-        # If the plan starts with `lease:resume token=...`, validate
-        # the token now so the eager-acquire path treats the lease's
-        # devices as ours. A bad/expired token fails the session
-        # before any locks are touched, and other agents racing to
-        # grab the held device fast-fail via lease_blocks_acquire.
-        try:
-            self._prescan_lease_resume()
-        except BusyError as e:
-            self.errors.append(traceback.format_exc())
-            self.log_event("ERROR", "session", f"lease: {e}")
-            for s in self.streams.values():
-                s.close()
-            return
         # Job-atomic device locking: grab every device the plan
         # references up front and hold the locks for the whole session.
         # A job that needs {dsp, fpga} therefore pauses any other job
@@ -544,27 +482,6 @@ class Session:
             f"acquire now={eager_keys}  "
             f"deferred={sorted(self._deferred_names)}"
             if eager_keys or self._deferred_names else "(no devices)")
-        # Lease check: if any eager key is leased to a different
-        # token, fast-fail before acquiring locks. A competing plan
-        # gets a clean BusyError instead of blocking on the per-
-        # device RLock for the whole lease window.
-        for k in eager_keys:
-            blocker = self.registry.lease_blocks_acquire(k, self.lease_token)
-            if blocker is not None:
-                msg = (f"{k} is leased to {blocker!r}; "
-                       f"resume that lease or wait for it to expire")
-                self.errors.append(msg + "\n")
-                self.log_event("ERROR", "session", msg)
-                with self.registry.lock:
-                    for kk in self._pinned_specs:
-                        n = self.registry.pinned_specs.get(kk, 0) - 1
-                        if n > 0:
-                            self.registry.pinned_specs[kk] = n
-                        else:
-                            self.registry.pinned_specs.pop(kk, None)
-                for s in self.streams.values():
-                    s.close()
-                return
         eager_acquired = []
         lock_wait_canceled = False
         try:
@@ -724,16 +641,6 @@ class Session:
                         self.registry.pinned_specs.pop(k, None)
             for s in self.streams.values():
                 s.close()
-            # If the lease was claimed in this session with
-            # auto_release_on_session_end=true, drop the lease now
-            # so the bench unlocks on session end rather than
-            # holding for the full duration_s. Default is the
-            # original cross-session-hold behaviour.
-            if (getattr(self, "lease_release_on_end", False)
-                    and self.lease_token is not None):
-                self.registry.lease_release(self.lease_token)
-                self.log_event("LEASE", "session",
-                               "auto-released on session end")
             # Release deferred locks (acquired mid-session) first, then
             # eager locks. Reverse of acquisition order in both lists.
             for key, lk in reversed(self._deferred_locks):
@@ -853,12 +760,6 @@ class Session:
         # fpga.hx8k) hits this path twice with different keys; both
         # need session-long locks to keep the job-atomic invariant.
         if key not in getattr(self, "_session_locked_keys", set()):
-            blocker = self.registry.lease_blocks_acquire(
-                key, self.lease_token)
-            if blocker is not None:
-                raise BusyError(
-                    f"{key} is leased to {blocker!r}; resume that "
-                    f"lease or wait for it to expire")
             with self.registry.lock:
                 lk = self.registry.per_dev_lock.setdefault(
                     key, threading.RLock())
@@ -1232,11 +1133,6 @@ def pack_artefact(session):
         plan_digest=session.plan_digest,
         code_digest=session.code_digest,
         blob_digests=blob_digests,
-        # Only the *claiming* run publishes the lease token. A resume
-        # run wouldn't add anything an agent doesn't already know,
-        # but would re-expose the credential.
-        lease_token=(session.lease_token if session.lease_just_claimed
-                     else None),
         inert_reason=inert_reason,
     )
     manifest_text = json.dumps(manifest, indent=2) + "\n"

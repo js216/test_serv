@@ -160,7 +160,6 @@ GET /devices                  # poller's device-probe snapshot
 GET /ops                      # bench.ops.json (full plugin/op map)
 GET /inflight                 # live tail: per-session events + stream peeks
 GET /bench                    # bench identity + uptime + thread/fd/RSS metrics
-GET /leases                   # token-redacted live lease snapshot
 GET /cancels                  # poller pulls cancel markers (internal use)
 GET /examples                 # bundled starter plan names (filtered to runnable)
 GET /examples/<name>          # plan body as text/plain
@@ -197,9 +196,7 @@ ctrl-verb    k=v ...           # control: mark, delay, inventory,
 ```
 
 The `plugin:op` short form errors with `ambiguous: 2 instances` when
-the bench has more than one instance of the named plugin. Lease ops
-(`lease:claim devices=...`) require fully-qualified `plugin.id`
-strings in the device list.
+the bench has more than one instance of the named plugin.
 
 Values are parsed as:
 
@@ -240,41 +237,13 @@ Control verbs:
 Unknown device, op, arg, or arg type is rejected before any hardware
 is touched.
 
-### holding a device across plans
+### device hold lifetime
 
-The `lease` plugin is the way to keep a device pinned across multiple
-plan submissions -- typical use case is an interactive debug window
-where each plan reads previous output before deciding what to do
-next, or a multi-agent bench where another agent must not grab the
-device between two of your submissions.
-
-```
-# plan 1: claim dsp.A for ten minutes. The issued token is written
-# ONLY to manifest.lease_token in the artefact -- not into a stream
-# or timeline event -- so the live /inflight feed doesn't expose it.
-lease:claim devices="dsp.A" duration_s=600
-
-# plan 2..N: resume and do work; other agents get fast BusyError if
-# they try to acquire dsp.A while the lease is live
-lease:resume token="abc1234..."
-dsp.A:uart_open
-...
-
-# plan N+1: release early (or just let the duration expire)
-lease:resume token="abc1234..."
-lease:release token="abc1234..."
-```
-
-To read the token:
-```
-python3 submit.py examples/lease_claim.plan --wait 5 --extract /tmp/lease
-python3 -c 'import json; print(json.load(open("/tmp/lease/manifest.json"))["lease_token"])'
-```
-
-Lease state is in-memory on the poller. A poller restart drops every
-live lease (the operator can re-claim). See
-`examples/lease_{claim,resume,release}.plan` and
-`test_lease_lifecycle` in `test_core.py` for the canonical flow.
+Device ownership is scoped to a single submitted job. At session
+start, the poller locks every resolvable device referenced by the
+plan and keeps those locks until the job finishes or is canceled.
+There is no cross-job lease or token mechanism; once the artefact is
+produced, the devices are available to later jobs.
 
 ### artefact layout
 
@@ -308,7 +277,7 @@ only when raw bytes are needed. `manifest.status` is one of:
                 was actually checked
 - `errors`   -- one or more ops raised
 - `failed`   -- the poller refused before the session even started
-                (parse error, validation, lease conflict)
+                (parse error, validation)
 - `canceled` -- a DELETE /jobs/<digest> arrived mid-run
 
 ### device config

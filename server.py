@@ -51,8 +51,7 @@ STATIC_CONTENT_TYPES = {
 # Names the poller is allowed to push into the STATUS dir. Anything
 # else is rejected so a foreign POST can't drop arbitrary files there.
 ALLOWED_STATUS_FILES = (
-    "devices.json", "ops.json", "inflight.json", "bench.json",
-    "leases.json")
+    "devices.json", "ops.json", "inflight.json", "bench.json")
 
 
 SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
@@ -165,8 +164,8 @@ def prune_stale_jobs():
        publish tick (2.5s).
     2) DONE/.plan mtime younger than PRUNE_MIN_AGE_S: covers the
        gap before the first inflight push reaches the server. A
-       lease op or quick failure can finish in ~100ms -- long
-       before STATUS/inflight.json catches up -- and was
+       quick failure can finish in ~100ms -- long before
+       STATUS/inflight.json catches up -- and was
        previously vulnerable to "operator clicked clear-stale
        just after pickup", which deleted DONE/.plan, made the
        upload 409, and parked the artefact under refused/.
@@ -536,9 +535,6 @@ class Handler(BaseHTTPRequestHandler):
         if path == "bench":
             return self._send_json(
                 _read_file(os.path.join(STATUS, "bench.json")) or b"{}")
-        if path == "leases":
-            return self._send_json(
-                _read_file(os.path.join(STATUS, "leases.json")) or b"[]")
         if path == "jobs":
             return self._list_jobs()
         if path == "cancels":
@@ -1247,7 +1243,7 @@ class Handler(BaseHTTPRequestHandler):
         # plan that needs blobs we don't ship lands there, the
         # operator picks it, clicks submit, and gets an opaque 404.
         # Better to just hide it. Plans with no @blob refs (the
-        # majority of bundled examples: inventory, lease_*, dsp_uart,
+        # majority of bundled examples: inventory, dsp_uart,
         # fpga_uart, fpga_blink, ...) always pass.
         try:
             entries = sorted(
