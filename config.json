@@ -127,8 +127,8 @@
   "ssh": {
     "instances": [
       {
-        "id": "target",
-        "ip": "172.25.0.115",
+        "id": "evb",
+        "ip": "172.25.0.132",
         "user": "root",
         "key":         "~/.ssh/test_serv_embedded",
         "known_hosts": "~/.ssh/test_serv_known_hosts"
