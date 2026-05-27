@@ -1900,11 +1900,20 @@ def test_multi_instance_plan_holds_all_dev_locks_for_session():
     instance. A parallel session could win the lock between ops on
     fake.B, breaking the job-atomic invariant.
     """
-    import threading as _th
+    entered = threading.Event()
+    release = threading.Event()
+
+    def _block_once(session, h, args):
+        entered.set()
+        assert release.wait(5), "test timed out waiting to release op"
 
     class TwoInstancePlugin(FakePlugin):
         name = "twoinst"
-        ops = {"tick": Op(args={}, doc="no-op", run=_noop)}
+        ops = {
+            "block": Op(args={}, doc="block until test releases",
+                        run=_block_once),
+            "tick": Op(args={}, doc="no-op", run=_noop),
+        }
 
         def probe(self):
             return [{"id": "A"}, {"id": "B"}]
@@ -1914,20 +1923,32 @@ def test_multi_instance_plan_holds_all_dev_locks_for_session():
     reg.refresh()
 
     parsed = plan.load_tar(plan.pack_tar(
-        "twoinst.A:tick\ntwoinst.B:tick\n", {}))
+        "twoinst.A:block\ntwoinst.B:tick\n", {}))
     session = Session(reg, parsed)
-    session.run_all(plugins)
+    t = threading.Thread(target=session.run_all, args=(plugins,))
+    t.start()
+    try:
+        assert entered.wait(5), "session did not enter blocking op"
+        locked = getattr(session, "_session_locked_keys", set())
+        assert "twoinst.A" in locked, locked
+        assert "twoinst.B" in locked, locked
 
-    # Both keys must be in the session-locked set after the run.
-    locked = getattr(session, "_session_locked_keys", set())
-    assert "twoinst.A" in locked, locked
-    assert "twoinst.B" in locked, locked
-    # The per-device RLocks must be the same identity that's now
-    # tracked in _deferred_locks (so the session's finally-release
-    # actually drops them on exit). Both instances should appear.
-    deferred = getattr(session, "_deferred_locks", [])
-    expected = {reg.per_dev_lock["twoinst.A"], reg.per_dev_lock["twoinst.B"]}
-    assert set(deferred) == expected, (deferred, expected)
+        # The job-atomic guarantee is about real lock ownership while
+        # the session is still running. Both device locks must already
+        # be held even though only the first op has started.
+        got = []
+        for key in ("twoinst.A", "twoinst.B"):
+            lk = reg.per_dev_lock[key]
+            ok = lk.acquire(blocking=False)
+            got.append((key, ok))
+            if ok:
+                lk.release()
+        assert got == [("twoinst.A", False), ("twoinst.B", False)], got
+    finally:
+        release.set()
+        t.join(5)
+    assert not t.is_alive(), "session thread did not exit"
+    assert not session.errors, session.errors
     reg.close_all()
 
 
