@@ -15,6 +15,7 @@ import time
 import urllib.error
 
 from plugins.tcp import TcpPlugin
+from plugins.usb import UsbPlugin
 import plan
 import server
 import submit
@@ -198,7 +199,7 @@ def test_session_closes_touched_handles_at_job_end():
 def test_inventory_returns_devices_and_ops_streams():
     parsed = plan.load_tar(plan.pack_tar("inventory\n", {}))
     fake = FakePlugin()
-    plugins = {"fake": fake}
+    plugins = {"fake": fake, "usb": UsbPlugin()}
     reg = DeviceRegistry(plugins)
     reg.refresh()
 
@@ -214,8 +215,57 @@ def test_inventory_returns_devices_and_ops_streams():
     assert "mark" in ops["_control"]["ops"]
     assert "fake" in ops
     assert "emit" in ops["fake"]["ops"]
+    usb_ops = ops["usb"]["ops"]
+    assert usb_ops["descriptor"]["optional_args"] == {
+        "vid": "int", "pid": "int", "serial": "str"}
+    assert "usb.any" in ops["usb"]["doc"]
+    assert "selectors must match exactly one device" in (
+        usb_ops["bulk_read"]["doc"])
 
     reg.close_all()
+
+
+def test_usb_any_descriptor_uses_unique_selector():
+    import plugins.usb as usb_mod
+
+    class FakeSession:
+        def __init__(self):
+            self.data = bytearray()
+        def stream(self, _name):
+            return self
+        def append(self, data):
+            self.data.extend(data)
+
+    dev_a = object()
+    dev_b = object()
+    old_find = usb_mod._find_devices
+    old_descriptor = usb_mod._descriptor_record
+    old_record = usb_mod._device_record
+    try:
+        usb_mod._find_devices = lambda vid=None, pid=None, serial=None: (
+            [dev_a] if serial == "A" else [dev_a, dev_b])
+        usb_mod._descriptor_record = lambda dev: {"selected": dev is dev_a}
+        usb_mod._device_record = lambda dev: {
+            "vid": "0x1234", "pid": "0xabcd",
+            "serial": "A" if dev is dev_a else "B"}
+        h = usb_mod.UsbHandle({"id": "any", "list_only": True}, None)
+        sess = FakeSession()
+        usb_mod._op_descriptor(
+            sess, h, {"vid": 0x1234, "pid": 0xabcd, "serial": "A"})
+        assert b'"selected": true' in bytes(sess.data)
+        assert h.selected == [dev_a]
+        try:
+            usb_mod._op_descriptor(
+                FakeSession(), h, {"vid": 0x1234, "pid": 0xabcd,
+                                   "serial": None})
+        except RuntimeError as e:
+            assert "ambiguous" in str(e), e
+        else:
+            raise AssertionError("ambiguous usb.any selector should fail")
+    finally:
+        usb_mod._find_devices = old_find
+        usb_mod._descriptor_record = old_descriptor
+        usb_mod._device_record = old_record
 
 
 def test_tcp_recv_captures_stream_and_expectation():
@@ -1968,6 +2018,7 @@ def main():
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
+        test_usb_any_descriptor_uses_unique_selector,
         test_tcp_recv_captures_stream_and_expectation,
         test_tcp_recv_expect_mismatch_fails_after_capture,
         test_server_rest_queue_helpers,
