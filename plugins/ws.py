@@ -15,7 +15,13 @@ MAX_RECV = 1024 * 1024 * 1024
 
 
 def _lazy_websocket():
-    import websocket
+    try:
+        import websocket
+    except ImportError as e:
+        raise ImportError(
+            "ws plugin requires websocket-client; install poller "
+            "dependencies with `pip install -r requirements.txt`"
+        ) from e
     return websocket
 
 
