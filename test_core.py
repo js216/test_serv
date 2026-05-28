@@ -15,6 +15,7 @@ import time
 import urllib.error
 
 from plugins.tcp import TcpPlugin
+from plugins.dmesg import DmesgPlugin
 from plugins.usb import UsbPlugin
 from plugins.usbtmc import _info_matches as _usbtmc_info_matches
 import plan
@@ -200,7 +201,7 @@ def test_session_closes_touched_handles_at_job_end():
 def test_inventory_returns_devices_and_ops_streams():
     parsed = plan.load_tar(plan.pack_tar("inventory\n", {}))
     fake = FakePlugin()
-    plugins = {"fake": fake, "usb": UsbPlugin()}
+    plugins = {"dmesg": DmesgPlugin(), "fake": fake, "usb": UsbPlugin()}
     reg = DeviceRegistry(plugins)
     reg.refresh()
 
@@ -212,8 +213,12 @@ def test_inventory_returns_devices_and_ops_streams():
     devices = session.bench_devices
     ops = session.bench_ops
     assert devices is not None and ops is not None
-    assert devices[0]["id"] == "fake.0"
+    assert any(d["id"] == "fake.0" for d in devices), devices
+    assert any(d["id"] == "dmesg.any" for d in devices), devices
     assert "mark" in ops["_control"]["ops"]
+    assert "dmesg" in ops
+    assert "tail" in ops["dmesg"]["ops"]
+    assert "kernel.dmesg_restrict=0" in ops["dmesg"]["ops"]["tail"]["doc"]
     assert "fake" in ops
     assert "emit" in ops["fake"]["ops"]
     usb_ops = ops["usb"]["ops"]
@@ -224,6 +229,50 @@ def test_inventory_returns_devices_and_ops_streams():
         usb_ops["bulk_read"]["doc"])
 
     reg.close_all()
+
+
+def test_dmesg_tail_captures_last_lines():
+    import plugins.dmesg as dmesg_mod
+
+    class FakeStream:
+        def __init__(self):
+            self.data = bytearray()
+        def append(self, data):
+            self.data.extend(data)
+
+    class FakeSession:
+        def __init__(self):
+            self.streams = {}
+            self.events = []
+        def bail_if_canceled(self, _where):
+            pass
+        def stream(self, name):
+            self.streams.setdefault(name, FakeStream())
+            return self.streams[name]
+        def log_event(self, kind, source, msg):
+            self.events.append((kind, source, msg))
+
+    class FakeResult:
+        returncode = 0
+        stdout = b"one\ntwo\nthree\n"
+        stderr = b""
+
+    old_run = dmesg_mod.subprocess.run
+    try:
+        calls = []
+        def fake_run(argv, capture_output, check, timeout):
+            calls.append((argv, capture_output, check, timeout))
+            return FakeResult()
+        dmesg_mod.subprocess.run = fake_run
+        sess = FakeSession()
+        dmesg_mod._op_tail(
+            sess, dmesg_mod.DmesgHandle(),
+            {"lines": 2, "timeout_ms": 500})
+        assert calls == [(["dmesg", "-T"], True, False, 0.5)]
+        assert bytes(sess.streams["dmesg.tail"].data) == b"two\nthree\n"
+        assert sess.events == [("DMESG", "dmesg:tail", "2 lines")]
+    finally:
+        dmesg_mod.subprocess.run = old_run
 
 
 def test_usb_any_descriptor_uses_unique_selector():
@@ -306,11 +355,13 @@ def test_usbtmc_sysfs_vid_pid_parse_as_hex():
         "serial": "evb-linux-usbtmc-0001",
     }
     inst = {
-        "usb_vid": "0x0483",
-        "usb_pid": "0x571e",
+        "usb_vid": "0483",
+        "usb_pid": "571e",
         "usb_serial": "evb-linux-usbtmc-0001",
     }
     assert _usbtmc_info_matches(info, inst)
+    assert _usbtmc_info_matches(
+        info, {**inst, "usb_vid": "0x0483", "usb_pid": "0x571e"})
     assert not _usbtmc_info_matches(info, {**inst, "usb_pid": "0x571d"})
 
 
@@ -2064,6 +2115,7 @@ def main():
         test_session_runs_and_artefact_has_expected_shape,
         test_session_closes_touched_handles_at_job_end,
         test_inventory_returns_devices_and_ops_streams,
+        test_dmesg_tail_captures_last_lines,
         test_usb_any_descriptor_uses_unique_selector,
         test_usb_inventory_lists_configured_absent_instances,
         test_tcp_recv_captures_stream_and_expectation,

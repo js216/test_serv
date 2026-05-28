@@ -54,13 +54,22 @@ def _sysfs_hex_int(val):
     return int(str(val), 16)
 
 
+def _config_usb_id_int(val):
+    if isinstance(val, int):
+        return val
+    s = str(val)
+    if s.lower().startswith("0x"):
+        return int(s, 0)
+    return int(s, 16)
+
+
 def _info_matches(info, inst):
     want_vid = inst.get("usb_vid") or inst.get("vid")
     want_pid = inst.get("usb_pid") or inst.get("pid")
     want_serial = inst.get("usb_serial") or inst.get("serial")
-    if want_vid and _sysfs_hex_int(info["vid"]) != config.as_int(want_vid):
+    if want_vid and _sysfs_hex_int(info["vid"]) != _config_usb_id_int(want_vid):
         return False
-    if want_pid and _sysfs_hex_int(info["pid"]) != config.as_int(want_pid):
+    if want_pid and _sysfs_hex_int(info["pid"]) != _config_usb_id_int(want_pid):
         return False
     if want_serial and info["serial"] != str(want_serial):
         return False
