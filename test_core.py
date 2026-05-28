@@ -16,6 +16,7 @@ import urllib.error
 
 from plugins.tcp import TcpPlugin
 from plugins.usb import UsbPlugin
+from plugins.usbtmc import _info_matches as _usbtmc_info_matches
 import plan
 import server
 import submit
@@ -296,6 +297,21 @@ def test_usb_inventory_lists_configured_absent_instances():
         assert not any(s["id"] == "usbtmc" for s in specs), specs
     finally:
         config_mod._cached = old_cached
+
+
+def test_usbtmc_sysfs_vid_pid_parse_as_hex():
+    info = {
+        "vid": "483",
+        "pid": "571E",
+        "serial": "evb-linux-usbtmc-0001",
+    }
+    inst = {
+        "usb_vid": "0x0483",
+        "usb_pid": "0x571e",
+        "usb_serial": "evb-linux-usbtmc-0001",
+    }
+    assert _usbtmc_info_matches(info, inst)
+    assert not _usbtmc_info_matches(info, {**inst, "usb_pid": "0x571d"})
 
 
 def test_tcp_recv_captures_stream_and_expectation():

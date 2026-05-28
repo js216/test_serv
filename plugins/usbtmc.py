@@ -48,13 +48,19 @@ def _all_nodes():
     return sorted(glob.glob("/dev/usbtmc*"))
 
 
+def _sysfs_hex_int(val):
+    if val is None or val == "":
+        return None
+    return int(str(val), 16)
+
+
 def _info_matches(info, inst):
     want_vid = inst.get("usb_vid") or inst.get("vid")
     want_pid = inst.get("usb_pid") or inst.get("pid")
     want_serial = inst.get("usb_serial") or inst.get("serial")
-    if want_vid and info["vid"].lower() != f"{config.as_int(want_vid):04x}":
+    if want_vid and _sysfs_hex_int(info["vid"]) != config.as_int(want_vid):
         return False
-    if want_pid and info["pid"].lower() != f"{config.as_int(want_pid):04x}":
+    if want_pid and _sysfs_hex_int(info["pid"]) != config.as_int(want_pid):
         return False
     if want_serial and info["serial"] != str(want_serial):
         return False
@@ -112,12 +118,10 @@ def _read_with_timeout(fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK,
         remain = max(0.0, deadline - time.monotonic())
         if remain <= 0:
             break
-        r, _w, _x = select.select([fd], [], [], min(0.2, remain))
-        if not r:
-            continue
         try:
             data = os.read(fd, min(length - total, chunk_size))
         except (BlockingIOError, InterruptedError):
+            time.sleep(min(0.01, remain))
             continue
         if not data:
             break
@@ -140,12 +144,10 @@ def _read_to_stream(session, fd, stream_name, length, timeout_ms,
         remain = max(0.0, deadline - time.monotonic())
         if remain <= 0:
             break
-        r, _w, _x = select.select([fd], [], [], min(0.2, remain))
-        if not r:
-            continue
         try:
             data = os.read(fd, min(length - total, chunk_size))
         except (BlockingIOError, InterruptedError):
+            session.cancel_event.wait(min(0.01, remain))
             continue
         if not data:
             break
