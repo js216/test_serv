@@ -365,6 +365,175 @@ def test_usbtmc_sysfs_vid_pid_parse_as_hex():
     assert not _usbtmc_info_matches(info, {**inst, "usb_pid": "0x571d"})
 
 
+class _UsbtmcFakeStream:
+    def __init__(self):
+        self.data = bytearray()
+
+    def append(self, data):
+        self.data.extend(data)
+
+
+class _UsbtmcFakeSession:
+    def __init__(self):
+        self.streams = {}
+        self.events = []
+        self.checks = []
+        self.cancel_event = threading.Event()
+
+    def stream(self, name):
+        return self.streams.setdefault(name, _UsbtmcFakeStream())
+
+    def bail_if_canceled(self, _where):
+        pass
+
+    def log_event(self, *a):
+        self.events.append(a)
+
+    def record_check(self, check, target, desc, result, evidence):
+        self.checks.append((check, target, desc, result, evidence))
+
+
+def _usbtmc_fd_with(data):
+    r, w = os.pipe()
+    os.write(w, data)
+    os.close(w)
+    return r
+
+
+def test_usbtmc_selector_matches_unique_node():
+    import plugins.usbtmc as u
+
+    nodes = {
+        "/dev/usbtmc0": {"node": "/dev/usbtmc0", "id": "0", "vid": "0483",
+                         "pid": "571e", "serial": "AAA"},
+        "/dev/usbtmc1": {"node": "/dev/usbtmc1", "id": "1", "vid": "0483",
+                         "pid": "571e", "serial": "BBB"},
+    }
+    old_all, old_info = u._all_nodes, u._node_info
+    try:
+        u._all_nodes = lambda: sorted(nodes)
+        u._node_info = lambda n: nodes[n]
+        # No selector -> None (let the caller fall back to handle fd).
+        assert u._match_selected({}) is None
+        # Unique serial selects exactly one node.
+        assert u._match_selected({"serial": "BBB"})["node"] == "/dev/usbtmc1"
+        # vid/pid alone is ambiguous across both nodes.
+        try:
+            u._match_selected({"vid": 0x0483, "pid": 0x571e})
+        except RuntimeError as e:
+            assert "ambiguous" in str(e), e
+        else:
+            raise AssertionError("ambiguous selector should fail")
+        # A selector matching nothing is an error, not a silent miss.
+        try:
+            u._match_selected({"serial": "ZZZ"})
+        except RuntimeError as e:
+            assert "no devices" in str(e), e
+        else:
+            raise AssertionError("no-match selector should fail")
+    finally:
+        u._all_nodes, u._node_info = old_all, old_info
+
+
+def test_usbtmc_any_op_opens_node_from_selector():
+    import plugins.usbtmc as u
+
+    payload = b"hello usbtmc"
+    fd = _usbtmc_fd_with(payload)
+    info = {"node": "/dev/usbtmc7", "id": "7", "vid": "0483",
+            "pid": "571e", "serial": "SER7"}
+    opened = []
+    old_match, old_open, old_close = u._match_selected, os.open, os.close
+    try:
+        u._match_selected = lambda args: info if args.get("serial") else None
+        os.open = lambda path, flags: opened.append(path) or fd
+        os.close = lambda f: None  # the test owns the pipe fd
+        sess = _UsbtmcFakeSession()
+        h = u.UsbTmcHandle({"id": "any", "list_only": True})
+        h.fd = None
+        u._op_read(sess, h, {"length": len(payload), "serial": "SER7",
+                             "expect_sha256":
+                                 hashlib.sha256(payload).hexdigest()})
+        assert opened == ["/dev/usbtmc7"], opened
+        hit = [c for c in sess.checks if c[0] == "usbtmc_read_sha256"]
+        assert hit and hit[0][3] == "hit", sess.checks
+        # Verify mode must NOT store the payload in a stream.
+        assert "usbtmc.read" not in sess.streams, sess.streams
+    finally:
+        u._match_selected, os.open, os.close = old_match, old_open, old_close
+        os.close(fd)
+
+
+def test_usbtmc_read_verify_discards_and_lifts_cap():
+    import plugins.usbtmc as u
+
+    payload = b"A" * 5000
+    fd = _usbtmc_fd_with(payload)
+    try:
+        sess = _UsbtmcFakeSession()
+        h = u.UsbTmcHandle({"id": "0"})
+        h.fd = fd
+        # length far above MAX_BULK_XFER is allowed in verify mode; the
+        # pipe EOF stops the read at the real byte count.
+        u._op_read(sess, h, {
+            "length": u.MAX_BULK_XFER + 1,
+            "expect_sha256": hashlib.sha256(payload).hexdigest(),
+            "expect_crc32": __import__("zlib").crc32(payload),
+        })
+        sha_ok = [c for c in sess.checks if c[0] == "usbtmc_read_sha256"]
+        crc_ok = [c for c in sess.checks if c[0] == "usbtmc_read_crc32"]
+        assert sha_ok and sha_ok[0][3] == "hit", sess.checks
+        assert crc_ok and crc_ok[0][3] == "hit", sess.checks
+        assert "usbtmc.read" not in sess.streams, sess.streams
+    finally:
+        os.close(fd)
+
+
+def test_usbtmc_read_verify_mismatch_raises():
+    import plugins.usbtmc as u
+
+    payload = b"payload-bytes"
+    fd = _usbtmc_fd_with(payload)
+    try:
+        sess = _UsbtmcFakeSession()
+        h = u.UsbTmcHandle({"id": "0"})
+        h.fd = fd
+        try:
+            u._op_read(sess, h, {"length": len(payload),
+                                 "expect_sha256": "00" * 32})
+        except RuntimeError as e:
+            assert "sha256 mismatch" in str(e), e
+        else:
+            raise AssertionError("sha256 mismatch should raise")
+        miss = [c for c in sess.checks if c[0] == "usbtmc_read_sha256"]
+        assert miss and miss[0][3] == "miss", sess.checks
+    finally:
+        os.close(fd)
+
+
+def test_usbtmc_read_plain_stores_and_caps():
+    import plugins.usbtmc as u
+
+    payload = b"store me"
+    fd = _usbtmc_fd_with(payload)
+    try:
+        sess = _UsbtmcFakeSession()
+        h = u.UsbTmcHandle({"id": "0"})
+        h.fd = fd
+        u._op_read(sess, h, {"length": len(payload)})
+        assert bytes(sess.streams["usbtmc.read"].data) == payload
+        assert not sess.checks, sess.checks
+        # Without verify, the 512 MiB cap still applies.
+        try:
+            u._op_read(sess, h, {"length": u.MAX_BULK_XFER + 1})
+        except ValueError as e:
+            assert "out of range" in str(e), e
+        else:
+            raise AssertionError("plain read above cap should raise")
+    finally:
+        os.close(fd)
+
+
 def test_tcp_recv_captures_stream_and_expectation():
     ready = threading.Event()
 
@@ -2118,6 +2287,11 @@ def main():
         test_dmesg_tail_captures_last_lines,
         test_usb_any_descriptor_uses_unique_selector,
         test_usb_inventory_lists_configured_absent_instances,
+        test_usbtmc_selector_matches_unique_node,
+        test_usbtmc_any_op_opens_node_from_selector,
+        test_usbtmc_read_verify_discards_and_lifts_cap,
+        test_usbtmc_read_verify_mismatch_raises,
+        test_usbtmc_read_plain_stores_and_caps,
         test_tcp_recv_captures_stream_and_expectation,
         test_tcp_recv_expect_mismatch_fails_after_capture,
         test_server_rest_queue_helpers,

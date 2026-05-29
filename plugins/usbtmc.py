@@ -2,11 +2,14 @@
 # usbtmc.py --- Linux USBTMC class-driver access (/dev/usbtmcN)
 # Copyright (c) 2026 Jakob Kastelic
 
+import contextlib
 import glob
+import hashlib
 import json
 import os
 import select
 import time
+import zlib
 
 import config
 from plugin import DevicePlugin, Op
@@ -15,6 +18,10 @@ from plugin import DevicePlugin, Op
 MAX_QUERY_READ = 16 * 1024 * 1024
 MAX_BULK_XFER = 512 * 1024 * 1024
 DEFAULT_CHUNK = 1 << 20
+
+
+def _fmt_crc32(v):
+    return f"0x{v & 0xffffffff:08x}"
 
 
 def _sys_read(path):
@@ -90,6 +97,62 @@ def _match_instance(inst):
     return None
 
 
+def _selector_args(args):
+    sel = {k: args.get(k) for k in ("vid", "pid", "serial")}
+    if all(v is None for v in sel.values()):
+        return None
+    return sel
+
+
+def _match_selected(args):
+    sel = _selector_args(args)
+    if sel is None:
+        return None
+    matches = [
+        info for info in (_node_info(n) for n in _all_nodes())
+        if _info_matches(info, sel)
+    ]
+    if not matches:
+        raise RuntimeError(
+            "usbtmc selector matched no devices "
+            f"(vid={sel['vid']!r} pid={sel['pid']!r} "
+            f"serial={sel['serial']!r})")
+    if len(matches) > 1:
+        nodes = sorted(m["node"] for m in matches)
+        raise RuntimeError(
+            "usbtmc selector is ambiguous; add vid/pid/serial. "
+            f"matches={nodes}")
+    return matches[0]
+
+
+@contextlib.contextmanager
+def _fd_for(h, args):
+    """Yield ``(fd, ident)`` for an op.
+
+    A concrete handle (usbtmc.<id>) already holds an open fd; selectors
+    are ignored, matching usb.any. The usbtmc.any pseudo-device has no
+    fd, so vid/pid/serial selectors must resolve to exactly one node,
+    which is opened for the duration of the op and closed afterwards.
+    """
+    if h.fd is not None:
+        yield h.fd, h.spec.get("id", h.spec.get("node"))
+        return
+    info = _match_selected(args)
+    if info is None:
+        raise RuntimeError(
+            "usbtmc.any ops require selectors (vid=0x1234 pid=0xabcd "
+            "and optional serial=\"...\") that match exactly one device; "
+            "use usbtmc.<id> for a configured/enumerated instance")
+    fd = os.open(info["node"], os.O_RDWR | os.O_NONBLOCK)
+    try:
+        yield fd, info.get("serial") or info["node"]
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def _encode_text(s):
     return str(s).encode()
 
@@ -141,13 +204,22 @@ def _read_with_timeout(fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK,
     return b"".join(chunks)
 
 
-def _read_to_stream(session, fd, stream_name, length, timeout_ms,
-                    chunk_size=DEFAULT_CHUNK):
+def _read_loop(session, fd, length, timeout_ms, chunk_size=DEFAULT_CHUNK,
+               stream=None, hashing=False):
+    """Read up to ``length`` bytes from ``fd`` within the timeout.
+
+    When ``stream`` is given each chunk is appended to it. When
+    ``hashing`` is set the bytes are folded into a running sha256/crc32
+    and otherwise discarded, so GB-scale transfers can be verified
+    byte-perfectly without buffering the payload. Returns
+    ``(total, elapsed_s, sha_or_None, crc)``.
+    """
     _check_chunk_size("usbtmc:read", chunk_size)
     deadline = time.monotonic() + timeout_ms / 1000.0
     total = 0
+    sha = hashlib.sha256() if hashing else None
+    crc = 0
     t0 = time.monotonic()
-    stream = session.stream(stream_name)
     while total < length:
         session.bail_if_canceled(f"usbtmc:read {total}/{length}B")
         remain = max(0.0, deadline - time.monotonic())
@@ -160,9 +232,13 @@ def _read_to_stream(session, fd, stream_name, length, timeout_ms,
             continue
         if not data:
             break
-        stream.append(data)
+        if stream is not None:
+            stream.append(data)
+        if sha is not None:
+            sha.update(data)
+            crc = zlib.crc32(data, crc)
         total += len(data)
-    return total, time.monotonic() - t0
+    return total, time.monotonic() - t0, sha, crc
 
 
 def _write_all(fd, data, timeout_ms, session=None, chunk_size=DEFAULT_CHUNK):
@@ -208,7 +284,8 @@ def _op_write(session, h, args):
     data = _encode_text(args["data"])
     session.bail_if_canceled("usbtmc:write")
     timeout_ms = args.get("timeout_ms") or 1000
-    written, elapsed = _write_all(h.fd, data, timeout_ms, session=session)
+    with _fd_for(h, args) as (fd, _ident):
+        written, elapsed = _write_all(fd, data, timeout_ms, session=session)
     if written != len(data):
         raise TimeoutError(
             f"usbtmc:write timed out after {written}/{len(data)}B")
@@ -222,8 +299,9 @@ def _op_write_blob(session, h, args):
     timeout_ms = args.get("timeout_ms") or 30000
     chunk_size = args.get("chunk_size") or DEFAULT_CHUNK
     min_rate_Bps = args.get("min_rate_Bps")
-    written, elapsed = _write_all(
-        h.fd, data, timeout_ms, session=session, chunk_size=chunk_size)
+    with _fd_for(h, args) as (fd, _ident):
+        written, elapsed = _write_all(
+            fd, data, timeout_ms, session=session, chunk_size=chunk_size)
     if written != len(data):
         raise TimeoutError(
             f"usbtmc:write_blob timed out after {written}/{len(data)}B")
@@ -235,30 +313,69 @@ def _op_write_blob(session, h, args):
 
 def _op_read(session, h, args):
     length = args["length"]
-    _check_bounds("usbtmc:read", length, MAX_BULK_XFER)
     timeout_ms = args.get("timeout_ms") or 30000
     chunk_size = args.get("chunk_size") or DEFAULT_CHUNK
     min_rate_Bps = args.get("min_rate_Bps")
     exact = bool(args.get("exact") or False)
-    got, elapsed = _read_to_stream(
-        session, h.fd, "usbtmc.read", length, timeout_ms, chunk_size)
+    expect_sha256 = args.get("expect_sha256")
+    expect_crc32 = args.get("expect_crc32")
+    verify = expect_sha256 is not None or expect_crc32 is not None
+    # Verify mode hashes-and-discards, so it has no buffering ceiling and
+    # lifts the stored-read cap to allow byte-perfect GB-scale checks.
+    if length < 0 or (not verify and length > MAX_BULK_XFER):
+        raise ValueError(f"usbtmc:read length out of range: {length}")
+    with _fd_for(h, args) as (fd, ident):
+        got, elapsed, sha, crc = _read_loop(
+            session, fd, length, timeout_ms, chunk_size,
+            stream=None if verify else session.stream("usbtmc.read"),
+            hashing=verify)
     if exact and got != length:
         raise TimeoutError(
             f"usbtmc:read expected {length}B, got {got}B")
     _check_min_rate("usbtmc:read", got, elapsed, min_rate_Bps)
     mbps = (got / elapsed / (1024 * 1024)) if elapsed > 0 else 0.0
+    if verify:
+        sha_hex = sha.hexdigest()
+        crc_hex = _fmt_crc32(crc)
+        evidence = {"bytes": got, "elapsed_s": elapsed,
+                    "sha256": sha_hex, "crc32": crc_hex}
+        session.log_event(
+            "USBTMC", "usbtmc:read",
+            f"{got}B in {elapsed:.3f}s @ {mbps:.2f} MiB/s "
+            f"sha256={sha_hex} crc32={crc_hex}")
+        if expect_sha256 is not None:
+            want = expect_sha256.lower()
+            ok = sha_hex == want
+            session.record_check(
+                "usbtmc_read_sha256", ident, f"sha256 == {want}",
+                "hit" if ok else "miss", evidence)
+            if not ok:
+                raise RuntimeError(
+                    f"usbtmc:read sha256 mismatch: got {sha_hex}, "
+                    f"expected {want}")
+        if expect_crc32 is not None:
+            want = expect_crc32 & 0xffffffff
+            ok = (crc & 0xffffffff) == want
+            session.record_check(
+                "usbtmc_read_crc32", ident, f"crc32 == {_fmt_crc32(want)}",
+                "hit" if ok else "miss", evidence)
+            if not ok:
+                raise RuntimeError(
+                    f"usbtmc:read crc32 mismatch: got {crc_hex}, "
+                    f"expected {_fmt_crc32(want)}")
+        return
     session.log_event("USBTMC", "usbtmc:read",
                       f"{got}B in {elapsed:.3f}s @ {mbps:.2f} MiB/s")
 
 
-def _query_bytes(session, h, cmd, length, timeout_ms):
+def _query_bytes(session, fd, cmd, length, timeout_ms):
     data = _encode_text(cmd)
     written, _elapsed = _write_all(
-        h.fd, data, timeout_ms, session=session, chunk_size=len(data) or 1)
+        fd, data, timeout_ms, session=session, chunk_size=len(data) or 1)
     if written != len(data):
         raise TimeoutError(
             f"usbtmc query write timed out after {written}/{len(data)}B")
-    return _read_with_timeout(h.fd, length, timeout_ms, session=session)
+    return _read_with_timeout(fd, length, timeout_ms, session=session)
 
 
 def _op_query(session, h, args):
@@ -266,7 +383,8 @@ def _op_query(session, h, args):
     _check_bounds("usbtmc:query", length, MAX_QUERY_READ)
     timeout_ms = args.get("timeout_ms") or 1000
     session.bail_if_canceled("usbtmc:query")
-    data = _query_bytes(session, h, args["data"], length, timeout_ms)
+    with _fd_for(h, args) as (fd, _ident):
+        data = _query_bytes(session, fd, args["data"], length, timeout_ms)
     session.stream("usbtmc.query").append(data)
     session.log_event("USBTMC", "usbtmc:query", f"{len(data)}B")
 
@@ -277,11 +395,12 @@ def _op_expect(session, h, args):
     timeout_ms = args.get("timeout_ms") or 1000
     sentinel = _encode_text(args["sentinel"])
     session.bail_if_canceled("usbtmc:expect")
-    data = _query_bytes(session, h, args["data"], length, timeout_ms)
+    with _fd_for(h, args) as (fd, ident):
+        data = _query_bytes(session, fd, args["data"], length, timeout_ms)
     session.stream("usbtmc.expect").append(data)
     hit = sentinel in data
     session.record_check(
-        "usbtmc_expect", h.spec.get("id", h.spec.get("node")),
+        "usbtmc_expect", ident,
         f"response contains {args['sentinel']!r}",
         "hit" if hit else "miss",
         {"response_len": len(data)})
@@ -293,13 +412,14 @@ def _op_expect(session, h, args):
 
 def _op_identify(session, h, args):
     timeout_ms = args.get("timeout_ms") or 1000
-    data = _query_bytes(session, h, "*IDN?\n", 4096, timeout_ms)
+    with _fd_for(h, args) as (fd, ident):
+        data = _query_bytes(session, fd, "*IDN?\n", 4096, timeout_ms)
     session.stream("usbtmc.idn").append(data)
     if args.get("expect") is not None:
         want = _encode_text(args["expect"])
         hit = want in data
         session.record_check(
-            "usbtmc_idn", h.spec.get("id", h.spec.get("node")),
+            "usbtmc_idn", ident,
             f"*IDN? contains {args['expect']!r}",
             "hit" if hit else "miss",
             {"response": data.decode("utf-8", "replace")})
@@ -337,45 +457,71 @@ class UsbTmcPlugin(DevicePlugin):
     doc = (
         "USB Test & Measurement Class via Linux /dev/usbtmcN. Use this "
         "when the gadget descriptors bind to the kernel usbtmc driver. "
-        "Ops are SCPI-friendly write/read/query/expect plus identify.")
+        "Ops are SCPI-friendly write/read/query/expect plus identify. "
+        "usbtmc.any is always present: use usbtmc.any:list to discover "
+        "nodes, then pass vid=0x1234 pid=0xabcd and optional "
+        "serial=\"...\" to any op to target exactly one device by serial "
+        "instead of usbtmc.0/.1. Selectors must match exactly one device.")
 
     ops = {
         "list": Op(args={}, doc="List /dev/usbtmc* devices as JSON.",
                    run=_op_list),
         "identify": Op(
             args={},
-            optional_args={"expect": "str", "timeout_ms": "int"},
-            doc="Send '*IDN?\\n' and append response to usbtmc.idn.",
+            optional_args={"expect": "str", "timeout_ms": "int",
+                           "vid": "int", "pid": "int", "serial": "str"},
+            doc=("Send '*IDN?\\n' and append response to usbtmc.idn. On "
+                 "usbtmc.any pass vid=0x1234 pid=0xabcd and optional "
+                 "serial=\"...\" to target exactly one device."),
             run=_op_identify),
         "write": Op(args={"data": "str"},
-                    optional_args={"timeout_ms": "int"},
-                    doc="Write text bytes; escapes are decoded by plan parser.",
+                    optional_args={"timeout_ms": "int",
+                                   "vid": "int", "pid": "int",
+                                   "serial": "str"},
+                    doc=("Write text bytes; escapes are decoded by plan "
+                         "parser. On usbtmc.any pass vid/pid/serial "
+                         "selectors to target exactly one device."),
                     run=_op_write),
         "write_blob": Op(
             args={"data": "blob"},
             optional_args={"timeout_ms": "int", "chunk_size": "int",
-                           "min_rate_Bps": "int"},
+                           "min_rate_Bps": "int",
+                           "vid": "int", "pid": "int", "serial": "str"},
             doc=("Write blob bytes using large chunks. Use for throughput "
                  "tests; min_rate_Bps can enforce USB high-speed-class "
-                 "performance."),
+                 "performance. On usbtmc.any pass vid/pid/serial selectors "
+                 "to target exactly one device."),
             run=_op_write_blob),
         "read": Op(
             args={"length": "int"},
             optional_args={"timeout_ms": "int", "chunk_size": "int",
-                           "min_rate_Bps": "int", "exact": "bool"},
+                           "min_rate_Bps": "int", "exact": "bool",
+                           "expect_sha256": "str", "expect_crc32": "int",
+                           "vid": "int", "pid": "int", "serial": "str"},
             doc=("Read up to length bytes into usbtmc.read using large "
                  "chunks. Use exact=true and min_rate_Bps for fast "
-                 "bulk-transfer checks."),
+                 "bulk-transfer checks. Passing expect_sha256 and/or "
+                 "expect_crc32 switches to streaming-verify mode: bytes "
+                 "are hashed and discarded (not stored), so the 512 MiB "
+                 "cap is lifted for byte-perfect GB-scale checks. On "
+                 "usbtmc.any pass vid/pid/serial selectors to target "
+                 "exactly one device."),
             run=_op_read),
         "query": Op(
             args={"data": "str"},
-            optional_args={"length": "int", "timeout_ms": "int"},
-            doc="Write command then read response into usbtmc.query.",
+            optional_args={"length": "int", "timeout_ms": "int",
+                           "vid": "int", "pid": "int", "serial": "str"},
+            doc=("Write command then read response into usbtmc.query. On "
+                 "usbtmc.any pass vid/pid/serial selectors to target "
+                 "exactly one device."),
             run=_op_query),
         "expect": Op(
             args={"data": "str", "sentinel": "str"},
-            optional_args={"length": "int", "timeout_ms": "int"},
-            doc="Query and require the response to contain sentinel.",
+            optional_args={"length": "int", "timeout_ms": "int",
+                           "vid": "int", "pid": "int", "serial": "str"},
+            doc=("Query and require the response to contain sentinel. On "
+                 "usbtmc.any pass vid/pid/serial selectors to target "
+                 "exactly one device."),
             run=_op_expect),
         "clear": Op(
             args={},
