@@ -100,10 +100,10 @@
       },
       {
         "id": "custom",
-        "description": "Custom STM32MP135 PCB's ROM DFU bootloader. iSerial 001E00063133511332303636.",
+        "description": "Custom STM32MP135 PCB's ROM DFU bootloader. iSerial 002500083133511332303636.",
         "usb_vid": "0x0483",
         "usb_pid": "0xDF11",
-        "usb_serial": "001E00063133511332303636"
+        "usb_serial": "002500083133511332303636"
       }
     ]
   },
