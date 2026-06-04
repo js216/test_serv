@@ -67,6 +67,33 @@
     ]
   },
 
+  "mp257": {
+    "instances": [
+      {
+        "id": "evb-uart1",
+        "description": "STM32MP257F-EV1 eval board, primary STLink-V3 VCP (interface MI_01 -> first console UART). STLink iSerial 0024003D4142501320353451.",
+        "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1, "serial": "0024003D4142501320353451" },
+        "baudrate": 115200,
+
+        "expected_usb_vid":       "0x0483",
+        "expected_usb_pid":       "0x3753",
+        "expected_usb_interface": 1,
+        "expected_usb_serial":    "0024003D4142501320353451"
+      },
+      {
+        "id": "evb-uart2",
+        "description": "STM32MP257F-EV1 eval board, second STLink-V3 VCP (interface MI_04 -> second UART). STLink iSerial 0024003D4142501320353451.",
+        "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 4, "serial": "0024003D4142501320353451" },
+        "baudrate": 115200,
+
+        "expected_usb_vid":       "0x0483",
+        "expected_usb_pid":       "0x3753",
+        "expected_usb_interface": 4,
+        "expected_usb_serial":    "0024003D4142501320353451"
+      }
+    ]
+  },
+
   "msc": {
     "instances": [
       {
