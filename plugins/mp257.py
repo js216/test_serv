@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# mp257.py --- STM32MP257 eval board serial console via STLink VCP
+# mp257.py --- STM32MP257F-DK Discovery Kit serial console via STLink VCP
 # Copyright (c) 2026 Jakob Kastelic
 
 import threading
@@ -147,7 +147,7 @@ def _op_uart_expect(session, h, args):
 
 class Mp257Plugin(DevicePlugin):
     name = "mp257"
-    doc = ("STM32MP257 eval board (MP257F-EV1) serial console via the "
+    doc = ("STM32MP257F-DK Discovery Kit serial console via the "
            "on-board STLink-V3 VCP (ST VID 0483 PID 3753). The STLink-V3 "
            "exposes two VCP UARTs -- interface MI_01 and MI_04 -- so each "
            "configured instance pins its own interface and is "
