@@ -114,7 +114,7 @@ class BenchMcuPlugin(DevicePlugin):
     name = "bench_mcu"
     doc = ("Small bench-helper MCU (STM32F405 wired to a serial port). "
            "Two reset lines, one per DUT:\n"
-           "  D13 -> EVB STM32MP135 reset (active LOW, idle HIGH).\n"
+           "  D13 -> STM32MP257F-EV1 reset (active LOW, idle HIGH).\n"
            "        Triggered by 'r' (or the dedicated reset_dut op).\n"
            "  D12 -> custom STM32MP135 PCB reset (active LOW, idle HIGH).\n"
            "        Triggered by 'R' (or the dedicated reset_dut2 op).\n"
@@ -129,7 +129,7 @@ class BenchMcuPlugin(DevicePlugin):
                        run=_op_identify),
         "reset_dut": Op(args={},
                         doc="Send 'r' to pulse D13 LOW for 100 ms -- "
-                            "resets the EVB STM32MP135.",
+                            "resets the STM32MP257F-EV1 eval board.",
                         run=_op_reset_dut),
         "reset_dut2": Op(args={},
                          doc="Send 'R' to pulse D12 LOW for 100 ms -- "
