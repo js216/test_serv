@@ -44,17 +44,6 @@
   "mp135": {
     "instances": [
       {
-        "id": "evb",
-        "description": "STM32MP135F-DK eval board. UART comes out on the on-board STLink-V3 VCP (interface 1). Paired with dfu.evb and msc.evb.",
-        "autodetect": { "vid": "0x0483", "pid": "0x3753", "interface": 1 },
-        "baudrate": 115200,
-
-        "expected_usb_vid":       "0x0483",
-        "expected_usb_pid":       "0x3753",
-        "expected_usb_interface": 1,
-        "expected_usb_serial":    "0044002F3132511838363431"
-      },
-      {
         "id": "custom",
         "description": "Custom STM32MP135 PCB. UART exposed via a USB-to-RS232 cable (FT232R, iSerial FTEKT7BP). No DFU/MSC instances configured for this board yet.",
         "autodetect": { "vid": "0x0403", "pid": "0x6001", "serial": "FTEKT7BP" },
@@ -97,14 +86,6 @@
   "msc": {
     "instances": [
       {
-        "id": "evb",
-        "description": "STM32MP135F-DK eval board's bare-metal MSC bootloader (visible only after DFU-flashing main.stm32). iSerial 002800425115 -- prefix matches the dfu.evb chip-UID, so this is the ST eval board.",
-        "usb_vid": "0x0483",
-        "usb_pid": "0x571d",
-        "usb_serial": "002800425115",
-        "block_size": 512
-      },
-      {
         "id": "custom",
         "description": "Custom STM32MP135 PCB (SRS-built). iSerial 002500085113 -- prefix matches the dfu.custom chip-UID.",
         "usb_vid": "0x0483",
@@ -118,13 +99,6 @@
   "dfu": {
     "cubeprog_exe": "/home/jk/projects/prog/stm32cubeprog/bin/STM32_Programmer_CLI",
     "instances": [
-      {
-        "id": "evb",
-        "description": "STM32MP135F-DK eval board's ROM DFU bootloader. iSerial 002800423232511538303631 is fixed-per-chip (derived from the SoC's factory unique ID).",
-        "usb_vid": "0x0483",
-        "usb_pid": "0xDF11",
-        "usb_serial": "002800423232511538303631"
-      },
       {
         "id": "custom",
         "description": "Custom STM32MP135 PCB's ROM DFU bootloader. iSerial 002500083133511332303636.",
@@ -167,6 +141,7 @@
     "instances": [
       {
         "id": "evb",
+        "description": "STM32MP257F-EV1 eval board over Ethernet (root login). NOTE: id kept as 'evb' for plan compatibility, but this is now the MP257, not the retired MP135F-DK eval board.",
         "ip": "172.25.0.115",
         "user": "root",
         "key":         "~/.ssh/test_serv_embedded",
