@@ -105,6 +105,13 @@
         "usb_vid": "0x0483",
         "usb_pid": "0xDF11",
         "usb_serial": "002500083133511332303636"
+      },
+      {
+        "id": "mp257",
+        "description": "STM32MP257F-EV1 eval board's ROM DFU bootloader. iSerial 002600224C42501400313951 (chip UID); DFU descriptor reports Device ID 0x505 = STM32MP25x family, distinguishing it from the MP13x (0x501) boards.",
+        "usb_vid": "0x0483",
+        "usb_pid": "0xDF11",
+        "usb_serial": "002600224C42501400313951"
       }
     ]
   },
