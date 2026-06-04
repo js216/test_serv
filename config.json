@@ -79,10 +79,10 @@
       },
       {
         "id": "custom",
-        "description": "Custom STM32MP135 PCB (SRS-built). iSerial 001E00065113 -- prefix matches the dfu.custom chip-UID.",
+        "description": "Custom STM32MP135 PCB (SRS-built). iSerial 002500085113 -- prefix matches the dfu.custom chip-UID.",
         "usb_vid": "0x0483",
         "usb_pid": "0x571d",
-        "usb_serial": "001E00065113",
+        "usb_serial": "002500085113",
         "block_size": 512
       }
     ]
