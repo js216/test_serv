@@ -152,8 +152,9 @@ class Mp257Plugin(DevicePlugin):
            "exposes two VCP UARTs -- interface MI_01 and MI_04 -- so each "
            "configured instance pins its own interface and is "
            "background-drained into its own mp257.<id>.uart stream. "
-           "Unlike the mp135 bench boards, this board is not wired to "
-           "bench_mcu, so reset is manual (board button / power).")
+           "Reset is wired to the bench MCU: pulse bench_mcu:reset_dut "
+           "('r' -> D13) to reboot this board, same mechanism the mp135 "
+           "boards use on their own lines.")
 
     ops = {
         "uart_open": Op(args={},
