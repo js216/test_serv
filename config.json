@@ -92,6 +92,14 @@
         "usb_pid": "0x571d",
         "usb_serial": "002500085113",
         "block_size": 512
+      },
+      {
+        "id": "mp257",
+        "description": "STM32MP257F-EV1 baremetal MSC bootloader -- NOT YET IMPLEMENTED. This instance is a CONTRACT for the bootloader agent: make the MSC gadget enumerate with exactly these descriptors and the bench probe will bind it automatically (kernel usb-storage -> /dev/sdX). VID 0x0483 (ST), PID 0x571d (same baremetal-MSC function id as the MP135 boards; disambiguated from msc.custom by iSerial). iSerial 002600224C42501400313951 is the MP257 SoC chip-UID, identical to its ROM DFU iSerial (dfu.mp257) so the gadget can present the factory UID verbatim. block_size 512. If the implementation lands with a different PID/serial/block size, update these three fields to match the live descriptors.",
+        "usb_vid": "0x0483",
+        "usb_pid": "0x571d",
+        "usb_serial": "002600224C42501400313951",
+        "block_size": 512
       }
     ]
   },
