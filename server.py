@@ -64,10 +64,12 @@ SAFE_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
 # OOM the server with a runaway body.
 MAX_ARTEFACT_BYTES = 256 * 1024 * 1024
 # Cap on /submit body size (the whole packed tar -- plan.txt plus
-# every blob it ships). 64 MiB comfortably covers FPGA bitstream +
-# DSP loader + STM32 firmware + sdcard image families; anything
-# larger should chunk via dfu:flash_layout pulling separate blobs.
-MAX_PLAN_BYTES = 64 * 1024 * 1024
+# every blob it ships). 256 MiB (matching MAX_ARTEFACT_BYTES) covers
+# FPGA bitstream + DSP loader + STM32 firmware + sdcard image families;
+# anything larger should chunk via dfu:flash_layout pulling separate
+# blobs. The body is buffered in memory, so this also bounds per-submit
+# RSS -- worst case MAX_QUEUED_PLANS * this.
+MAX_PLAN_BYTES = 256 * 1024 * 1024
 # Status snapshots are small JSON.
 MAX_STATUS_BYTES = 4 * 1024 * 1024
 
