@@ -37,6 +37,11 @@ SSH_TIMEOUT_S = 60
 # ConnectTimeout=5 in _ssh_argv handles unreachable.
 IDENTITY_TIMEOUT_S = 8
 _REMOTE_PATH_RE = re.compile(r"^/[A-Za-z0-9._/+-]+$")
+# IP/hostname and username must start alphanumeric so a caller-supplied
+# value can never be mistaken for an ssh/scp option (a leading '-'). The
+# argv is a list (no shell), so this is purely option-injection defense.
+_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 def _ssh_argv(ip, user, key, known_hosts):
@@ -95,10 +100,40 @@ def _run_child(session, proc, op_name, timeout_s):
     return stdout, stderr
 
 
+def _target(h, args):
+    """Resolve (ip, user, key, known_hosts) for this op call.
+
+    Concrete ssh.<id> instances pin ip/user from config and ignore any
+    ip/user op args (mirrors how usbtmc.<id> ignores selectors). The
+    ssh.any pseudo-device has no fixed target, so it REQUIRES an `ip`
+    op arg and accepts an optional `user` (default root). key and
+    known_hosts always come from the handle -- for ssh.any those are the
+    bench's default keypair + known_hosts file.
+    """
+    if h.ip is not None:
+        return h.ip, h.user, h.key, h.known_hosts
+    ip = args.get("ip")
+    if not ip:
+        raise ValueError(
+            "ssh.any ops require an `ip` arg (e.g. ip=172.25.0.46); "
+            "use a configured ssh.<id> instance for a fixed target")
+    if not _HOST_RE.match(ip):
+        raise ValueError(
+            f"ssh.any: invalid ip/host {ip!r}; allowed chars are "
+            f"A-Z a-z 0-9 . _ - and it must start alphanumeric")
+    user = args.get("user") or h.user or "root"
+    if not _USER_RE.match(user):
+        raise ValueError(
+            f"ssh.any: invalid user {user!r}; allowed chars are "
+            f"A-Z a-z 0-9 . _ - and it must start alphanumeric")
+    return ip, user, h.key, h.known_hosts
+
+
 def _op_exec(session, h, args):
     cmd = args["command"]
-    argv = _ssh_argv(h.ip, h.user, h.key, h.known_hosts) + [cmd]
-    session.log_event("SSH", "ssh:exec", cmd)
+    ip, user, key, known_hosts = _target(h, args)
+    argv = _ssh_argv(ip, user, key, known_hosts) + [cmd]
+    session.log_event("SSH", "ssh:exec", f"{user}@{ip}: {cmd}")
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE)
     timeout_s = _ssh_timeout_s(args)
@@ -142,14 +177,14 @@ def _op_put(session, h, args):
             "ssh:put path must be absolute and contain only "
             "A-Z a-z 0-9 . _ / + -")
 
+    ip, user, key, known_hosts = _target(h, args)
     timeout_s = _ssh_timeout_s(args)
     with tempfile.NamedTemporaryFile(prefix="test-serv-ssh-put-") as f:
         f.write(bytes(data))
         f.flush()
-        argv = _scp_argv(h.ip, h.user, h.key, h.known_hosts,
-                         f.name, dest_path)
+        argv = _scp_argv(ip, user, key, known_hosts, f.name, dest_path)
         session.log_event("SSH", "ssh:put",
-                          f"{len(data)}B -> {dest_path}")
+                          f"{len(data)}B -> {user}@{ip}:{dest_path}")
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE)
         stdout, stderr = _run_child(session, proc, "ssh:put", timeout_s)
@@ -181,6 +216,7 @@ def _op_pubkey(session, h, args):
 
 
 def _op_trust_host_key(session, h, args):
+    ip, _user, _key, known_hosts = _target(h, args)
     line = args["key"].strip()
     # Validate: <algo> <base64> [comment]; reject embedded newlines so
     # the agent can't smuggle multiple entries via a single op call.
@@ -198,7 +234,7 @@ def _op_trust_host_key(session, h, args):
     if session.canceled:
         raise RuntimeError("ssh:trust_host_key canceled before ssh-keygen")
     proc = subprocess.Popen(
-        ["ssh-keygen", "-R", h.ip, "-f", h.known_hosts],
+        ["ssh-keygen", "-R", ip, "-f", known_hosts],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _track_subproc(proc, session=session)
     try:
@@ -219,11 +255,11 @@ def _op_trust_host_key(session, h, args):
         _untrack_subproc(proc)
     # Append the new entry IP-prefixed; ssh-keygen leaves the file
     # without a trailing newline, so emit one before our line.
-    with open(h.known_hosts, "ab") as f:
-        f.write(f"{h.ip} {line}\n".encode())
+    with open(known_hosts, "ab") as f:
+        f.write(f"{ip} {line}\n".encode())
     session.log_event(
         "SSH", "ssh:trust_host_key",
-        f"replaced known_hosts entry for {h.ip}: {parts[0]}")
+        f"replaced known_hosts entry for {ip}: {parts[0]}")
 
 
 class SshHandle:
@@ -270,11 +306,18 @@ class SshPlugin(DevicePlugin):
         "       - a freshly-generated target host keypair, the private\n"
         "         half at /etc/ssh/ssh_host_ed25519_key (mode 0600)\n"
         "  3. `ssh:trust_host_key key=\"<the pub half from step 2>\"`\n"
-        "  4. `dfu.evb:flash_layout layout=@flash.tsv` (or whichever\n"
+        "  4. `dfu.custom:flash_layout layout=@flash.tsv` (or whichever\n"
         "      board's `dfu.<id>` you're targeting)\n"
-        "  5. `msc.evb:write data=@sdcard.img`\n"
+        "  5. `msc.custom:write data=@sdcard.img`\n"
         "  6. `delay ms=8000`  (wait for boot)\n"
         "  7. `ssh:exec command=\"...\"`  (drive the running system)\n"
+        "\n"
+        "Configured ssh.<id> instances pin a fixed IP/user (and optional\n"
+        "expected_uname identity gate). The ssh.any pseudo-device targets\n"
+        "an ARBITRARY host: pass ip=<host> (and optional user=, default\n"
+        "root) to exec / put / trust_host_key. It reuses the bench default\n"
+        "key + known_hosts and skips the uname gate, so the caller owns\n"
+        "target selection.\n"
         "\n"
         "Bench private key path, known_hosts path, target IP, user,\n"
         "and expected_uname live in config.json's `ssh` section.")
@@ -293,6 +336,7 @@ class SshPlugin(DevicePlugin):
             run=_op_pubkey),
         "trust_host_key": Op(
             args={"key": "str"},
+            optional_args={"ip": "str", "user": "str"},
             doc=("Agent -> bench. The agent generates a target host "
                  "keypair as part of its image build and embeds the "
                  "PRIVATE half in the rootfs at "
@@ -304,11 +348,12 @@ class SshPlugin(DevicePlugin):
                  "the next ssh:exec accepts the freshly booted "
                  "image. NEVER send the private host key to the "
                  "bench -- only the public half. Run this once per "
-                 "image build, before ssh:exec."),
+                 "image build, before ssh:exec. On ssh.any, also pass "
+                 "ip=<host> to name the target."),
             run=_op_trust_host_key),
         "exec": Op(
             args={"command": "str"},
-            optional_args={"timeout_ms": "int"},
+            optional_args={"timeout_ms": "int", "ip": "str", "user": "str"},
             doc=("Run an arbitrary shell command on the target as the "
                  "configured user (typically root). Stdout/stderr "
                  "land in streams ssh.exec / ssh.exec.stderr; the "
@@ -316,25 +361,30 @@ class SshPlugin(DevicePlugin):
                  "exit raises so the plan halts on failure. "
                  f"Per-call timeout: {SSH_TIMEOUT_S}s. Requires the "
                  "target's host pubkey to already be trusted -- run "
-                 "ssh:trust_host_key first per image build."),
+                 "ssh:trust_host_key first per image build. On ssh.any, "
+                 "also pass ip=<host> (and optional user=, default "
+                 "root)."),
             run=_op_exec),
         "put": Op(
             args={"data": "blob", "path": "str"},
-            optional_args={"timeout_ms": "int"},
+            optional_args={"timeout_ms": "int", "ip": "str", "user": "str"},
             doc=("Copy a plan blob to an absolute path on the target "
                  "using key-only scp with the same strict known_hosts "
                  "and pinned identity-key behavior as ssh:exec. "
                  "Stdout/stderr land in streams ssh.put / "
                  "ssh.put.stderr; non-zero exit raises. "
                  f"Per-call timeout: {SSH_TIMEOUT_S}s by default. "
-                 "Requires ssh:trust_host_key first per image build."),
+                 "Requires ssh:trust_host_key first per image build. "
+                 "On ssh.any, also pass ip=<host> (and optional "
+                 "user=, default root)."),
             run=_op_put),
     }
 
     def probe(self):
         if not shutil.which("ssh"):
             return []
-        out = []
+        section = config.section(self.name) or {}
+        concrete = []
         for inst in config.instances(self.name):
             key = os.path.expanduser(inst.get("key", ""))
             known_hosts = os.path.expanduser(inst.get("known_hosts", ""))
@@ -342,7 +392,7 @@ class SshPlugin(DevicePlugin):
                 continue
             if not known_hosts or not os.path.exists(known_hosts):
                 continue
-            out.append({
+            concrete.append({
                 "id": inst.get("id", "target"),
                 "ip": inst["ip"],
                 "user": inst.get("user", "root"),
@@ -351,11 +401,48 @@ class SshPlugin(DevicePlugin):
                 "expected_uname": inst.get("expected_uname"),
                 "description": inst.get("description"),
             })
+
+        out = []
+        # ssh.any: SSH/scp to an arbitrary host named by an `ip` op arg.
+        # Its default keypair + known_hosts come from the ssh section
+        # (default_key / default_known_hosts), or are inherited from the
+        # first usable configured instance so a single-target bench needs
+        # no extra config. Only advertised when both files exist, same
+        # gating as concrete instances.
+        def_key = section.get("default_key")
+        def_kh = section.get("default_known_hosts")
+        def_key = (os.path.expanduser(def_key) if def_key
+                   else (concrete[0]["key"] if concrete else None))
+        def_kh = (os.path.expanduser(def_kh) if def_kh
+                  else (concrete[0]["known_hosts"] if concrete else None))
+        if (def_key and def_kh
+                and os.path.exists(def_key) and os.path.exists(def_kh)):
+            out.append({
+                "id": "any",
+                "list_only": True,
+                "ip": None,
+                "user": section.get("default_user", "root"),
+                "key": def_key,
+                "known_hosts": def_kh,
+                "description": (
+                    "Pseudo-device: SSH/scp to an ARBITRARY host given as "
+                    "an `ip` op arg (optional `user`, default root), using "
+                    "the bench default key + known_hosts. Same strict "
+                    "key-only + host-key checking as concrete instances, "
+                    "but no expected_uname identity gate -- the caller "
+                    "owns target selection."),
+            })
+        out.extend(concrete)
         return out
 
     def open(self, spec):
-        h = SshHandle(ip=spec["ip"], user=spec["user"],
+        h = SshHandle(ip=spec.get("ip"), user=spec.get("user", "root"),
                       key=spec["key"], known_hosts=spec["known_hosts"])
+        # ssh.any has no fixed target, so no uname identity gate is
+        # possible; return it straight away. Concrete instances still
+        # verify expected_uname below.
+        if spec.get("list_only"):
+            return h
         # Identity handshake: when the config pins a substring of `uname
         # -a`, refuse the handle if the target's uname doesn't match.
         # Catches the case where a freshly-flashed but wrong image is
