@@ -153,22 +153,9 @@
   },
 
   "ssh": {
-    "instances": [
-      {
-        "id": "evb",
-        "description": "STM32MP257F-DK Discovery Kit over Ethernet (root login). NOTE: id kept as 'evb' for plan compatibility, but this is now the MP257, not the retired MP135F-DK eval board.",
-        "ip": "172.25.0.115",
-        "user": "root",
-        "key":         "~/.ssh/test_serv_embedded",
-        "known_hosts": "~/.ssh/test_serv_known_hosts"
-      },
-      {
-        "id": "custom",
-        "ip": "172.25.0.46",
-        "user": "root",
-        "key":         "~/.ssh/test_serv_embedded",
-        "known_hosts": "~/.ssh/test_serv_known_hosts"
-      }
-    ]
+    "default_user":        "root",
+    "default_key":         "~/.ssh/test_serv_embedded",
+    "default_known_hosts": "~/.ssh/test_serv_known_hosts",
+    "instances": []
   }
 }
