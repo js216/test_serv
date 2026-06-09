@@ -457,31 +457,61 @@ def _fmt_rate(nbytes, seconds):
     return f"{mib_s:.2f} MiB/s"
 
 
-def _progress_dots(label, total, advance, started=None, done_bytes=None):
-    """Render a progress line incrementally. Call with ``advance=0`` for
-    the header, then with the byte count after each transfer chunk; call
-    once more with ``advance < 0`` to terminate the line. Single-line,
-    flushes after every dot so SSH-tunnelled tail -f stays live.
+class ProgressLine:
+    """Single-line dotted progress for big transfers::
+
+        2026-06-09 16:38:31 GET http://... 44530 KiB ... done in 9.1s @ 4.77 MiB/s
+
+    Inactive (every method a no-op) when ``total`` is None or below
+    PROGRESS_THRESHOLD, so callers don't need their own size gate.
+    ``advance(n)`` prints one dot per PROGRESS_BYTES_PER_DOT bytes and
+    flushes after each so SSH-tunnelled tail -f stays live; ``done()``
+    terminates the line with elapsed time and rate.  Also used (via
+    plugins/_progress.py) by the msc and dfu plugins so their
+    subprocess-driven transfers render the same way as HTTP ones.
     """
-    if advance == 0:
-        sys.stdout.write(
-            f"\n{datetime.now()} {label} {total >> 10} KiB ")
-        sys.stdout.flush()
-        return
-    if advance < 0:
-        if started is not None and done_bytes is not None:
-            elapsed = max(0.0, time.monotonic() - started)
+
+    def __init__(self, label, total):
+        self.active = total is not None and total >= PROGRESS_THRESHOLD
+        self.bytes_done = 0
+        self._tally = 0
+        self._started = time.monotonic()
+        self._ended = False
+        if self.active:
+            sys.stdout.write(
+                f"\n{datetime.now()} {label} {total >> 10} KiB ")
+            sys.stdout.flush()
+
+    def advance(self, n):
+        if not self.active or n <= 0:
+            return
+        self.bytes_done += n
+        self._tally += n
+        if self._tally >= PROGRESS_BYTES_PER_DOT:
+            sys.stdout.write("." * (self._tally // PROGRESS_BYTES_PER_DOT))
+            sys.stdout.flush()
+            self._tally %= PROGRESS_BYTES_PER_DOT
+
+    def advance_to(self, done_bytes):
+        """Move to an absolute cumulative byte count; never backward.
+        Suits sources that report totals (dd stats lines, percentages)
+        rather than per-chunk deltas, and makes repeated reports of the
+        same count idempotent.
+        """
+        self.advance(done_bytes - self.bytes_done)
+
+    def done(self):
+        if not self.active or self._ended:
+            return
+        self._ended = True
+        elapsed = max(0.0, time.monotonic() - self._started)
+        if self.bytes_done > 0:
             sys.stdout.write(
                 f" done in {elapsed:.1f}s @ "
-                f"{_fmt_rate(done_bytes, elapsed)}\n")
+                f"{_fmt_rate(self.bytes_done, elapsed)}\n")
         else:
-            sys.stdout.write(" done\n")
+            sys.stdout.write(f" done in {elapsed:.1f}s\n")
         sys.stdout.flush()
-        return
-    while advance >= PROGRESS_BYTES_PER_DOT:
-        sys.stdout.write(".")
-        sys.stdout.flush()
-        advance -= PROGRESS_BYTES_PER_DOT
 
 
 def _get(url, timeout=30.0):
@@ -493,10 +523,8 @@ def _get(url, timeout=30.0):
         except ValueError:
             cl_int = None
         buf = bytearray()
-        if cl_int is not None and cl_int >= PROGRESS_THRESHOLD:
-            tally = 0
-            started = time.monotonic()
-            _progress_dots(f"GET {url}", cl_int, 0)
+        if cl_int is not None:
+            progress = ProgressLine(f"GET {url}", cl_int)
             while len(buf) < cl_int:
                 # urlopen's timeout is per socket operation, not a
                 # transfer deadline. Re-arm a small timeout per chunk
@@ -506,18 +534,8 @@ def _get(url, timeout=30.0):
                 if not chunk:
                     break
                 buf += chunk
-                tally += len(chunk)
-                if tally >= PROGRESS_BYTES_PER_DOT:
-                    _progress_dots("", 0, tally)
-                    tally %= PROGRESS_BYTES_PER_DOT
-            _progress_dots("", 0, -1, started=started, done_bytes=len(buf))
-        elif cl_int is not None:
-            while len(buf) < cl_int:
-                _set_urlopen_timeout(r, deadline)
-                chunk = r.read(min(_HTTP_CHUNK, cl_int - len(buf)))
-                if not chunk:
-                    break
-                buf += chunk
+                progress.advance(len(chunk))
+            progress.done()
         else:
             while True:
                 _set_urlopen_timeout(r, deadline)
@@ -566,20 +584,15 @@ def _post_streamed(url, data, timeout):
         conn.sock.settimeout(_timeout_left(deadline))
         conn.endheaders()
         sent = 0
-        tally = 0
-        started = time.monotonic()
-        _progress_dots(f"POST {url}", len(data), 0)
+        progress = ProgressLine(f"POST {url}", len(data))
         mv = memoryview(data)
         while sent < len(data):
             conn.sock.settimeout(_timeout_left(deadline))
             n = min(_HTTP_CHUNK, len(data) - sent)
             conn.send(mv[sent:sent + n])
             sent += n
-            tally += n
-            if tally >= PROGRESS_BYTES_PER_DOT:
-                _progress_dots("", 0, tally)
-                tally %= PROGRESS_BYTES_PER_DOT
-        _progress_dots("", 0, -1, started=started, done_bytes=sent)
+            progress.advance(n)
+        progress.done()
         conn.sock.settimeout(_timeout_left(deadline))
         resp = conn.getresponse()
         # Drain so the connection can be reused / closed cleanly.

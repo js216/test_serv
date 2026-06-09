@@ -7,11 +7,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 import config
 from plugin import DevicePlugin, Op
 from . import _usb
+from ._progress import progress_line
 
 
 def _track_subproc(proc, session=None):
@@ -57,13 +59,110 @@ SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 # --- shared helpers ---
 
-def _run_cubeprog(exe, argv_tail, timeout_s, session=None):
+_CUBE_FILE_RE = re.compile(r"File\s+:\s+(\S+)")
+_CUBE_SIZE_RE = re.compile(
+    r"Size\s+:\s+([\d.]+)\s*(Bytes|KB|MB|GB)", re.IGNORECASE)
+_CUBE_SIZE_MULT = {"bytes": 1, "kb": 1024, "mb": 1024**2, "gb": 1024**3}
+_CUBE_PCT_RE = re.compile(rb"(\d{1,3})%")
+
+
+class _CubeProgressScanner:
+    """Feed raw cubeprog stdout chunks; renders dotted console progress
+    lines (one per partition download), matching the poller's GET/POST
+    output.
+
+    Cubeprog announces each transfer with ``File : <name>`` and
+    ``Size : <n> <unit>`` lines, then redraws a percentage bar using
+    carriage returns, so input is split on both CR and LF and the
+    highest percentage seen is mapped onto the announced size.  A
+    percentage that goes backward means the bar restarted (e.g. the
+    -v verify pass) without a header we recognise; the open line is
+    closed and percent tracking resets.  Transfers below the poller's
+    PROGRESS_THRESHOLD render nothing (ProgressLine self-gates), so
+    small tf-a/fip downloads stay quiet.
+    """
+
+    def __init__(self):
+        self._buf = b""
+        self._fname = None
+        self._size = None
+        self._line = None
+        self._pct = 0
+
+    def feed(self, chunk):
+        self._buf += chunk
+        while True:
+            m = re.search(rb"[\r\n]", self._buf)
+            if m is None:
+                break
+            line, self._buf = self._buf[:m.start()], self._buf[m.end():]
+            self._handle_line(line)
+        # A redraw may sit unterminated in the buffer until the next CR;
+        # peek at it so dots don't lag a whole redraw behind.  Reparsing
+        # the same percent after the CR arrives is harmless (advance_to
+        # is idempotent).
+        self._scan_pct(self._buf[-64:])
+
+    def _handle_line(self, line):
+        text = line.decode(errors="replace")
+        m = _CUBE_FILE_RE.search(text)
+        if m:
+            self._fname = m.group(1)
+            return
+        m = _CUBE_SIZE_RE.search(text)
+        if m:
+            self._size = int(
+                float(m.group(1)) * _CUBE_SIZE_MULT[m.group(2).lower()])
+            return
+        if "Download in Progress" in text:
+            self._open()
+            return
+        self._scan_pct(line)
+
+    def _open(self):
+        self.finish()
+        self._line = progress_line(
+            f"DFU write {self._fname or '?'}", self._size)
+        self._pct = 0
+
+    def _scan_pct(self, raw):
+        last = None
+        for last in _CUBE_PCT_RE.finditer(raw):
+            pass
+        if last is None:
+            return
+        pct = min(100, int(last.group(1)))
+        if self._line is None or not self._size:
+            return
+        if pct < self._pct:
+            # Bar restarted without a recognised header; close out the
+            # finished transfer rather than mis-attribute the new one.
+            self.finish()
+            return
+        self._pct = pct
+        self._line.advance_to(self._size * pct // 100)
+        if pct >= 100:
+            self.finish()
+
+    def finish(self):
+        """Terminate any open progress line; safe to call repeatedly."""
+        if self._line is not None:
+            self._line.done()
+            self._line = None
+
+
+def _run_cubeprog(exe, argv_tail, timeout_s, session=None, scanner=None):
     """Run cubeprog and capture stdout/stderr. If `session` is given
     and session.canceled fires while cubeprog is still running, the
     child is SIGTERM'd then SIGKILL'd, and a RuntimeError raises so
     the op aborts cleanly. Without `session` (probe-time invocation
     from the registry, no cancel context), behaves like the previous
     blocking subprocess.run.
+
+    With a `scanner` (a _CubeProgressScanner; flash ops only), stdout
+    is fed to it chunk-by-chunk as cubeprog runs so big partition
+    downloads render a dotted console progress line.  stdout/stderr
+    are drained by threads either way so the pipes can't deadlock.
     """
     argv = [exe] + list(argv_tail)
     if session is None:
@@ -75,34 +174,63 @@ def _run_cubeprog(exe, argv_tail, timeout_s, session=None):
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     _track_subproc(proc, session=session)
-    deadline = time.monotonic() + timeout_s
-    try:
+    out_buf = bytearray()
+    err_buf = bytearray()
+
+    def _drain(pipe, buf, feed):
+        fd = pipe.fileno()
         while True:
             try:
-                stdout, stderr = proc.communicate(timeout=0.2)
-                return subprocess.CompletedProcess(
-                    argv, proc.returncode, stdout, stderr)
-            except subprocess.TimeoutExpired:
-                if session.canceled:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=2)
-                    raise RuntimeError(
-                        "cubeprog canceled mid-flight via "
-                        "DELETE /jobs/<digest>")
-                if time.monotonic() > deadline:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    raise TimeoutError(
-                        f"cubeprog timed out after {timeout_s}s")
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            buf.extend(chunk)
+            if feed is not None:
+                feed(chunk)
+
+    readers = [
+        threading.Thread(
+            target=_drain,
+            args=(proc.stdout, out_buf,
+                  scanner.feed if scanner is not None else None),
+            daemon=True),
+        threading.Thread(
+            target=_drain, args=(proc.stderr, err_buf, None), daemon=True),
+    ]
+    for t in readers:
+        t.start()
+    deadline = time.monotonic() + timeout_s
+    try:
+        while proc.poll() is None:
+            if session.canceled:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                raise RuntimeError(
+                    "cubeprog canceled mid-flight via "
+                    "DELETE /jobs/<digest>")
+            if time.monotonic() > deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise TimeoutError(
+                    f"cubeprog timed out after {timeout_s}s")
+            time.sleep(0.2)
     finally:
         _untrack_subproc(proc)
+        for t in readers:
+            t.join(timeout=5)
+        if scanner is not None:
+            scanner.finish()
+    return subprocess.CompletedProcess(
+        argv, proc.returncode, bytes(out_buf), bytes(err_buf))
 
 
 def _parse_list_output(stdout):
@@ -229,7 +357,8 @@ def _op_flash_layout(session, h, args):
                 session, h.cubeprog_exe, argv, FLASH_TIMEOUT_S)
         else:
             result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S,
-                                   session=session)
+                                   session=session,
+                                   scanner=_CubeProgressScanner())
             if result.stdout:
                 session.stream("dfu.flash.stdout").append(result.stdout)
             if result.stderr:
@@ -253,16 +382,17 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
     observe "Reconnecting the device" on stdout; declare success iff
     "RUNNING Program" was seen before then.
 
-    Runs a single reader thread draining stdout line-by-line; stderr
-    is drained post-exit via communicate() on the kill path.
+    Runs a single reader thread draining stdout chunk-by-chunk (the
+    progress bar is redrawn with carriage returns, so line-based reads
+    would stall until cubeprog finally emits a newline); chunks feed
+    the dotted console progress scanner as they arrive.  stderr is
+    drained post-exit via communicate() on the kill path.
     """
-    import subprocess
-    import threading
-
     argv = [exe] + list(argv_tail)
     proc = subprocess.Popen(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     _track_subproc(proc, session=session)
+    scanner = _CubeProgressScanner()
     try:
         seen_running = [False]
         seen_reconnect = [False]
@@ -273,16 +403,23 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
 
         def _reader():
             try:
+                fd = proc.stdout.fileno()
+                tail = b""
                 while True:
-                    line = proc.stdout.readline()
-                    if not line:
+                    chunk = os.read(fd, 65536)
+                    if not chunk:
                         return
-                    stream_out.append(line)
-                    if b"RUNNING Program" in line:
+                    stream_out.append(chunk)
+                    scanner.feed(chunk)
+                    # Carry a tail across chunks so a marker split by a
+                    # read boundary is still seen.
+                    window = tail + chunk
+                    if b"RUNNING Program" in window:
                         seen_running[0] = True
-                    if b"Reconnecting the device" in line:
+                    if b"Reconnecting the device" in window:
                         seen_reconnect[0] = True
                         return
+                    tail = window[-64:]
             except Exception as e:
                 reader_err.append(repr(e))
 
@@ -323,6 +460,7 @@ def _run_with_early_kill(session, exe, argv_tail, timeout_s):
             session.stream("dfu.flash.stderr").append(rest_stderr)
         t.join(timeout=2)
     finally:
+        scanner.finish()
         # _untrack_subproc unconditionally so an unexpected raise
         # from any of the wait/communicate/terminate paths above
         # doesn't leak the Popen into _active_subprocs forever
@@ -371,7 +509,8 @@ def _op_flash(session, h, args):
             f"cubeprog -c port={h.usb_index} -w <{len(image)}B> "
             f"0x{address:08x}")
         result = _run_cubeprog(h.cubeprog_exe, argv, FLASH_TIMEOUT_S,
-                               session=session)
+                               session=session,
+                               scanner=_CubeProgressScanner())
         if result.stdout:
             session.stream("dfu.stdout").append(result.stdout)
         if result.stderr:

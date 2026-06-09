@@ -41,11 +41,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 
 import config
 from plugin import DevicePlugin, Op
 from ._prbs import XorShift32Bytes
+from ._progress import progress_line
 
 
 CHUNK_BYTES = 1 << 20
@@ -139,7 +141,20 @@ def _new_tmp(instance_id, suffix=".bin"):
     return path
 
 
-def _run_dd(session, argv, op_name, stream_name="msc.dd"):
+def _terminate(proc):
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _run_dd(session, argv, op_name, stream_name="msc.dd",
+            total_bytes=None, label=None):
     """Run dd, stream stderr to ``stream_name``, honour session cancel,
     and return ``(bytes_done, rate_Bps, elapsed_s)``.
 
@@ -148,6 +163,12 @@ def _run_dd(session, argv, op_name, stream_name="msc.dd"):
     count on a mid-flight cancel.  Returns ``(None, None, elapsed)`` if
     dd died before printing the summary, in which case ``op_name`` is
     raised as IOError so the caller can surface it.
+
+    stderr is drained by a thread as dd runs (rather than collected by
+    communicate() at exit) so the once-a-second ``status=progress``
+    lines can drive a dotted console progress line, matching the
+    poller's GET/POST output for big transfers.  ``total_bytes`` sizes
+    the line's header; pass None to disable.
     """
     dd = shutil.which("dd")
     if dd is None:
@@ -158,33 +179,50 @@ def _run_dd(session, argv, op_name, stream_name="msc.dd"):
     proc = subprocess.Popen(
         full_argv, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     _track_subproc(proc, session=session)
+    stderr_buf = bytearray()
+    progress = progress_line(label or op_name, total_bytes)
+
+    def _drain_stderr():
+        fd = proc.stderr.fileno()
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                return
+            if not chunk:
+                return
+            stderr_buf.extend(chunk)
+            # status=progress lines carry a cumulative byte count;
+            # scan a trailing window (lines are short; a count split
+            # across chunks parses low once and heals on the next
+            # line, since advance_to never moves backward).
+            last = None
+            for last in _DD_STATS_RE.finditer(bytes(stderr_buf[-4096:])):
+                pass
+            if last is not None:
+                progress.advance_to(int(last.group(1)))
+
+    reader = threading.Thread(target=_drain_stderr, daemon=True)
+    reader.start()
     canceled = False
     try:
         deadline = t0 + DD_TIMEOUT_S
-        while True:
-            try:
-                _, stderr = proc.communicate(timeout=0.2)
+        while proc.poll() is None:
+            if session.canceled:
+                canceled = True
+                _terminate(proc)
                 break
-            except subprocess.TimeoutExpired:
-                if session.canceled:
-                    canceled = True
-                    proc.terminate()
-                    try: proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill(); proc.wait(timeout=2)
-                    _, stderr = proc.communicate(timeout=2)
-                    break
-                if time.monotonic() > deadline:
-                    proc.terminate()
-                    try: proc.wait(timeout=2)
-                    except subprocess.TimeoutExpired:
-                        proc.kill(); proc.wait(timeout=2)
-                    _, stderr = proc.communicate(timeout=2)
-                    raise TimeoutError(
-                        f"{op_name}: dd exceeded {DD_TIMEOUT_S}s wall clock")
+            if time.monotonic() > deadline:
+                _terminate(proc)
+                raise TimeoutError(
+                    f"{op_name}: dd exceeded {DD_TIMEOUT_S}s wall clock")
+            time.sleep(0.2)
     finally:
         _untrack_subproc(proc)
+        reader.join(timeout=5)
+        progress.done()
     elapsed = time.monotonic() - t0
+    stderr = bytes(stderr_buf)
     session.stream(stream_name).append(stderr or b"")
     if canceled:
         raise RuntimeError(
@@ -292,7 +330,9 @@ def _op_write(session, h, args):
                 "bs=1M", "conv=fsync,notrunc",
                 "oflag=seek_bytes", f"seek={offset_bytes}",
                 "status=progress"]
-        bytes_w, rate_Bps, elapsed = _run_dd(session, argv, "msc:write")
+        bytes_w, rate_Bps, elapsed = _run_dd(
+            session, argv, "msc:write",
+            total_bytes=total, label=f"msc:write {h.device}")
     finally:
         try: os.remove(src)
         except OSError: pass
@@ -314,6 +354,7 @@ def _write_generated(session, h, *, n, offset_lba, min_rate_Bps,
     if total < 0:
         raise ValueError(f"{op_name}: n must be >= 0")
     t0 = time.monotonic()
+    progress = progress_line(f"{op_name} {h.device}", total)
     fd = os.open(h.device, os.O_WRONLY)
     try:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -334,10 +375,12 @@ def _write_generated(session, h, *, n, offset_lba, min_rate_Bps,
                     raise IOError(f"{op_name} stalled at {written}/{total}")
                 pos += nwr
                 written += nwr
+                progress.advance(nwr)
         if not session.canceled:
             os.fsync(fd)
     finally:
         os.close(fd)
+        progress.done()
     session.log_event(
         "MSC", op_name,
         f"wrote {total}B to {h.device} @ LBA {offset_lba}")
@@ -380,6 +423,7 @@ def _verify_generated(session, h, *, n, offset_lba, min_rate_Bps,
     mism = 0
     first = -1
     first_window = b""
+    progress = progress_line(f"{op_name} {h.device}", total)
     fd = os.open(h.device, os.O_RDONLY)
     try:
         os.lseek(fd, offset, os.SEEK_SET)
@@ -396,6 +440,7 @@ def _verify_generated(session, h, *, n, offset_lba, min_rate_Bps,
                 if not chunk:
                     raise IOError(f"short read at {read + len(got)}/{total}")
                 got += chunk
+                progress.advance(len(chunk))
             got = bytes(got)
             for i, (a, b) in enumerate(zip(expected, got)):
                 if a == b:
@@ -407,6 +452,7 @@ def _verify_generated(session, h, *, n, offset_lba, min_rate_Bps,
             read += want
     finally:
         os.close(fd)
+        progress.done()
     claim = f"{total}B generated pattern match at LBA {offset_lba}"
     if mism == 0:
         session.log_event("MSC", op_name, f"OK {total}B @ LBA {offset_lba}")
@@ -459,7 +505,9 @@ def _op_read(session, h, args):
                 "iflag=skip_bytes,count_bytes",
                 f"skip={offset_bytes}", f"count={n}",
                 "status=progress"]
-        bytes_r, rate_Bps, elapsed = _run_dd(session, argv, "msc:read")
+        bytes_r, rate_Bps, elapsed = _run_dd(
+            session, argv, "msc:read",
+            total_bytes=n, label=f"msc:read {h.device}")
 
         # Stream the captured bytes into the msc.read artefact stream
         # chunk-by-chunk so a multi-GB read doesn't materialize the full
@@ -503,7 +551,9 @@ def _op_verify(session, h, args):
                 "iflag=skip_bytes,count_bytes",
                 f"skip={offset_bytes}", f"count={total}",
                 "status=progress"]
-        bytes_r, rate_Bps, elapsed = _run_dd(session, argv, "msc:verify")
+        bytes_r, rate_Bps, elapsed = _run_dd(
+            session, argv, "msc:verify",
+            total_bytes=total, label=f"msc:verify {h.device}")
         _check_min_rate(
             "msc:verify", bytes_r if bytes_r is not None else total,
             elapsed, min_rate_Bps)
