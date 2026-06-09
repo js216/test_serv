@@ -144,7 +144,17 @@ def verify_com_identity(port, label, exp_vid=None, exp_pid=None,
 
 def ftd2xx_descriptors():
     """Return the set of FTDI descriptor strings currently enumerated,
-    or ``None`` if the driver is unavailable (non-FTDI host, etc.).
+    or ``None`` if the ftd2xx module is unavailable (non-FTDI host).
+
+    Raises ``RuntimeError`` on a transient enumeration failure so
+    callers can retry or keep their previous device view. (Mapping
+    that case to ``None``/``[]`` made a one-tick driver hiccup look
+    like "all FTDI devices unplugged" and got specs evicted.)
+
+    Note: D2XX cannot read the description string of a device some
+    process currently holds open -- it reports a BLANK string instead.
+    A returned set containing ``""`` is therefore evidence that a busy
+    device is being hidden, not that the bench has a nameless chip.
     """
     try:
         import ftd2xx
@@ -152,8 +162,8 @@ def ftd2xx_descriptors():
         return None
     try:
         descs = ftd2xx.listDevices(2) or []
-    except Exception:
-        return None
+    except Exception as e:
+        raise RuntimeError(f"ftd2xx enumeration failed: {e}") from e
     return {(d.decode(errors="replace") if isinstance(d, bytes) else d)
             for d in descs}
 

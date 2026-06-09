@@ -722,6 +722,79 @@ def _op_qspi_xfer_prbs(session, h, args):
     session.stream("dsp.qspi_xfer").append(got)
 
 
+# ---- FTDI enumeration with settle-retry ----
+
+# D2XX-level enumeration is not USB enumeration: the chip never leaves
+# the bus, but FT_CreateDeviceInfoList / FT_ListDevices report BLANK
+# description/serial strings for a device some process holds open, so
+# a busy FT4222 is indistinguishable from an unplugged one by strings
+# alone. Sources of "busy": a dsp op mid-transfer, a leaked dsp:boot
+# helper wedged after SIGKILL, an operator's debug script. All of
+# these usually clear within seconds, so retry before concluding
+# anything.
+ENUM_RETRY_DELAYS_S = (1.0, 3.0, 5.0)
+
+_FT_FLAGS_OPENED = 1
+
+
+def _enum_descriptors_settled(want):
+    """Enumerate FTDI descriptors, retrying while the result looks
+    transient rather than like a genuine unplug: a driver-level error,
+    or a wanted descriptor missing while some entry enumerates blank
+    (= held open, see above). Returns the descriptor set, or ``None``
+    when ftd2xx is unavailable (permanent). Raises ``RuntimeError``
+    when the view never settles -- the registry keeps the previous
+    spec list on a raised probe, which is the right semantics for
+    "unknown" (vs a clean ``[]`` meaning "absent").
+    """
+    last = None
+    for delay in (0.0,) + ENUM_RETRY_DELAYS_S:
+        if delay:
+            time.sleep(delay)
+        try:
+            descs = _usb.ftd2xx_descriptors()
+        except RuntimeError as e:
+            last = str(e)
+            continue
+        if descs is None:
+            return None
+        if not (want - descs) or "" not in descs:
+            return descs
+        last = (f"{sorted(want - descs)} absent while another entry "
+                f"enumerates blank (chip held open?)")
+    raise RuntimeError(
+        f"dsp: FTDI enumeration did not settle after "
+        f"{len(ENUM_RETRY_DELAYS_S)} retries: {last}")
+
+
+def _walk_ftdi_for_match(ft_mod, desc, expected_serial):
+    """One pass over the FTDI device-info list. Returns
+    ``(matched, saw_busy)``: ``matched`` is ``(desc, serial, type,
+    id)`` or ``None``; ``saw_busy`` is True when any entry looked
+    held-open (opened flag set, or blank description+serial).
+    """
+    matched = None
+    saw_busy = False
+    for i in range(ft_mod.createDeviceInfoList()):
+        info = ft_mod.getDeviceInfoDetail(i, False)
+        d = info.get("description", b"")
+        s = info.get("serial", b"")
+        if isinstance(d, bytes):
+            d = d.decode(errors="replace")
+        if isinstance(s, bytes):
+            s = s.decode(errors="replace")
+        try:
+            flags = int(info.get("flags") or 0)
+        except (TypeError, ValueError):
+            flags = 0
+        if (flags & _FT_FLAGS_OPENED) or (not d and not s):
+            saw_busy = True
+        if matched is None and d == desc and (
+                not expected_serial or s == expected_serial):
+            matched = (d, s, info.get("type"), info.get("id"))
+    return matched, saw_busy
+
+
 # ---- plugin class ----
 
 class DspPlugin(DevicePlugin):
@@ -809,11 +882,13 @@ class DspPlugin(DevicePlugin):
     }
 
     def probe(self):
-        descs = _usb.ftd2xx_descriptors()
+        insts = list(config.instances(self.name))
+        want = {i.get("ft4222_desc") for i in insts if i.get("ft4222_desc")}
+        descs = _enum_descriptors_settled(want)
         if descs is None:
             return []
         out = []
-        for inst in config.instances(self.name):
+        for inst in insts:
             ft_desc = inst.get("ft4222_desc")
             if not ft_desc or ft_desc not in descs:
                 continue
@@ -847,24 +922,33 @@ class DspPlugin(DevicePlugin):
         except ImportError:
             raise RuntimeError("pyft4222 not installed")
         matched = None
-        for i in range(ft_mod.createDeviceInfoList()):
-            info = ft_mod.getDeviceInfoDetail(i, False)
-            d = info.get("description", b"")
-            s = info.get("serial", b"")
-            if isinstance(d, bytes):
-                d = d.decode(errors="replace")
-            if isinstance(s, bytes):
-                s = s.decode(errors="replace")
-            if d != desc:
+        saw_busy = False
+        for delay in (0.0,) + ENUM_RETRY_DELAYS_S:
+            if delay:
+                time.sleep(delay)
+            try:
+                matched, saw_busy = _walk_ftdi_for_match(
+                    ft_mod, desc, expected_serial)
+            except Exception:
+                # Transient enumeration failure; retry like a miss.
+                matched, saw_busy = None, False
                 continue
-            if expected_serial and s != expected_serial:
-                continue
-            matched = (d, s, info.get("type"), info.get("id"))
-            break
+            if matched is not None:
+                break
         if matched is None:
+            if saw_busy:
+                raise BusyError(
+                    f"dsp: FT4222 desc={desc!r} would not enumerate "
+                    f"after {len(ENUM_RETRY_DELAYS_S)} retries over "
+                    f"{sum(ENUM_RETRY_DELAYS_S):.0f}s, and an FTDI "
+                    f"entry reports blank strings / opened flag: the "
+                    f"chip is most likely held open by another "
+                    f"process (leaked dsp:boot helper, debug script) "
+                    f"-- not unplugged")
             raise RuntimeError(
                 f"dsp: no FTDI device matches desc={desc!r} "
-                f"serial={expected_serial!r}")
+                f"serial={expected_serial!r} after "
+                f"{len(ENUM_RETRY_DELAYS_S)} retries")
         # The FT4222 SPI/I2C side is identity-verified above. The UART
         # side comes out on a separate USB endpoint (often a sibling
         # FTDI port) -- on a multi-board bench the configured

@@ -1472,6 +1472,76 @@ def test_refused_spool_409_is_backed_off():
             poller._refused_retry_after.update(old_retry)
 
 
+def test_dsp_enum_settles_only_on_transient_evidence():
+    from plugins import dsp
+
+    delays = []
+    saved_sleep = dsp.time.sleep
+    saved_enum = dsp._usb.ftd2xx_descriptors
+    dsp.time.sleep = lambda s: delays.append(s)
+    try:
+        # Genuinely absent (no blank/held-open entry): no retry.
+        dsp._usb.ftd2xx_descriptors = lambda: {"Dual RS232-HS A"}
+        got = dsp._enum_descriptors_settled({"FT4222 A"})
+        assert got == {"Dual RS232-HS A"}
+        assert delays == [], "absent without busy evidence must not retry"
+
+        # Wanted desc hidden behind a blank (held-open) entry: retry
+        # at 1/3/5 s, then raise so the registry keeps the previous
+        # spec view instead of evicting the device as "absent".
+        dsp._usb.ftd2xx_descriptors = lambda: {""}
+        try:
+            dsp._enum_descriptors_settled({"FT4222 A"})
+            raise AssertionError("unsettled enumeration should raise")
+        except RuntimeError as e:
+            assert "held open" in str(e), e
+        assert delays == list(dsp.ENUM_RETRY_DELAYS_S), delays
+        delays.clear()
+
+        # Transient driver error that clears on the first retry.
+        calls = [0]
+        def flaky():
+            calls[0] += 1
+            if calls[0] == 1:
+                raise RuntimeError("ftd2xx enumeration failed: glitch")
+            return {"FT4222 A"}
+        dsp._usb.ftd2xx_descriptors = flaky
+        assert dsp._enum_descriptors_settled({"FT4222 A"}) == {"FT4222 A"}
+        assert delays == [dsp.ENUM_RETRY_DELAYS_S[0]], delays
+        delays.clear()
+
+        # ftd2xx module unavailable is permanent: None, no retry.
+        dsp._usb.ftd2xx_descriptors = lambda: None
+        assert dsp._enum_descriptors_settled({"FT4222 A"}) is None
+        assert delays == []
+    finally:
+        dsp.time.sleep = saved_sleep
+        dsp._usb.ftd2xx_descriptors = saved_enum
+
+
+def test_dsp_ftdi_walk_reports_held_open_entries_as_busy():
+    from plugins import dsp
+
+    class FakeFt:
+        def createDeviceInfoList(self):
+            return 2
+
+        def getDeviceInfoDetail(self, i, update):
+            if i == 0:
+                # D2XX shape for a device another process holds open:
+                # opened flag set, blank strings.
+                return {"description": b"", "serial": b"", "flags": 1}
+            return {"description": b"FT4222 B", "serial": b"X1",
+                    "flags": 0, "type": 10, "id": 99}
+
+    m, busy = dsp._walk_ftdi_for_match(FakeFt(), "FT4222 A", None)
+    assert m is None and busy, (m, busy)
+    m, busy = dsp._walk_ftdi_for_match(FakeFt(), "FT4222 B", None)
+    assert m == ("FT4222 B", "X1", 10, 99) and busy, (m, busy)
+    m, busy = dsp._walk_ftdi_for_match(FakeFt(), "FT4222 B", "OTHER")
+    assert m is None, m
+
+
 def test_dsp_boot_requires_timeout_and_kills_hung_helper():
     import subprocess
     from plugins import dsp
@@ -2322,6 +2392,8 @@ def main():
         test_spool_unique_per_attempt,
         test_pending_upload_drain_kick_is_nonblocking,
         test_refused_spool_409_is_backed_off,
+        test_dsp_enum_settles_only_on_transient_evidence,
+        test_dsp_ftdi_walk_reports_held_open_entries_as_busy,
         test_dsp_boot_requires_timeout_and_kills_hung_helper,
         test_dsp_boot_cancel_race_reports_cancel,
         test_dsp_boot_already_canceled_does_not_spawn_helper,
