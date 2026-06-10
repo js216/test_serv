@@ -167,14 +167,16 @@ def _summarize_tar(data):
     """Print the manifest and timeline from an artefact tarball."""
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as tf:
         members = tf.getnames()
-        manifest_m = tf.extractfile("manifest.json")
-        if manifest_m is not None:
-            sys.stdout.buffer.write(b"=== manifest.json ===\n")
-            sys.stdout.buffer.write(manifest_m.read())
-        tl = tf.extractfile("timeline.log")
-        if tl is not None:
-            sys.stdout.buffer.write(b"\n=== timeline.log ===\n")
-            sys.stdout.buffer.write(tl.read())
+        if "manifest.json" in members:
+            manifest_m = tf.extractfile("manifest.json")
+            if manifest_m is not None:
+                sys.stdout.buffer.write(b"=== manifest.json ===\n")
+                sys.stdout.buffer.write(manifest_m.read())
+        if "timeline.log" in members:
+            tl = tf.extractfile("timeline.log")
+            if tl is not None:
+                sys.stdout.buffer.write(b"\n=== timeline.log ===\n")
+                sys.stdout.buffer.write(tl.read())
         if "errors.log" in members:
             err = tf.extractfile("errors.log")
             if err is not None:
