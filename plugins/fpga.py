@@ -11,7 +11,7 @@ import threading
 import time
 
 import config
-from plugin import DevicePlugin, Op
+from plugin import BusyError, DevicePlugin, Op
 from . import _usb
 from ._text import decode_escapes, expect_timeout_msg
 
@@ -20,6 +20,17 @@ FT2232H_DESC_A_DEFAULT = "Dual RS232-HS A"    # MPSSE channel
 FT2232H_DESC_B_DEFAULT = "Dual RS232-HS B"    # UART channel
 FPGA_BAUD_DEFAULT = 115200
 FPGA_PROGRAM_GRACE_S = 5.0
+# open()-time enumeration settle-retry. After heavy program/cancel
+# cycling the D2XX view can transiently report the FT2232H with BLANK
+# serial+description (a handle somewhere is still closing) or omit it
+# entirely; observed in the field to recover on its own within tens of
+# seconds with no physical access (bug report 2026-06-11, agent1).
+# Mirrors dsp.py's ENUM_RETRY_DELAYS_S. Kept short enough that even
+# with every ftd2xx_devices() helper call hitting its 10s cap the
+# whole open() stays under the registry's 60s OPEN_TIMEOUT_S --
+# otherwise a slow-but-recovering driver would get the key
+# quarantined instead of retried.
+ENUM_RETRY_DELAYS_S = (1.0, 3.0, 5.0)
 
 
 def _lazy_ftd2xx():
@@ -517,13 +528,36 @@ class FpgaPlugin(DevicePlugin):
         want_serial = spec.get("ft2232h_serial") or None
         ft_desc = spec["ft2232h_desc"]
         if want_serial:
-            devs = _usb.ftd2xx_devices() or []
-            if not any(d["description"] == ft_desc and d["serial"] == want_serial
-                       for d in devs):
+            seen = []
+            saw_blank = False
+            for delay in (0.0,) + ENUM_RETRY_DELAYS_S:
+                if delay:
+                    time.sleep(delay)
+                devs = _usb.ftd2xx_devices() or []
+                if any(d["description"] == ft_desc
+                       and d["serial"] == want_serial for d in devs):
+                    break
+                seen = sorted(d["serial"] for d in devs)
+                # D2XX reports blank serial AND description for a
+                # device some process currently holds open -- a blank
+                # row means the chip is busy/settling, not unplugged.
+                saw_blank = saw_blank or any(
+                    not d["serial"] and not d["description"] for d in devs)
+            else:
+                retries = (f"after {len(ENUM_RETRY_DELAYS_S)} retries "
+                           f"over {sum(ENUM_RETRY_DELAYS_S):.0f}s")
+                if saw_blank:
+                    raise BusyError(
+                        f"fpga: FT2232H {want_serial!r} ({ft_desc!r}) "
+                        f"did not enumerate {retries}, and an FTDI "
+                        f"entry reports blank strings: the chip is "
+                        f"most likely still held open (killed flash "
+                        f"helper settling, another process) -- not "
+                        f"unplugged. If it persists, POST /devices/"
+                        f"<key>/release and re-probe.")
                 raise RuntimeError(
                     f"fpga: FT2232H {want_serial!r} ({ft_desc!r}) not "
-                    f"enumerated; saw "
-                    f"{sorted(d['serial'] for d in devs) or '(none)'}")
+                    f"enumerated {retries}; saw {seen or '(none)'}")
         # UART side: pin VID/PID/iSerial if config gave them.
         # Catches a Windows re-enumeration that lands the configured
         # COM port on a sibling FTDI chip's channel B. _identity_-
