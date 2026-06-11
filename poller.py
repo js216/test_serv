@@ -1344,6 +1344,51 @@ def _post_artefact(job_id, tar_bytes, timeout_s=DEFAULT_UPLOAD_S,
         _post_spooled(spool, timeout_s=timeout_s)
 
 
+_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _resolve_orphan_running_jobs():
+    """Startup-only: fail any job the server still lists as 'running'.
+
+    This poller just started, and the STATE_DIR advisory lock
+    guarantees no second poller shares this state -- so a 'running'
+    row can have no live session behind it. It is a leftover from a
+    crash or a watchdog os._exit mid-run. Without this, the row shows
+    'running' forever: the submitting agent polls a job that can never
+    finish, and its device locks look held by a job that no longer
+    exists. Jobs whose artefact was spooled before the crash are
+    skipped -- the PENDING upload resolves them as done.
+    """
+    base = f"http://localhost:{HTTP_PORT}"
+    try:
+        _status, body, _headers = _get(f"{base}/jobs", timeout=10.0)
+        jobs = json.loads(body)
+    except Exception:
+        return
+    try:
+        spooled = {n.split(".", 1)[0] for n in os.listdir(PENDING)}
+    except FileNotFoundError:
+        spooled = set()
+    for j in jobs if isinstance(jobs, list) else []:
+        if j.get("status") != "running":
+            continue
+        digest = j.get("digest") or ""
+        if not _DIGEST_RE.match(digest) or digest in spooled:
+            continue
+        print(datetime.now(),
+              f"[{digest[:8]}] orphaned 'running' job from a previous "
+              f"poller incarnation; posting failure artefact")
+        tar = _failure_artefact(
+            digest,
+            "poller restarted while this job was in flight (crash or "
+            "watchdog os._exit); the run was lost -- resubmit if "
+            "still needed")
+        try:
+            _post_artefact(digest, tar)
+        except Exception:
+            traceback.print_exc()
+
+
 # Supervisor knobs. Match the prior shell-supervisor's behaviour so
 # the move from run_poller.sh to in-process supervision is invisible
 # to the operator.
@@ -1611,6 +1656,12 @@ def _run_poller():
     _write_heartbeat()
     _print_device_table(registry.verify_results, registry)
     _publish_status(registry, plugins_by_name)
+    # Upload anything spooled by a previous incarnation FIRST so those
+    # jobs resolve as done, then fail whatever 'running' rows remain --
+    # they belong to no live session and would otherwise sit 'running'
+    # forever after a crash / watchdog os._exit.
+    _drain_pending_uploads(timeout_s=30.0)
+    _resolve_orphan_running_jobs()
 
     def _sighup(signum, frame):
         print(datetime.now(), "SIGHUP: refresh plugins + devices")

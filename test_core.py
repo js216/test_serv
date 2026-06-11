@@ -2217,6 +2217,101 @@ def test_multi_instance_plan_holds_all_dev_locks_for_session():
     reg.close_all()
 
 
+def _late_device_plugin_cls(name):
+    """Plugin whose device is absent for the first two probes (the
+    test's refresh + run_all's eager probe) and present from the
+    third (the op-time targeted re-probe) -- forces the DEFERRED
+    lock-acquisition path in _resolve_device."""
+    class LateDevicePlugin(FakePlugin):
+        ops = {"tick": Op(args={}, doc="no-op", run=_noop)}
+
+        def __init__(self):
+            super().__init__()
+            self.probes = 0
+
+        def probe(self):
+            self.probes += 1
+            return [{"id": "0"}] if self.probes >= 3 else []
+
+    LateDevicePlugin.name = name
+    return LateDevicePlugin
+
+
+def test_deferred_lock_wait_credited_not_charged_to_budget():
+    """Bug report 2026-06-11 (agent1): a session queued behind another
+    job's device lock had the wait charged against its own runtime
+    budget, so budget-bound plans failed even though their ops all
+    passed. The deferred lock wait must extend the deadline and be
+    surfaced as session.lock_wait_s / manifest lock_wait_s."""
+    cls = _late_device_plugin_cls("latedev")
+    plugins = {"latedev": cls()}
+    reg = DeviceRegistry(plugins)
+    reg.refresh()   # probe 1: absent
+
+    lk = reg.per_dev_lock.setdefault("latedev.0", threading.RLock())
+    assert lk.acquire(timeout=1)
+
+    parsed = plan.load_tar(plan.pack_tar(
+        "latedev:tick\nlatedev:tick\n", {}))
+    session = Session(reg, parsed, runtime_s=1)
+    t = threading.Thread(target=session.run_all, args=(plugins,))
+    t.start()   # probe 2 (eager, absent) -> latedev goes deferred
+    try:
+        deadline = time.monotonic() + 5
+        while plugins["latedev"].probes < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert plugins["latedev"].probes >= 3, "op never re-probed"
+        # Session is now blocked in the deferred polled acquire. Hold
+        # the lock past its whole 1s runtime budget before releasing.
+        time.sleep(1.3)
+    finally:
+        lk.release()
+        t.join(10)
+    assert not t.is_alive(), "session thread did not exit"
+    # Without deadline crediting the second op dies with "session
+    # exceeded 1s deadline"; with it, both ops run clean.
+    assert not session.errors, session.errors
+    assert len(session.ops_log) == 2, session.ops_log
+    assert all(r["status"] == "ok" for r in session.ops_log), session.ops_log
+    assert session.lock_wait_s >= 1.0, session.lock_wait_s
+    reg.close_all()
+
+
+def test_cancel_interrupts_deferred_lock_wait():
+    """A cancel must abort a session stuck waiting for another job's
+    device lock; previously the bare lk.acquire() was uninterruptible
+    and the watchdog's os._exit was the only way out."""
+    cls = _late_device_plugin_cls("latedev2")
+    plugins = {"latedev2": cls()}
+    reg = DeviceRegistry(plugins)
+    reg.refresh()
+
+    lk = reg.per_dev_lock.setdefault("latedev2.0", threading.RLock())
+    assert lk.acquire(timeout=1)
+
+    parsed = plan.load_tar(plan.pack_tar("latedev2:tick\n", {}))
+    session = Session(reg, parsed, runtime_s=30)
+    t = threading.Thread(target=session.run_all, args=(plugins,))
+    t.start()
+    try:
+        deadline = time.monotonic() + 5
+        while plugins["latedev2"].probes < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)   # let it settle into the polled acquire
+        session.signal_cancel()
+        t.join(5)
+        assert not t.is_alive(), "cancel did not interrupt lock wait"
+        assert any("canceled while waiting for device lock" in e
+                   for e in session.errors), session.errors
+    finally:
+        if t.is_alive():
+            lk.release()
+            t.join(5)
+        else:
+            lk.release()
+    reg.close_all()
+
+
 def test_check_record_lands_in_manifest():
     """A plugin's session.record_check call must populate
     manifest.checks[] with a structured pass/fail record."""
@@ -2411,6 +2506,8 @@ def main():
         test_delete_job_resolves_old_non_inflight_running_record,
         test_delete_outputs_no_op_when_nothing_to_delete,
         test_multi_instance_plan_holds_all_dev_locks_for_session,
+        test_deferred_lock_wait_credited_not_charged_to_budget,
+        test_cancel_interrupts_deferred_lock_wait,
         test_check_record_lands_in_manifest,
         test_bench_id_defaults_to_hostname_and_env_overrides,
         test_ssh_put_uses_key_only_scp_and_streams_output,

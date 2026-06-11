@@ -59,7 +59,7 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
                   expectations=None, message=None,
                   files=None, run_id=None, plan_digest=None,
                   code_digest=None, blob_digests=None,
-                  checks=None, inert_reason=None):
+                  checks=None, inert_reason=None, lock_wait_s=0.0):
     """Single source of truth for the artefact ``manifest.json``
     shape. Both the session's success path and the poller's failure-
     artefact path emit through here so the two never drift on field
@@ -87,6 +87,11 @@ def make_manifest(*, status, t0_monotonic, t0_wall, runtime_s,
         "t0_wall_iso": iso,
         "t0_wall_unix": t0_wall,
         "runtime_s": runtime_s,
+        # Time spent waiting for ANOTHER session to release this
+        # plan's devices (bench contention). runtime_s includes it
+        # because t0 is session creation; subtract it to get actual
+        # plan execution time for throughput/budget accounting.
+        "lock_wait_s": round(lock_wait_s, 3),
         "streams": sorted(streams),
         "files": sorted(files or []),
         "n_ops": n_ops,
@@ -330,6 +335,14 @@ class Session:
         # Distinct from self.expectations (free-form prose set by the
         # `expect` control verb).
         self.checks = []
+        # Total seconds spent blocked on per-device locks held by other
+        # sessions (eager + deferred). Surfaced as manifest lock_wait_s
+        # so agents can exclude bench contention from their budgets.
+        self.lock_wait_s = 0.0
+        # Deferred-only portion, credited to the runtime deadline and
+        # the watchdog (the eager wait already happens before the
+        # deadline starts, so crediting it twice would be a free pass).
+        self._lock_credit_s = 0.0
         self.lock = threading.Lock()
         self.session_id = f"sess-{uuid.uuid4().hex[:12]}"
         # Set by signal_cancel(). _run_block tests it at op boundaries;
@@ -484,6 +497,7 @@ class Session:
             if eager_keys or self._deferred_names else "(no devices)")
         eager_acquired = []
         lock_wait_canceled = False
+        t_lock0 = time.monotonic()
         try:
             for lk in eager_locks:
                 while True:
@@ -535,7 +549,11 @@ class Session:
         self._session_locked_keys = set(eager_keys)
         for key in eager_keys:
             self._mark_device_use(key)
-        self.log_event("LOCK", "session", "acquired; running ops")
+        self.lock_wait_s += time.monotonic() - t_lock0
+        self.log_event(
+            "LOCK", "session",
+            f"acquired; running ops (waited {self.lock_wait_s:.1f}s "
+            f"for other sessions to release)")
         # Lock wait is bench scheduling/resource contention, not plan
         # execution. Start the runtime budget after eager locks are held
         # so a valid op is not skipped just because another session
@@ -554,10 +572,23 @@ class Session:
         budget_left_s = budget_s + WATCHDOG_SOFT_GRACE_S
         self._done_event = threading.Event()
 
+        wd_t0 = time.monotonic()
+
         def _watchdog():
             try:
-                if self._done_event.wait(budget_left_s):
-                    return  # session ended cleanly
+                # Re-check in a loop instead of one fixed wait: deferred
+                # lock waits (_lock_credit_s) extend the budget while
+                # the session runs, and a watchdog that ignored them
+                # would cancel + os._exit a session that was merely
+                # queued behind another job's devices -- killing the
+                # poller and orphaning the job as still-"running".
+                while True:
+                    left = (budget_left_s + self._lock_credit_s
+                            - (time.monotonic() - wd_t0))
+                    if left <= 0:
+                        break
+                    if self._done_event.wait(min(left, 5.0)):
+                        return  # session ended cleanly
                 self.log_event(
                     "WATCHDOG", "session",
                     f"runtime exceeded {budget_left_s:.0f}s; "
@@ -620,12 +651,28 @@ class Session:
             # close() does its own pre-close flush, so a canceled
             # session tears down cleanly without a separate cleanup
             # hook.
+            #
+            # Release each device's session lock IMMEDIATELY after its
+            # own close, not after the whole sweep: USB closes can
+            # stall in C-level syscalls, and a queued job waiting on
+            # device N shouldn't also pay for devices N+1..'s slow
+            # closes. A lock can only drop after ITS device's close --
+            # earlier would let the next session open a device this
+            # one is still closing.
+            lock_by_key = dict(self._deferred_locks)
+            lock_by_key.update(zip(eager_keys, eager_locks))
+            released_keys = set()
             for key in sorted(self.touched_keys):
                 try:
                     if self.registry.release_now(key):
                         self.log_event("CLOSE", "session", key)
                 except Exception:
                     traceback.print_exc()
+                lk = lock_by_key.get(key)
+                if lk is not None:
+                    self._mark_device_release(key)
+                    lk.release()
+                    released_keys.add(key)
             # Drop the spec-pin so a later refresh can finally evict
             # any device that vanished. Done after release_now so the
             # eviction path doesn't race with our close.
@@ -641,14 +688,17 @@ class Session:
                         self.registry.pinned_specs.pop(k, None)
             for s in self.streams.values():
                 s.close()
-            # Release deferred locks (acquired mid-session) first, then
-            # eager locks. Reverse of acquisition order in both lists.
+            # Release whatever locks remain (devices the plan locked
+            # but never ran an op on -- not in touched_keys above).
+            # Deferred first, then eager; reverse acquisition order.
             for key, lk in reversed(self._deferred_locks):
-                self._mark_device_release(key)
-                lk.release()
+                if key not in released_keys:
+                    self._mark_device_release(key)
+                    lk.release()
             for key, lk in reversed(list(zip(eager_keys, eager_locks))):
-                self._mark_device_release(key)
-                lk.release()
+                if key not in released_keys:
+                    self._mark_device_release(key)
+                    lk.release()
             self.log_event("LOCK", "session", "released")
             # Tell the watchdog we're done so it doesn't fire after a
             # legitimate completion.
@@ -656,7 +706,11 @@ class Session:
 
     def _run_block(self, ops, plugins, deadline):
         for op in ops:
-            if time.monotonic() > deadline:
+            # _lock_credit_s grows when a deferred device lock was held
+            # by another session: that's bench contention, not plan
+            # runtime, so it extends the deadline rather than eating
+            # the plan's budget.
+            if time.monotonic() > deadline + self._lock_credit_s:
                 budget = getattr(
                     self, "_runtime_budget_s", deadline - self.t0)
                 self.log_event("ERROR", "session",
@@ -768,13 +822,26 @@ class Session:
                 # disappearance.
                 self._pinned_specs.add(key)
                 self.registry.pinned_specs[key] += 1
-            lk.acquire()
+            # Poll-acquire so a cancel can interrupt the wait, and
+            # measure it: time blocked here is another session holding
+            # the device, so it's credited back to the runtime budget
+            # (and surfaced in the manifest) instead of being charged
+            # as plan execution time.
+            t_wait0 = time.monotonic()
+            while not lk.acquire(timeout=0.1):
+                if self.canceled:
+                    raise RuntimeError(
+                        f"canceled while waiting for device lock {key}")
+            waited = time.monotonic() - t_wait0
+            self.lock_wait_s += waited
+            self._lock_credit_s += waited
             self._deferred_locks.append((key, lk))
             self._session_locked_keys.add(key)
             self._mark_device_use(key)
             self._deferred_names.discard(plugin_name)
             self.log_event("LOCK", "session",
-                           f"deferred acquire {key}")
+                           f"deferred acquire {key} "
+                           f"(waited {waited:.1f}s)")
         self.touched_keys.add(key)
         return key
 
@@ -1134,6 +1201,7 @@ def pack_artefact(session):
         code_digest=session.code_digest,
         blob_digests=blob_digests,
         inert_reason=inert_reason,
+        lock_wait_s=session.lock_wait_s,
     )
     manifest_text = json.dumps(manifest, indent=2) + "\n"
 
