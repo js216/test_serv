@@ -672,7 +672,8 @@ class MscPlugin(DevicePlugin):
                  "resolved block device. Reproduce/verify the same "
                  "pattern with verify_prbs using identical seed, n, and "
                  "offset_lba. offset_lba defaults to 0; min_rate_Bps "
-                 "fails the op if effective write rate falls below the "
+                 "fails the op if the full host-side pipeline (PRBS "
+                 "generation plus block-device I/O) falls below the "
                  "requested byte/s floor."),
             run=_op_write_prbs),
         "verify_zeroes": Op(
@@ -691,8 +692,9 @@ class MscPlugin(DevicePlugin):
                  "they match the deterministic xorshift32 PRBS produced "
                  "by write_prbs with identical seed, n, and offset_lba. "
                  "offset_lba defaults to 0; min_rate_Bps fails the op if "
-                 "effective read rate falls below the requested byte/s "
-                 "floor. Records a machine-checkable "
+                 "the full host-side pipeline (block-device I/O plus PRBS "
+                 "comparison) falls below the requested byte/s floor. "
+                 "Records a machine-checkable "
                  "msc_verify_prbs check."),
             run=_op_verify_prbs),
         "verify": Op(
