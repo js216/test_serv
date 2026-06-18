@@ -236,6 +236,27 @@ def _fetch(server, digest, extract_to, force=False):
     return 0
 
 
+def _manifest_n_errors(tar_bytes):
+    """Op-level error count from the artefact's manifest.json (0 == clean).
+
+    Returns -1 if the manifest is missing or unreadable -- a job whose
+    manifest we cannot read did not demonstrably succeed. The server
+    returns the artefact (HTTP 200) even when the bench session recorded
+    op errors, so this count is the only success signal; main() uses it
+    to exit nonzero instead of always returning 0 on a completed job.
+    """
+    if not tar_bytes:
+        return -1
+    try:
+        with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tf:
+            m = tf.extractfile("manifest.json")
+            if m is None:
+                return -1
+            return int(json.loads(m.read().decode()).get("n_errors", -1))
+    except Exception:
+        return -1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("plan", nargs="?",
@@ -316,6 +337,11 @@ def main():
 
     _dump_outputs(tar, digest, args.extract, force=args.force)
     _delete_outputs(args.server, digest)
+    n_errors = _manifest_n_errors(tar)
+    if n_errors != 0:
+        print(f"bench session for {digest} reported {n_errors} op-level "
+              f"error(s) (manifest n_errors={n_errors})", file=sys.stderr)
+        return 1
     return 0
 
 
