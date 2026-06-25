@@ -27,6 +27,31 @@ def _lazy_serial():
     return serial
 
 
+# An FT4222 open can transiently fail (typically DEVICE_NOT_OPENED)
+# when the chip is mid-flap: briefly held open by a leaked dsp:boot
+# helper, an in-flight transfer, or a USB hiccup. This is the same
+# class of blip the enumeration path rides out via settle-retry (see
+# _enum_descriptors_settled / ENUM_RETRY_DELAYS_S below). The op path
+# opens the device to do real work, so retry a few times before
+# concluding the device is gone rather than letting a sub-second blip
+# fail a DUT that is actually present. Happy path is unchanged: the
+# first attempt has zero delay and almost always succeeds.
+_OPEN_RETRY_DELAYS_S = (0.2, 0.5, 1.0, 2.0)
+
+
+def _open_by_description(desc):
+    ft = _lazy_ft4222()
+    last = None
+    for delay in (0.0,) + _OPEN_RETRY_DELAYS_S:
+        if delay:
+            time.sleep(delay)
+        try:
+            return ft.openByDescription(desc)
+        except Exception as e:
+            last = e
+    raise last
+
+
 class DspHandle:
     """Everything dsp ops need. Exposes the FT4222 descriptor, the serial
     port name, and a UART reader lifecycle.
@@ -128,8 +153,7 @@ class _Expander:
                 a, ft.I2CMaster.Flag.START_AND_STOP, bytes([b, c]))
 
     def init_and_reset(self):
-        ft = _lazy_ft4222()
-        dev = ft.openByDescription(self.desc)
+        dev = _open_by_description(self.desc)
         dev.i2cMaster_Init(100)
         try:
             self._wr(dev, [(0x30, 0x1D, 0x00)])
@@ -145,8 +169,7 @@ class _Expander:
 
     def pulse_reset(self, session=None):
         """DS8 is repurposed as eval-board reset; toggle it briefly."""
-        ft = _lazy_ft4222()
-        dev = ft.openByDescription(self.desc)
+        dev = _open_by_description(self.desc)
         dev.i2cMaster_Init(100)
         try:
             self._wr(dev, [(0x30, 0x18, 0b0001_1011)])
@@ -201,7 +224,7 @@ def _ft_cpol_cpha(flags):
 
 def _open_master(desc, clk_div=8, mode=1, flags=0):
     ft = _lazy_ft4222()
-    dev = ft.openByDescription(desc)
+    dev = _open_by_description(desc)
     dev.setClock(ft.SysClock.CLK_80)
     cpol, cpha = _ft_cpol_cpha(flags)
     dev.spiMaster_Init(
@@ -214,10 +237,20 @@ def _open_master(desc, clk_div=8, mode=1, flags=0):
 # ---- op implementations ----
 
 def _op_reset(session, h, args):
-    session.bail_if_canceled("dsp:reset before pulse")
-    _Expander(h.ft4222_desc).pulse_reset(session=session)
-    session.bail_if_canceled("dsp:reset before init")
-    _Expander(h.ft4222_desc).init_and_reset()
+    try:
+        session.bail_if_canceled("dsp:reset before pulse")
+        _Expander(h.ft4222_desc).pulse_reset(session=session)
+        session.bail_if_canceled("dsp:reset before init")
+        _Expander(h.ft4222_desc).init_and_reset()
+    except Exception as e:
+        # A DUT that won't reset can't run anything that follows, so a
+        # failure here aborts the plan rather than letting later ops
+        # (uart_expect, qspi tests) burn their full timeouts against a
+        # dead device. A cancel is not a device failure -- let it
+        # propagate unchanged so the run is recorded as canceled.
+        if session.canceled:
+            raise
+        session.fail_hard(f"dsp:reset failed, aborting plan: {e}")
 
 
 def _op_boot(session, h, args):
@@ -235,8 +268,17 @@ def _op_boot(session, h, args):
     padded = ((n + CHUNK - 1) // CHUNK) * CHUNK
     if padded != n:
         buf += bytes(padded - n)
-    _boot_subprocess(session, h.ft4222_desc, bytes(buf),
-                     timeout_ms / 1000.0)
+    try:
+        _boot_subprocess(session, h.ft4222_desc, bytes(buf),
+                         timeout_ms / 1000.0)
+    except Exception as e:
+        # A DUT that won't boot can't run anything that follows, so a
+        # failure here aborts the plan rather than letting later ops
+        # burn their full timeouts against a dead device. A cancel is
+        # not a boot failure -- let it propagate unchanged.
+        if session.canceled:
+            raise
+        session.fail_hard(f"dsp:boot failed, aborting plan: {e}")
 
 
 def _track_subproc(proc, session=None):

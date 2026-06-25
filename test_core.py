@@ -783,6 +783,42 @@ def test_stop_session_clean_termination():
     reg.close_all()
 
 
+def test_fail_hard_aborts_plan_and_records_error():
+    """session.fail_hard -> HardFail -> op recorded as error, plan stops.
+
+    Models the dsp:reset/boot fast-fail: a fatal op failure must abort
+    the rest of the plan (so following ops don't burn their timeouts
+    against a dead device) while still surfacing as an error, unlike
+    the clean StopSession early-done path.
+    """
+    def _boom_op(session, h, args):
+        try:
+            raise RuntimeError("device gone")
+        except Exception as e:
+            session.fail_hard(f"boom, aborting: {e}")
+
+    class BoomPlugin(FakePlugin):
+        name = "boom"
+        ops = {
+            "boom": Op(args={}, doc="fail hard", run=_boom_op),
+            "should_not_run": Op(args={}, doc="must not execute",
+                                 run=_fail),
+        }
+
+    parsed = plan.load_tar(plan.pack_tar(
+        "boom:boom\nboom:should_not_run\n", {}))
+    plugins = {"boom": BoomPlugin()}
+    reg = DeviceRegistry(plugins); reg.refresh()
+    session = Session(reg, parsed)
+    session.run_all(plugins)
+    assert len(session.ops_log) == 1, [r["verb"] for r in session.ops_log]
+    assert session.ops_log[0]["status"] == "error", session.ops_log[0]
+    assert session.errors, "fatal op should surface as an error"
+    # The original cause is chained into the recorded traceback.
+    assert "device gone" in "".join(session.errors), session.errors
+    reg.close_all()
+
+
 def test_cancel_propagates_to_session():
     """signal_cancel during a `delay` should wake immediately.
 
@@ -2466,6 +2502,7 @@ def main():
         test_lazy_handle_cache_and_release,
         test_bounded_sizes,
         test_stop_session_clean_termination,
+        test_fail_hard_aborts_plan_and_records_error,
         test_cancel_propagates_to_session,
         test_signal_cancel_sigkills_session_subprocs,
         test_session_watchdog_hard_exits_when_wedged,

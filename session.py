@@ -147,6 +147,17 @@ class StopSession(Exception):
     """
 
 
+class HardFail(Exception):
+    """Raised (via Session.fail_hard) by a plan op whose failure makes
+    the rest of the plan pointless -- e.g. dsp:reset/dsp:boot could not
+    reach the DUT, so every following op would just burn its full
+    timeout against a dead device. _run_one records the failing op as
+    an error (exactly like any other op error) and then re-raises, so
+    _run_block stops the plan instead of grinding through the rest.
+    Unlike StopSession this is an error, not a clean early-done.
+    """
+
+
 # Per-stream cap: a runaway UART (kernel-panic loop, baud-rate flood)
 # could otherwise grow Stream.records without bound and OOM the bench
 # host before the session deadline expires. 64 MiB is well above any
@@ -406,6 +417,16 @@ class Session:
         # at the top level and treats it as clean termination.
         raise StopSession(reason)
 
+    def fail_hard(self, reason):
+        # Plugins call this when an op's failure makes the rest of the
+        # plan pointless (e.g. dsp:reset/boot could not reach the DUT).
+        # _run_one records the op as an error and re-raises so the plan
+        # stops instead of running every following op into its timeout
+        # against a dead device. Call from inside an `except` block so
+        # the original exception is preserved as the __context__ of the
+        # HardFail and shows up in the recorded traceback.
+        raise HardFail(reason)
+
     def bail_if_canceled(self, where):
         """Plugin helper: raise RuntimeError if the session is canceled.
         Cheaper to call once per chunk than to manage a local helper.
@@ -634,6 +655,14 @@ class Session:
             # Clean termination, not an error.
             self.log_event("CTRL", "session",
                            f"early_done: {e.args[0] if e.args else ''}")
+        except HardFail as e:
+            # An op declared its failure fatal to the plan (e.g.
+            # dsp:reset/boot could not reach the DUT). The failing op is
+            # already recorded as an error in ops_log/errors; stop here
+            # instead of running the rest into their timeouts.
+            self.log_event("CTRL", "session",
+                           f"aborted after fatal op: "
+                           f"{e.args[0] if e.args else ''}")
         except Exception:
             self.errors.append(traceback.format_exc())
             self.log_event("ERROR", "session",
@@ -763,6 +792,13 @@ class Session:
             self.log_event("ERROR",
                            f"{op.device or 'ctrl'}:{op.verb}",
                            rec["err"])
+            # A HardFail records like any other op error, then aborts
+            # the plan: the op declared its failure fatal, so the
+            # remaining ops would only waste their timeouts.
+            if isinstance(e, HardFail):
+                rec["t_end"] = time.monotonic() - self.t0
+                self.ops_log.append(rec)
+                raise
         rec["t_end"] = time.monotonic() - self.t0
         self.ops_log.append(rec)
         if rec["status"] == "ok":
