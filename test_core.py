@@ -645,6 +645,62 @@ def test_server_rest_queue_helpers():
              server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
 
 
+def test_pickup_rollback_requeues_on_write_failure():
+    """GET /plan that can't deliver the body (poller transfer deadline,
+    dropped tunnel) must roll the claim-by-rename back: the plan returns
+    to INPUTS for re-pickup instead of stranding in DONE as a 'running'
+    job no session ever runs. Regression for the 23 MB GET /plan that
+    timed out at 30s and orphaned the job.
+    """
+    class _RaiseOnBody(io.BytesIO):
+        def __init__(self, body):
+            super().__init__()
+            self._body = body
+
+        def write(self, b):
+            if bytes(b) == self._body:
+                raise BrokenPipeError("client went away mid-body")
+            return super().write(b)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        old_dirs = (
+            server.INPUTS, server.OUTPUTS, server.DONE,
+            server.STATUS, server.RELEASE, server.SWEEP,
+        )
+        server.INPUTS = os.path.join(tmp, "inputs")
+        server.OUTPUTS = os.path.join(tmp, "outputs")
+        server.DONE = os.path.join(tmp, "done")
+        server.STATUS = os.path.join(tmp, "status")
+        server.RELEASE = os.path.join(tmp, "release")
+        server.SWEEP = os.path.join(tmp, "sweep")
+        for d in (server.INPUTS, server.OUTPUTS, server.DONE,
+                  server.STATUS, server.RELEASE, server.SWEEP):
+            os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            body = plan.pack_tar("mark tag=rollback\n", {})
+            digest, status = server.queue_job(body, {"runtime": "1"})
+            assert status == "queued"
+
+            h = server.Handler.__new__(server.Handler)
+            h.request_version = "HTTP/1.1"
+            h.requestline = "GET /plan HTTP/1.1"
+            h.wfile = _RaiseOnBody(body)
+            h._pickup("plan")
+
+            plan_in = os.path.join(server.INPUTS, f"{digest}.plan")
+            plan_done = os.path.join(server.DONE, f"{digest}.plan")
+            assert os.path.exists(plan_in), \
+                "plan must be re-queued in INPUTS after a failed delivery"
+            assert not os.path.exists(plan_done), \
+                "no orphaned 'running' record may remain in DONE"
+            assert os.path.exists(plan_in + ".meta"), \
+                "meta must roll back alongside the plan"
+            assert not os.path.exists(plan_done + ".meta")
+        finally:
+            (server.INPUTS, server.OUTPUTS, server.DONE,
+             server.STATUS, server.RELEASE, server.SWEEP) = old_dirs
+
+
 def test_request_path_strips_query_for_static_assets():
     assert server._request_path("/web/style.css?v=20260505-2") == (
         "web/style.css")
@@ -2496,6 +2552,7 @@ def main():
         test_tcp_recv_captures_stream_and_expectation,
         test_tcp_recv_expect_mismatch_fails_after_capture,
         test_server_rest_queue_helpers,
+        test_pickup_rollback_requeues_on_write_failure,
         test_request_path_strips_query_for_static_assets,
         test_static_assets_accept_query_and_disable_cache,
         test_queue_job_rejects_resubmit_while_inflight,

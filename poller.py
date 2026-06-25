@@ -433,6 +433,13 @@ MAX_UPLOAD_S = 3600.0
 PROGRESS_THRESHOLD = 1 << 20         # 1 MiB
 PROGRESS_BYTES_PER_DOT = 1 << 20     # 1 MiB
 _HTTP_CHUNK = 64 * 1024              # send/recv granularity
+# Floor bandwidth used to size the GET /plan transfer budget. A flat
+# 30s timeout under-budgets a multi-MB plan (firmware/PRBS blobs) over
+# a slow tunnel: it would abort mid-download and strand the job in the
+# server's DONE/ as a "running" record. Budgeting cl/_PLAN_MIN_BPS
+# gives a big-but-legitimate plan room to finish; a genuinely dead
+# connection still aborts within the per-chunk timeout cap.
+_PLAN_MIN_BPS = 256 * 1024           # 256 KiB/s
 
 
 def _timeout_left(deadline, cap=5.0):
@@ -514,14 +521,21 @@ class ProgressLine:
         sys.stdout.flush()
 
 
-def _get(url, timeout=30.0):
-    deadline = time.monotonic() + timeout
+def _get(url, timeout=30.0, min_bps=None):
+    start = time.monotonic()
+    deadline = start + timeout
     with urllib.request.urlopen(url, timeout=_timeout_left(deadline)) as r:
         cl = r.getheader("Content-Length")
         try:
             cl_int = int(cl) if cl is not None else None
         except ValueError:
             cl_int = None
+        # Extend the transfer budget for a large body so a slow-but-
+        # progressing download isn't aborted just for being big. Only
+        # the total deadline grows; the per-chunk timeout still trips
+        # on a real stall.
+        if min_bps and cl_int:
+            deadline = max(deadline, start + cl_int / min_bps)
         buf = bytearray()
         if cl_int is not None:
             progress = ProgressLine(f"GET {url}", cl_int)
@@ -1769,7 +1783,8 @@ def _run_poller():
             if not worker_slot.acquire(timeout=POLL_INTERVAL_S):
                 continue
             try:
-                status, body, headers = _get(f"{base}/plan")
+                status, body, headers = _get(f"{base}/plan",
+                                             min_bps=_PLAN_MIN_BPS)
             except Exception:
                 print(datetime.now(), "GET /plan failed")
                 worker_slot.release()

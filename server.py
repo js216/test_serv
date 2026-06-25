@@ -833,12 +833,38 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
-            self.wfile.write(data)
+            try:
+                self.wfile.write(data)
+            except OSError:
+                # The poller never received the full body -- a slow
+                # transfer hit its deadline, or the tunnel dropped. We
+                # already claimed the job by renaming INPUTS->DONE,
+                # which marks it "running"; undo that so the plan is
+                # re-queued for the next pickup instead of stranding it
+                # as a "running" job no session will ever execute.
+                self._rollback_pickup(name, dst, meta_dst)
+                self.close_connection = True
             return
         # Fell through the retry budget -- treat as "nothing right
         # now"; the poller will retry on its next tick.
         self.send_response(204)
         self.end_headers()
+
+    def _rollback_pickup(self, name, dst, meta_dst):
+        # Reverse of the claim-by-rename in _pickup. Restore the meta
+        # first, then the .plan: a racing poller lists INPUTS by .plan
+        # name, so the plan must reappear only once its meta is back in
+        # place. Best-effort -- if a rename loses a race or the file is
+        # already gone, the stale-running reaper backstops the orphan.
+        if meta_dst:
+            try:
+                os.rename(meta_dst, os.path.join(INPUTS, f"{name}.meta"))
+            except OSError:
+                pass
+        try:
+            os.rename(dst, os.path.join(INPUTS, name))
+        except OSError:
+            pass
 
     # --- POST / artefact ---
 
